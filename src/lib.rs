@@ -360,21 +360,57 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
 
 impl<TxnId: fmt::Display + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
     /// Commit the value of this [`TxnLock`] at the given `txn_id`.
-    pub fn commit(&self, txn_id: &TxnId) {
-        let mut state = self.state.lock().expect("lock state");
-        if let Some((txn_id, version)) = state.versions.remove_entry(txn_id) {
-            let value = match version {
-                Version::Pending(lock) => {
-                    let value = lock.try_read().expect("canon");
-                    T::clone(&*value)
-                }
-                Version::Committed(_) => panic!("got duplicate commit at {}", txn_id),
-            };
+    ///
+    /// Panics:
+    ///  - when called twice with the same `txn_id`
+    ///  - when called with a `txn_id` which has already been finalized
+    pub async fn commit(&self, txn_id: &TxnId) -> Arc<T> {
+        let mut state = loop {
+            let state = self.state.lock().expect("lock state");
 
-            state
+            if state
                 .versions
-                .insert(txn_id, Version::Committed(Arc::new(value)));
-        }
+                .iter()
+                .filter(|(version_id, _)| version_id < &txn_id)
+                .any(|(_, version)| version.is_pending())
+            {
+                std::mem::drop(state);
+                self.notify.notified().await;
+            } else {
+                break state;
+            }
+        };
+
+        let canon = if let Some((txn_id, version)) = state.versions.remove_entry(txn_id) {
+            match version {
+                Version::Committed(_) => panic!("duplicate commit {}", txn_id),
+                Version::Pending(lock) => {
+                    let guard = lock.try_read().expect("canon");
+                    Arc::new(T::clone(&*guard))
+                }
+            }
+        } else {
+            let mut canon = None;
+            for (version_id, version) in &state.versions {
+                if version_id > txn_id {
+                    break;
+                } else {
+                    match version {
+                        Version::Committed(value) => canon = Some(value),
+                        Version::Pending(_) => unreachable!(),
+                    }
+                }
+            }
+
+            if let Some(canon) = canon {
+                canon.clone()
+            } else {
+                panic!("value has already been finalized at {}", txn_id);
+            }
+        };
+
+        self.notify.notify_waiters();
+        canon
     }
 
     /// Roll back the value of this [`TxnLock`] at the given `txn_id`.
