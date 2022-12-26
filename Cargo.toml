@@ -12,3 +12,4 @@ keywords = ["transaction", "transactional", "lock", "version"]
 categories = ["concurrency", "data-structures"]
 
 [dependencies]
+tokio = { version = "1.23", features = ["sync"] }
