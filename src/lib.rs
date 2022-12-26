@@ -358,19 +358,44 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
     }
 }
 
-impl<TxnId, T> TxnLock<TxnId, T> {
+impl<TxnId: fmt::Display + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
     /// Commit the value of this [`TxnLock`] at the given `txn_id`.
-    pub fn commit(_txn_id: &TxnId) {
-        todo!()
+    pub fn commit(&self, txn_id: &TxnId) {
+        let mut state = self.state.lock().expect("lock state");
+        if let Some((txn_id, version)) = state.versions.remove_entry(txn_id) {
+            let value = match version {
+                Version::Pending(lock) => {
+                    let value = lock.try_read().expect("canon");
+                    T::clone(&*value)
+                }
+                Version::Committed(_) => panic!("got duplicate commit at {}", txn_id),
+            };
+
+            state
+                .versions
+                .insert(txn_id, Version::Committed(Arc::new(value)));
+        }
     }
 
     /// Roll back the value of this [`TxnLock`] at the given `txn_id`.
-    pub fn rollback(_txn_id: &TxnId) {
-        todo!()
+    pub fn rollback(&self, txn_id: &TxnId) {
+        let mut state = self.state.lock().expect("lock state");
+        state.versions.remove(txn_id);
     }
 
     /// Drop all values of this [`TxnLock`] older than the given `txn_id`.
-    pub fn finalize(_txn_id: &TxnId) {
-        todo!()
+    pub fn finalize(&self, txn_id: &TxnId) {
+        let mut state = self.state.lock().expect("lock state");
+        let finalized = state
+            .versions
+            .keys()
+            .rev()
+            .filter(|version_id| *version_id <= txn_id)
+            .copied()
+            .collect::<Vec<_>>();
+
+        for version_id in &finalized[1..] {
+            state.versions.remove(version_id);
+        }
     }
 }
