@@ -34,6 +34,14 @@ impl Error {
             message: message.to_string(),
         }
     }
+
+    pub fn kind(&self) -> &ErrorKind {
+        &self.kind
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl fmt::Display for Error {
@@ -93,16 +101,19 @@ impl<TxnId: Copy + Ord, T: Clone> TxnLockReadGuardExclusive<TxnId, T> {
         let mut state = ExclusiveReadGuardState::Upgraded;
         std::mem::swap(&mut self.state, &mut state);
 
-        let guard = match state {
-            ExclusiveReadGuardState::Pending(_notify, guard) => guard,
+        let (notify, guard) = match state {
+            ExclusiveReadGuardState::Pending(notify, guard) => (notify, guard),
             ExclusiveReadGuardState::Canon(txn_lock, txn_id, value) => {
                 let lock = txn_lock.create_value(txn_id, T::clone(&*value));
-                lock.try_write_owned().expect("write guard")
+                (
+                    txn_lock.notify.clone(),
+                    lock.try_write_owned().expect("write guard"),
+                )
             }
             ExclusiveReadGuardState::Upgraded => unreachable!(),
         };
 
-        TxnLockWriteGuard { guard }
+        TxnLockWriteGuard { notify, guard }
     }
 }
 
@@ -129,6 +140,7 @@ impl<TxnId, T> Drop for TxnLockReadGuardExclusive<TxnId, T> {
 }
 
 pub struct TxnLockWriteGuard<T> {
+    notify: Arc<Notify>,
     guard: OwnedRwLockWriteGuard<T>,
 }
 
@@ -143,6 +155,12 @@ impl<T> Deref for TxnLockWriteGuard<T> {
 impl<T> DerefMut for TxnLockWriteGuard<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.guard.deref_mut()
+    }
+}
+
+impl<T> Drop for TxnLockWriteGuard<T> {
+    fn drop(&mut self) {
+        self.notify.notify_waiters();
     }
 }
 
@@ -212,7 +230,7 @@ impl<TxnId: Ord, T> TxnLock<TxnId, T> {
     }
 }
 
-impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T> TxnLock<TxnId, T> {
+impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
     fn read_inner(&self, txn_id: &TxnId) -> Result<Option<(TxnId, Version<T>)>> {
         let state = self.state.lock().expect("lock state");
         if let Some(version) = state.versions.get(txn_id) {
@@ -282,9 +300,61 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T> TxnLock<TxnId, T> {
         }
     }
 
+    fn write_inner(&self, txn_id: &TxnId) -> Result<Option<Arc<RwLock<T>>>> {
+        let mut state = self.state.lock().expect("lock state");
+        if let Some(version) = state.versions.get(txn_id) {
+            return match version {
+                Version::Committed(_) => Err(Error::new(
+                    ErrorKind::Conflict,
+                    "cannot write-lock a committed version",
+                )),
+                Version::Pending(lock) => Ok(Some(lock.clone())),
+            };
+        }
+
+        let mut canon = None;
+        for (version_id, version) in &state.versions {
+            if version_id > txn_id {
+                return Err(Error::new(
+                    ErrorKind::Conflict,
+                    "there is already a transactional write lock in the future",
+                ));
+            }
+
+            match version {
+                Version::Pending(_) => return Ok(None),
+                Version::Committed(value) => canon = Some(value),
+            }
+        }
+
+        if let Some(canon) = canon {
+            let lock = Arc::new(RwLock::new(T::clone(&*canon)));
+            state
+                .versions
+                .insert(*txn_id, Version::Pending(lock.clone()));
+
+            Ok(Some(lock))
+        } else {
+            Err(Error::new(
+                ErrorKind::Outdated,
+                format!("value has already been finalized at {}", txn_id),
+            ))
+        }
+    }
+
     /// Lock this value for exclusive reading at the given `txn_id`.
-    pub async fn write(&self, _txn_id: &TxnId) -> Result<TxnLockWriteGuard<T>> {
-        todo!()
+    pub async fn write(&self, txn_id: &TxnId) -> Result<TxnLockWriteGuard<T>> {
+        loop {
+            if let Some(lock) = self.write_inner(txn_id)? {
+                let guard = lock.write_owned().await;
+                return Ok(TxnLockWriteGuard {
+                    notify: self.notify.clone(),
+                    guard,
+                });
+            }
+
+            self.notify.notified().await;
+        }
     }
 }
 
