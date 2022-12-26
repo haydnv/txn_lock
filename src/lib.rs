@@ -77,15 +77,32 @@ impl<T> Drop for TxnLockReadGuard<T> {
     }
 }
 
-pub struct TxnLockReadGuardExclusive<TxnId, T> {
-    lock: TxnLock<TxnId, T>,
-    guard: OwnedRwLockWriteGuard<T>,
+enum ExclusiveReadGuardState<TxnId, T> {
+    Canon(TxnLock<TxnId, T>, TxnId, Arc<T>),
+    Pending(Arc<Notify>, OwnedRwLockWriteGuard<T>),
+    Upgraded,
 }
 
-impl<TxnId, T> TxnLockReadGuardExclusive<TxnId, T> {
+pub struct TxnLockReadGuardExclusive<TxnId, T> {
+    state: ExclusiveReadGuardState<TxnId, T>,
+}
+
+impl<TxnId: Copy + Ord, T: Clone> TxnLockReadGuardExclusive<TxnId, T> {
     /// Upgrade this exclusive read lock to a write lock.
-    pub fn upgrade(self) -> TxnLockWriteGuard<T> {
-        todo!()
+    pub fn upgrade(mut self) -> TxnLockWriteGuard<T> {
+        let mut state = ExclusiveReadGuardState::Upgraded;
+        std::mem::swap(&mut self.state, &mut state);
+
+        let guard = match state {
+            ExclusiveReadGuardState::Pending(_notify, guard) => guard,
+            ExclusiveReadGuardState::Canon(txn_lock, txn_id, value) => {
+                let lock = txn_lock.create_value(txn_id, T::clone(&*value));
+                lock.try_write_owned().expect("write guard")
+            }
+            ExclusiveReadGuardState::Upgraded => unreachable!(),
+        };
+
+        TxnLockWriteGuard { guard }
     }
 }
 
@@ -93,7 +110,21 @@ impl<TxnId, T> Deref for TxnLockReadGuardExclusive<TxnId, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        self.guard.deref()
+        match &self.state {
+            ExclusiveReadGuardState::Canon(_lock, _txn_id, value) => value,
+            ExclusiveReadGuardState::Pending(_notify, guard) => guard.deref(),
+            ExclusiveReadGuardState::Upgraded => unreachable!(),
+        }
+    }
+}
+
+impl<TxnId, T> Drop for TxnLockReadGuardExclusive<TxnId, T> {
+    fn drop(&mut self) {
+        match &self.state {
+            ExclusiveReadGuardState::Canon(txn_lock, _, _) => txn_lock.notify.notify_waiters(),
+            ExclusiveReadGuardState::Pending(notify, _) => notify.notify_waiters(),
+            ExclusiveReadGuardState::Upgraded => {}
+        };
     }
 }
 
@@ -142,10 +173,18 @@ struct LockState<TxnId, T> {
     versions: BTreeMap<TxnId, Version<T>>,
 }
 
-#[derive(Clone)]
 pub struct TxnLock<TxnId, T> {
     notify: Arc<Notify>,
     state: Arc<Mutex<LockState<TxnId, T>>>,
+}
+
+impl<TxnId, T> Clone for TxnLock<TxnId, T> {
+    fn clone(&self) -> Self {
+        Self {
+            notify: self.notify.clone(),
+            state: self.state.clone(),
+        }
+    }
 }
 
 impl<TxnId: Copy + Ord, T> TxnLock<TxnId, T> {
@@ -161,37 +200,48 @@ impl<TxnId: Copy + Ord, T> TxnLock<TxnId, T> {
     }
 }
 
-impl<TxnId: fmt::Display + Ord, T> TxnLock<TxnId, T> {
-    fn read_inner(&self, txn_id: &TxnId) -> Result<Option<Version<T>>> {
+impl<TxnId: Ord, T> TxnLock<TxnId, T> {
+    fn create_value(&self, txn_id: TxnId, value: T) -> Arc<RwLock<T>> {
+        let mut state = self.state.lock().expect("lock state");
+        assert!(!state.versions.contains_key(&txn_id));
+
+        let lock = Arc::new(RwLock::new(value));
+        let version = Version::Pending(lock.clone());
+        state.versions.insert(txn_id, version);
+        lock
+    }
+}
+
+impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T> TxnLock<TxnId, T> {
+    fn read_inner(&self, txn_id: &TxnId) -> Result<Option<(TxnId, Version<T>)>> {
         let state = self.state.lock().expect("lock state");
         if let Some(version) = state.versions.get(txn_id) {
-            Ok(Some(version.clone()))
-        } else if txn_id < state.versions.keys().next().expect("oldest version ID") {
-            Err(Error::new(
-                ErrorKind::Outdated,
-                format!("version {} has already been finalized", txn_id),
-            ))
-        } else {
-            let mut version = None;
+            return Ok(Some((*txn_id, version.clone())));
+        }
 
-            for (candidate_id, candidate) in &state.versions {
-                if candidate_id > txn_id {
-                    break;
-                } else if candidate.is_pending() {
+        let mut version = None;
+        for (candidate_id, candidate) in &state.versions {
+            if candidate_id < txn_id {
+                if candidate.is_pending() {
                     return Ok(None);
                 } else {
-                    version = Some(candidate);
+                    version = Some((candidate_id, candidate))
                 }
+            } else if let Some((version_id, version)) = version {
+                return Ok(Some((*version_id, version.clone())));
             }
-
-            Ok(version.cloned())
         }
+
+        Err(Error::new(
+            ErrorKind::Outdated,
+            format!("value has already been finalized at {}", txn_id),
+        ))
     }
 
     /// Lock this value for reading at the given `txn_id`.
     pub async fn read(&self, txn_id: &TxnId) -> Result<TxnLockReadGuard<T>> {
         loop {
-            if let Some(version) = self.read_inner(txn_id)? {
+            if let Some((_version_id, version)) = self.read_inner(txn_id)? {
                 return match version {
                     Version::Pending(lock) => {
                         let guard = lock.read_owned().await;
@@ -208,9 +258,28 @@ impl<TxnId: fmt::Display + Ord, T> TxnLock<TxnId, T> {
     /// Lock this value for exclusive reading at the given `txn_id`.
     pub async fn read_exclusive(
         &self,
-        _txn_id: &TxnId,
+        txn_id: &TxnId,
     ) -> Result<TxnLockReadGuardExclusive<TxnId, T>> {
-        todo!()
+        loop {
+            if let Some((version_id, version)) = self.read_inner(txn_id)? {
+                return match version {
+                    Version::Committed(_) if &version_id == txn_id => Err(Error::new(ErrorKind::Conflict, "cannot acquire an exclusive lock on a transactional version after committing")),
+                    Version::Committed(value) => {
+                        assert!(&version_id < txn_id);
+                        let state = ExclusiveReadGuardState::Canon(self.clone(), *txn_id, value);
+                        Ok(TxnLockReadGuardExclusive { state })
+                    }
+                    Version::Pending(lock) => {
+                        assert_eq!(&version_id, txn_id);
+                        let guard = lock.write_owned().await;
+                        let state = ExclusiveReadGuardState::Pending(self.notify.clone(), guard);
+                        Ok(TxnLockReadGuardExclusive { state })
+                    }
+                };
+            }
+
+            self.notify.notified().await;
+        }
     }
 
     /// Lock this value for exclusive reading at the given `txn_id`.
