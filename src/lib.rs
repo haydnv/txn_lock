@@ -399,33 +399,35 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
         let mut state = self.state.lock().expect("lock state");
         assert!(!state.versions.is_empty());
 
-        let mut canon = None;
-        for (version_id, version) in &state.versions {
-            if version_id > txn_id {
-                return Err(Error::Conflict);
-            } else if version_id == txn_id {
+        if let Some((version_id, version)) = state.versions.back() {
+            if version_id == txn_id {
                 return match version {
                     Version::Pending(lock) => Ok(Some(lock.clone())),
                     Version::Committed(_value) => Err(Error::Committed),
                 };
-            } else {
-                match version {
-                    Version::Pending(_) => return Ok(None),
-                    Version::Committed(value) => canon = Some(value),
+            } else if version_id > txn_id {
+                return Err(Error::Conflict);
+            } else if version_id < txn_id {
+                if version.is_pending() {
+                    return Ok(None);
                 }
             }
+        } else if &state.versions.front().unwrap().0 > txn_id {
+            return Err(Error::Outdated);
         }
 
-        if let Some(canon) = canon {
-            let lock = Arc::new(RwLock::new(T::clone(&*canon)));
-            state
-                .versions
-                .push_back((*txn_id, Version::Pending(lock.clone())));
+        let (left, _right) = binary_search(&state.versions, txn_id);
+        let canon = match &state.versions[left].1 {
+            Version::Committed(canon) => canon,
+            Version::Pending(_lock) => unreachable!(),
+        };
 
-            Ok(Some(lock))
-        } else {
-            Err(Error::Outdated)
-        }
+        let lock = Arc::new(RwLock::new(T::clone(&*canon)));
+        state
+            .versions
+            .push_back((*txn_id, Version::Pending(lock.clone())));
+
+        Ok(Some(lock))
     }
 
     /// Lock this value for writing at the given `txn_id`.
@@ -506,23 +508,17 @@ impl<TxnId: fmt::Display + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
 
             value
         } else {
-            // TODO: binary search
-            let mut canon = None;
-            for (version_id, version) in &state.versions {
-                if version_id > txn_id {
-                    break;
-                } else {
-                    match version {
-                        Version::Committed(value) => canon = Some(value),
-                        Version::Pending(_) => unreachable!(),
-                    }
-                }
+            if &state.versions[0].0 > txn_id {
+                panic!("value has already been finalized at {}", txn_id);
             }
 
-            if let Some(canon) = canon {
-                canon.clone()
-            } else {
-                panic!("value has already been finalized at {}", txn_id);
+            let (left, _right) = binary_search(&state.versions, txn_id);
+            match &state.versions[left] {
+                (version_id, Version::Committed(value)) => {
+                    assert!(version_id <= txn_id);
+                    value.clone()
+                }
+                _ => unreachable!(),
             }
         };
 
@@ -535,17 +531,13 @@ impl<TxnId: fmt::Display + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
         let mut state = self.state.lock().expect("lock state");
         assert!(!state.versions.is_empty());
 
-        // TODO: binary search
-        let mut index = None;
-        for (i, (version_id, _version)) in state.versions.iter().enumerate() {
-            if version_id == txn_id {
-                index = Some(i);
-                break;
-            }
+        if &state.versions[0].0 > txn_id {
+            return;
         }
 
-        if let Some(i) = index {
-            state.versions.remove(i);
+        let (left, right) = binary_search(&state.versions, txn_id);
+        if left == right {
+            state.versions.remove(left);
             self.notify.notify_waiters();
         }
     }
@@ -559,4 +551,27 @@ impl<TxnId: fmt::Display + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
             state.versions.pop_front();
         }
     }
+}
+
+fn binary_search<TxnId: PartialOrd, T>(
+    versions: &VecDeque<(TxnId, T)>,
+    txn_id: &TxnId,
+) -> (usize, usize) {
+    let mut left = 0;
+    let mut right = versions.len();
+
+    while (right - left) > 1 {
+        let mid = right / 2;
+
+        match &versions[mid].0 {
+            version_id if version_id > txn_id => right = mid,
+            version_id if version_id < txn_id => left = mid,
+            _ => {
+                right = mid;
+                left = mid;
+            }
+        }
+    }
+
+    (left, right)
 }
