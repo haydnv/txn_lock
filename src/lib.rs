@@ -412,7 +412,9 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
                     return Ok(None);
                 }
             }
-        } else if &state.versions.front().unwrap().0 > txn_id {
+        }
+
+        if &state.versions.front().unwrap().0 > txn_id {
             return Err(Error::Outdated);
         }
 
