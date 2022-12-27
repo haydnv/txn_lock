@@ -469,29 +469,17 @@ impl<TxnId: fmt::Display + fmt::Debug + Ord, T: Clone> TxnLock<TxnId, T> {
 }
 
 impl<TxnId: fmt::Display + Ord, T: Clone> TxnLock<TxnId, T> {
-    /// Commit the value of this [`TxnLock`] at the given `txn_id`.
-    /// This will wait until any earlier write locks have been committed or rolled back.
-    ///
-    /// Panics:
-    ///  - when called twice with the same `txn_id`
-    ///  - when called with a `txn_id` which has already been finalized
-    pub async fn commit(&self, txn_id: &TxnId) -> Arc<T> {
-        let mut state = loop {
-            let state = self.state.lock().expect("lock state");
-            assert!(!state.versions.is_empty());
+    fn commit_inner(&self, txn_id: &TxnId) -> Option<Arc<T>> {
+        let mut state = self.state.lock().expect("lock state");
 
-            if state
-                .versions
-                .iter()
-                .filter(|(version_id, _)| version_id < &txn_id)
-                .any(|(_, version)| version.is_pending())
-            {
-                std::mem::drop(state);
-                self.notify.notified().await;
-            } else {
-                break state;
-            }
-        };
+        if state
+            .versions
+            .iter()
+            .filter(|(version_id, _)| version_id < &txn_id)
+            .any(|(_, version)| version.is_pending())
+        {
+            return None;
+        }
 
         let pending = state
             .versions
@@ -499,7 +487,7 @@ impl<TxnId: fmt::Display + Ord, T: Clone> TxnLock<TxnId, T> {
             .map(|(version_id, _version)| version_id == txn_id)
             .expect("latest version");
 
-        let canon = if pending {
+        if pending {
             let (txn_id, version) = state.versions.pop_back().expect("version to commit");
 
             let value = match version {
@@ -514,7 +502,7 @@ impl<TxnId: fmt::Display + Ord, T: Clone> TxnLock<TxnId, T> {
                 .versions
                 .push_back((txn_id, Version::Committed(value.clone())));
 
-            value
+            Some(value)
         } else {
             if &state.versions[0].0 > txn_id {
                 panic!("value has already been finalized at {}", txn_id);
@@ -524,14 +512,27 @@ impl<TxnId: fmt::Display + Ord, T: Clone> TxnLock<TxnId, T> {
             match &state.versions[left] {
                 (version_id, Version::Committed(value)) => {
                     assert!(version_id <= txn_id);
-                    value.clone()
+                    Some(value.clone())
                 }
                 _ => unreachable!(),
             }
-        };
+        }
+    }
 
-        self.notify.notify_waiters();
-        canon
+    /// Commit the value of this [`TxnLock`] at the given `txn_id`.
+    /// This will wait until any earlier write locks have been committed or rolled back.
+    ///
+    /// Panics:
+    ///  - when called twice with the same `txn_id`
+    ///  - when called with a `txn_id` which has already been finalized
+    pub async fn commit(&self, txn_id: &TxnId) -> Arc<T> {
+        loop {
+            if let Some(canon) = self.commit_inner(txn_id) {
+                return canon;
+            }
+
+            self.notify.notify_waiters();
+        }
     }
 
     /// Roll back the value of this [`TxnLock`] at the given `txn_id`.
