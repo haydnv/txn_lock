@@ -144,7 +144,8 @@ impl<TxnId: Ord, T: Clone> TxnLockReadGuardExclusive<TxnId, T> {
             ExclusiveReadGuardState::Upgraded => unreachable!(),
         };
 
-        TxnLockWriteGuard { notify, guard }
+        let state = WriteGuardState::Pending(notify, guard);
+        TxnLockWriteGuard { state }
     }
 }
 
@@ -182,28 +183,55 @@ impl<TxnId, T: fmt::Display> fmt::Display for TxnLockReadGuardExclusive<TxnId, T
     }
 }
 
+enum WriteGuardState<T> {
+    Pending(Arc<Notify>, OwnedRwLockWriteGuard<T>),
+    Downgraded,
+}
+
 pub struct TxnLockWriteGuard<T> {
-    notify: Arc<Notify>,
-    guard: OwnedRwLockWriteGuard<T>,
+    state: WriteGuardState<T>,
+}
+
+impl<T> TxnLockWriteGuard<T> {
+    pub fn downgrade<TxnId>(mut self) -> TxnLockReadGuardExclusive<TxnId, T> {
+        let mut state = WriteGuardState::Downgraded;
+        std::mem::swap(&mut self.state, &mut state);
+
+        match state {
+            WriteGuardState::Pending(notify, guard) => TxnLockReadGuardExclusive {
+                state: ExclusiveReadGuardState::Pending(notify, guard),
+            },
+            WriteGuardState::Downgraded => unreachable!(),
+        }
+    }
 }
 
 impl<T> Deref for TxnLockWriteGuard<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        self.guard.deref()
+        match &self.state {
+            WriteGuardState::Pending(_notify, guard) => guard.deref(),
+            WriteGuardState::Downgraded => unreachable!(),
+        }
     }
 }
 
 impl<T> DerefMut for TxnLockWriteGuard<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.guard.deref_mut()
+        match &mut self.state {
+            WriteGuardState::Pending(_notify, guard) => guard.deref_mut(),
+            WriteGuardState::Downgraded => unreachable!(),
+        }
     }
 }
 
 impl<T> Drop for TxnLockWriteGuard<T> {
     fn drop(&mut self) {
-        self.notify.notify_waiters();
+        match &self.state {
+            WriteGuardState::Pending(notify, _guard) => notify.notify_waiters(),
+            WriteGuardState::Downgraded => {}
+        }
     }
 }
 
@@ -457,8 +485,7 @@ impl<TxnId: fmt::Display + fmt::Debug + Ord, T: Clone> TxnLock<TxnId, T> {
                 Write::Version(lock) => {
                     let guard = lock.write_owned().await;
                     return Ok(TxnLockWriteGuard {
-                        notify: self.notify.clone(),
-                        guard,
+                        state: WriteGuardState::Pending(self.notify.clone(), guard),
                     });
                 }
             };
@@ -474,8 +501,7 @@ impl<TxnId: fmt::Display + fmt::Debug + Ord, T: Clone> TxnLock<TxnId, T> {
             Write::Version(lock) => lock
                 .try_write_owned()
                 .map(|guard| TxnLockWriteGuard {
-                    notify: self.notify.clone(),
-                    guard,
+                    state: WriteGuardState::Pending(self.notify.clone(), guard),
                 })
                 .map_err(|_err| Error::WouldBlock),
         }
