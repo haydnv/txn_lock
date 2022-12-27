@@ -11,8 +11,12 @@ repository = "https://github.com/haydnv/tinychain.git"
 keywords = ["transaction", "transactional", "lock", "version"]
 categories = ["concurrency", "data-structures"]
 
+[features]
+logging = ["log"]
+
 [dependencies]
 tokio = { version = "1.23", features = ["sync"] }
+log = { version = "0.4", features = ["release_max_level_info"], optional = true }
 
 [dev-dependencies]
 futures = "0.3"

@@ -8,7 +8,7 @@
 //! use futures::executor::block_on;
 //! use txn_lock::*;
 //!
-//! let lock = TxnLock::new(0, "zero");
+//! let lock = TxnLock::new("example", 0, "zero");
 //!
 //! assert_eq!(*lock.try_read(0).expect("read"), "zero");
 //! assert_eq!(lock.try_write(1).unwrap_err(), Error::WouldBlock);
@@ -37,7 +37,6 @@
 //! lock.finalize(&2);
 //!
 //! assert_eq!(lock.try_read(0).unwrap_err(), Error::Outdated);
-//! assert_eq!(*lock.try_read(2).expect("old value"), "one");
 //! assert_eq!(*lock.try_read(3).expect("current value"), "three");
 //!
 //! ```
@@ -47,6 +46,9 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
+
+#[cfg(feature = "logging")]
+use log::{debug, trace, warn};
 
 use tokio::sync::{Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
@@ -277,6 +279,7 @@ impl<T> Clone for Version<T> {
 }
 
 struct LockState<TxnId, T> {
+    name: String,
     versions: VecDeque<(TxnId, Version<T>)>,
 }
 
@@ -296,13 +299,16 @@ impl<TxnId, T> Clone for TxnLock<TxnId, T> {
 
 impl<TxnId: Ord, T> TxnLock<TxnId, T> {
     /// Create a new transactional lock.
-    pub fn new(txn_id: TxnId, value: T) -> Self {
+    pub fn new<Name: fmt::Display>(name: Name, txn_id: TxnId, value: T) -> Self {
         let mut versions = VecDeque::new();
         versions.push_back((txn_id, Version::Pending(Arc::new(RwLock::new(value)))));
 
         Self {
             notify: Arc::new(Notify::new()),
-            state: Arc::new(Mutex::new(LockState { versions })),
+            state: Arc::new(Mutex::new(LockState {
+                name: name.to_string(),
+                versions,
+            })),
         }
     }
 }
@@ -310,6 +316,7 @@ impl<TxnId: Ord, T> TxnLock<TxnId, T> {
 impl<TxnId: Ord, T> TxnLock<TxnId, T> {
     fn create_value(&self, txn_id: TxnId, value: T) -> Arc<RwLock<T>> {
         let mut state = self.state.lock().expect("lock state");
+        debug_assert!(!state.versions.is_empty());
 
         if let Some((prev_id, _)) = state.versions.iter().last() {
             assert!(prev_id < &txn_id);
@@ -332,12 +339,21 @@ enum Write<TxnId, T> {
 impl<TxnId: fmt::Display + fmt::Debug + Ord, T: Clone> TxnLock<TxnId, T> {
     fn read_inner(&self, txn_id: &TxnId) -> Result<Option<(Ordering, Version<T>)>> {
         let state = self.state.lock().expect("lock state");
-        assert!(!state.versions.is_empty());
+        debug_assert!(!state.versions.is_empty());
+
+        #[cfg(feature = "logging")]
+        trace!("read {} at {}", state.name, txn_id);
 
         let mut version = None;
         for (candidate_id, candidate) in &state.versions {
             if candidate_id < txn_id {
                 if candidate.is_pending() {
+                    #[cfg(feature = "logging")]
+                    debug!(
+                        "read of {} at {} is pending a write at {}",
+                        state.name, txn_id, candidate_id
+                    );
+
                     return Ok(None);
                 } else {
                     version = Some((Ordering::Less, candidate));
@@ -448,7 +464,10 @@ impl<TxnId: fmt::Display + fmt::Debug + Ord, T: Clone> TxnLock<TxnId, T> {
 
     fn write_inner(&self, txn_id: TxnId) -> Result<Write<TxnId, T>> {
         let mut state = self.state.lock().expect("lock state");
-        assert!(!state.versions.is_empty());
+        debug_assert!(!state.versions.is_empty());
+
+        #[cfg(feature = "logging")]
+        trace!("write {} at {}", state.name, txn_id);
 
         if let Some((version_id, version)) = state.versions.back() {
             if version_id == &txn_id {
@@ -460,6 +479,12 @@ impl<TxnId: fmt::Display + fmt::Debug + Ord, T: Clone> TxnLock<TxnId, T> {
                 return Err(Error::Conflict);
             } else if version_id < &txn_id {
                 if version.is_pending() {
+                    #[cfg(feature = "logging")]
+                    debug!(
+                        "write to {} at {} is pending a write at {}",
+                        state.name, txn_id, version_id
+                    );
+
                     return Ok(Write::Pending(txn_id));
                 }
             }
@@ -518,13 +543,23 @@ impl<TxnId: fmt::Display + Ord, T: Clone> TxnLock<TxnId, T> {
     fn commit_inner(&self, txn_id: &TxnId) -> Option<Arc<T>> {
         let mut state = self.state.lock().expect("lock state");
 
-        if state
-            .versions
-            .iter()
-            .filter(|(version_id, _)| version_id < &txn_id)
-            .any(|(_, version)| version.is_pending())
-        {
-            return None;
+        #[cfg(feature = "logging")]
+        trace!("commit {} at {}", state.name, txn_id);
+
+        for (version_id, version) in state.versions.iter() {
+            if version_id >= txn_id {
+                break;
+            }
+
+            if version.is_pending() {
+                #[cfg(feature = "logging")]
+                debug!(
+                    "commit at {} is waiting on a commit at {}",
+                    txn_id, version_id
+                );
+
+                return None;
+            }
         }
 
         let pending = state
@@ -537,7 +572,11 @@ impl<TxnId: fmt::Display + Ord, T: Clone> TxnLock<TxnId, T> {
             let (txn_id, version) = state.versions.pop_back().expect("version to commit");
 
             let value = match version {
-                Version::Committed(_value) => panic!("duplicate commit {}", txn_id),
+                Version::Committed(value) => {
+                    #[cfg(feature = "logging")]
+                    warn!("duplicate commit {}", txn_id);
+                    value
+                }
                 Version::Pending(lock) => {
                     let guard = lock.try_read().expect("canon");
                     Arc::new(T::clone(&*guard))
@@ -569,22 +608,25 @@ impl<TxnId: fmt::Display + Ord, T: Clone> TxnLock<TxnId, T> {
     /// This will wait until any earlier write locks have been committed or rolled back.
     ///
     /// Panics:
-    ///  - when called twice with the same `txn_id`
-    ///  - when called with a `txn_id` which has already been finalized
+    /// - when called with a `txn_id` which has already been finalized.
     pub async fn commit(&self, txn_id: &TxnId) -> Arc<T> {
-        loop {
+        let canon = loop {
             if let Some(canon) = self.commit_inner(txn_id) {
-                return canon;
+                break canon;
             }
+        };
 
-            self.notify.notify_waiters();
-        }
+        self.notify.notify_waiters();
+        canon
     }
 
     /// Roll back the value of this [`TxnLock`] at the given `txn_id`.
     pub fn rollback(&self, txn_id: &TxnId) {
+        #[cfg(feature = "logging")]
+        trace!("rollback at {}", txn_id);
+
         let mut state = self.state.lock().expect("lock state");
-        assert!(!state.versions.is_empty());
+        debug_assert!(!state.versions.is_empty());
 
         if &state.versions[0].0 > txn_id {
             return;
@@ -595,16 +637,39 @@ impl<TxnId: fmt::Display + Ord, T: Clone> TxnLock<TxnId, T> {
             state.versions.remove(left);
             self.notify.notify_waiters();
         }
+
+        assert!(!state.versions.is_empty());
     }
 
     /// Drop all values of this [`TxnLock`] older than the given `txn_id`.
     pub fn finalize(&self, txn_id: &TxnId) {
-        let mut state = self.state.lock().expect("lock state");
-        assert!(!state.versions.is_empty());
+        #[cfg(feature = "logging")]
+        trace!("finalize {}", txn_id);
 
-        while state.versions.len() > 1 && &state.versions[1].0 <= txn_id {
+        let mut state = self.state.lock().expect("lock state");
+        debug_assert!(!state.versions.is_empty());
+
+        while &state.versions[0].0 < txn_id {
             state.versions.pop_front();
         }
+
+        if &state.versions[0].0 == txn_id {
+            if state.versions.len() == 1 {
+                assert!(!state.versions[0].1.is_pending());
+            } else {
+                state.versions.pop_front();
+            }
+        }
+
+        assert!(!state.versions.is_empty());
+        self.notify.notify_waiters();
+    }
+}
+
+impl<TxnId, T> fmt::Debug for TxnLock<TxnId, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let state = self.state.lock().expect("lock state");
+        write!(f, "transaction lock {}", state.name)
     }
 }
 
@@ -612,6 +677,8 @@ fn binary_search<TxnId: PartialOrd, T>(
     versions: &VecDeque<(TxnId, T)>,
     txn_id: &TxnId,
 ) -> (usize, usize) {
+    assert!(!versions.is_empty());
+
     let mut left = 0;
     let mut right = versions.len();
 
