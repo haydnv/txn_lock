@@ -1,4 +1,40 @@
-//! A [`TxnLock`] to support transaction-specific versioning
+//! A futures-aware read-write lock which supports transaction-specific versioning
+//!
+//! The value to lock must implement [`Clone`] since the lock may keep track of multiple past
+//! values after committing.
+//!
+//! Example:
+//! ```
+//! use futures::executor::block_on;
+//! use txn_lock::*;
+//!
+//! let lock = TxnLock::new(0, "zero");
+//! {
+//!     let mut guard = lock.try_write(&1).expect("write lock");
+//!     *guard = "one";
+//! }
+//!
+//! block_on(lock.commit(&1));
+//!
+//! assert_eq!(*lock.try_read(&0).expect("old value"), "zero");
+//! assert_eq!(*lock.try_read(&1).expect("current value"), "one");
+//! assert_eq!(*lock.try_read_exclusive(&2).expect("new value"), "one");
+//!
+//! lock.rollback(&2);
+//!
+//! {
+//!     let mut guard = lock.try_write(&3).expect("write lock");
+//!     *guard = "three";
+//! }
+//!
+//! lock.finalize(&2);
+//!
+//! assert_eq!(lock.try_read(&0).unwrap_err(), Error::Outdated);
+//! assert_eq!(*lock.try_read(&2).expect("old value"), "one");
+//! assert_eq!(*lock.try_read(&3).expect("current value"), "three");
+//! assert_eq!(lock.try_read(&4).unwrap_err(), Error::WouldBlock);
+//!
+//! ```
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -61,6 +97,18 @@ impl<T> Drop for TxnLockReadGuard<T> {
     }
 }
 
+impl<T: fmt::Debug> fmt::Debug for TxnLockReadGuard<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Debug::fmt(self.deref(), f)
+    }
+}
+
+impl<T: fmt::Display> fmt::Display for TxnLockReadGuard<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Display::fmt(self.deref(), f)
+    }
+}
+
 enum ExclusiveReadGuardState<TxnId, T> {
     Canon(TxnLock<TxnId, T>, TxnId, Arc<T>),
     Pending(Arc<Notify>, OwnedRwLockWriteGuard<T>),
@@ -115,6 +163,18 @@ impl<TxnId, T> Drop for TxnLockReadGuardExclusive<TxnId, T> {
     }
 }
 
+impl<TxnId, T: fmt::Debug> fmt::Debug for TxnLockReadGuardExclusive<TxnId, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Debug::fmt(self.deref(), f)
+    }
+}
+
+impl<TxnId, T: fmt::Display> fmt::Display for TxnLockReadGuardExclusive<TxnId, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Display::fmt(self.deref(), f)
+    }
+}
+
 pub struct TxnLockWriteGuard<T> {
     notify: Arc<Notify>,
     guard: OwnedRwLockWriteGuard<T>,
@@ -137,6 +197,18 @@ impl<T> DerefMut for TxnLockWriteGuard<T> {
 impl<T> Drop for TxnLockWriteGuard<T> {
     fn drop(&mut self) {
         self.notify.notify_waiters();
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for TxnLockWriteGuard<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Debug::fmt(self.deref(), f)
+    }
+}
+
+impl<T: fmt::Display> fmt::Display for TxnLockWriteGuard<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Display::fmt(self.deref(), f)
     }
 }
 
@@ -209,6 +281,8 @@ impl<TxnId: Ord, T> TxnLock<TxnId, T> {
 impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
     fn read_inner(&self, txn_id: &TxnId) -> Result<Option<(TxnId, Version<T>)>> {
         let state = self.state.lock().expect("lock state");
+        assert!(!state.versions.is_empty());
+
         if let Some(version) = state.versions.get(txn_id) {
             return Ok(Some((*txn_id, version.clone())));
         }
@@ -219,14 +293,18 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
                 if candidate.is_pending() {
                     return Ok(None);
                 } else {
-                    version = Some((candidate_id, candidate))
+                    version = Some((candidate_id, candidate));
                 }
-            } else if let Some((version_id, version)) = version {
-                return Ok(Some((*version_id, version.clone())));
+            } else {
+                break;
             }
         }
 
-        Err(Error::Outdated)
+        if let Some((version_id, version)) = version {
+            return Ok(Some((*version_id, version.clone())));
+        } else {
+            Err(Error::Outdated)
+        }
     }
 
     /// Lock this value for reading at the given `txn_id`.
@@ -290,7 +368,7 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
     }
 
     /// Synchronously lock this value for exclusive reading at the given `txn_id`, if possible.
-    pub async fn try_read_exclusive(
+    pub fn try_read_exclusive(
         &self,
         txn_id: &TxnId,
     ) -> Result<TxnLockReadGuardExclusive<TxnId, T>> {
@@ -316,6 +394,8 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
 
     fn write_inner(&self, txn_id: &TxnId) -> Result<Option<Arc<RwLock<T>>>> {
         let mut state = self.state.lock().expect("lock state");
+        assert!(!state.versions.is_empty());
+
         if let Some(version) = state.versions.get(txn_id) {
             return match version {
                 Version::Committed(_) => Err(Error::Committed),
@@ -386,6 +466,7 @@ impl<TxnId: fmt::Display + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
     pub async fn commit(&self, txn_id: &TxnId) -> Arc<T> {
         let mut state = loop {
             let state = self.state.lock().expect("lock state");
+            assert!(!state.versions.is_empty());
 
             if state
                 .versions
@@ -401,13 +482,19 @@ impl<TxnId: fmt::Display + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
         };
 
         let canon = if let Some((txn_id, version)) = state.versions.remove_entry(txn_id) {
-            match version {
+            let value = match version {
                 Version::Committed(_) => panic!("duplicate commit {}", txn_id),
                 Version::Pending(lock) => {
                     let guard = lock.try_read().expect("canon");
                     Arc::new(T::clone(&*guard))
                 }
-            }
+            };
+
+            state
+                .versions
+                .insert(txn_id, Version::Committed(value.clone()));
+
+            value
         } else {
             let mut canon = None;
             for (version_id, version) in &state.versions {
@@ -435,6 +522,8 @@ impl<TxnId: fmt::Display + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
     /// Roll back the value of this [`TxnLock`] at the given `txn_id`.
     pub fn rollback(&self, txn_id: &TxnId) {
         let mut state = self.state.lock().expect("lock state");
+        assert!(!state.versions.is_empty());
+
         if state.versions.remove(txn_id).is_some() {
             self.notify.notify_waiters();
         }
@@ -443,6 +532,8 @@ impl<TxnId: fmt::Display + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
     /// Drop all values of this [`TxnLock`] older than the given `txn_id`.
     pub fn finalize(&self, txn_id: &TxnId) {
         let mut state = self.state.lock().expect("lock state");
+        assert!(!state.versions.is_empty());
+
         let finalized = state
             .versions
             .keys()

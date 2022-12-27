@@ -1,6 +1,6 @@
 [package]
 name = "txn_lock"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["haydn@tinychain.net"]
 edition = "2021"
 description = "A futures-aware transactional read-write lock"
@@ -13,3 +13,6 @@ categories = ["concurrency", "data-structures"]
 
 [dependencies]
 tokio = { version = "1.23", features = ["sync"] }
+
+[dev-dependencies]
+futures = "0.3"
