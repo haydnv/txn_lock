@@ -8,53 +8,27 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 #[derive(Copy, Clone, Eq, PartialEq)]
-pub enum ErrorKind {
+pub enum Error {
+    Committed,
     Conflict,
     Outdated,
     WouldBlock,
 }
 
-impl fmt::Display for ErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::Conflict => f.write_str("Conflict"),
-            Self::Outdated => f.write_str("Outdated"),
-            Self::WouldBlock => f.write_str("WouldBlock"),
-        }
-    }
-}
-
-pub struct Error {
-    kind: ErrorKind,
-    message: String,
-}
-
-impl Error {
-    fn new<M: fmt::Display>(kind: ErrorKind, message: M) -> Self {
-        Self {
-            kind,
-            message: message.to_string(),
-        }
-    }
-
-    pub fn kind(&self) -> &ErrorKind {
-        &self.kind
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
-
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}: {}", self.kind, self.message)
+        f.write_str(match self {
+            Self::Committed => "cannot acquire an exclusive lock after committing",
+            Self::Conflict => "there is already a transactional write lock in the future",
+            Self::Outdated => "the value has already been finalized",
+            Self::WouldBlock => "unable to acquire a lock",
+        })
     }
 }
 
 impl fmt::Debug for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}: {}", self.kind, self.message)
+        fmt::Display::fmt(self, f)
     }
 }
 
@@ -252,10 +226,7 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
             }
         }
 
-        Err(Error::new(
-            ErrorKind::Outdated,
-            format!("value has already been finalized at {}", txn_id),
-        ))
+        Err(Error::Outdated)
     }
 
     /// Lock this value for reading at the given `txn_id`.
@@ -279,20 +250,15 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
     pub fn try_read(&self, txn_id: &TxnId) -> Result<TxnLockReadGuard<T>> {
         if let Some((_version_id, version)) = self.read_inner(txn_id)? {
             match version {
-                Version::Pending(lock) => {
-                    let guard = lock
-                        .try_read_owned()
-                        .map_err(|err| Error::new(ErrorKind::WouldBlock, err))?;
+                Version::Pending(lock) => lock
+                    .try_read_owned()
+                    .map(|guard| TxnLockReadGuard::Pending(self.notify.clone(), guard))
+                    .map_err(|_err| Error::WouldBlock),
 
-                    Ok(TxnLockReadGuard::Pending(self.notify.clone(), guard))
-                }
                 Version::Committed(value) => Ok(TxnLockReadGuard::Committed(value)),
             }
         } else {
-            Err(Error::new(
-                ErrorKind::WouldBlock,
-                format!("there is a write pending at {}", txn_id),
-            ))
+            Err(Error::WouldBlock)
         }
     }
 
@@ -304,7 +270,7 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
         loop {
             if let Some((version_id, version)) = self.read_inner(txn_id)? {
                 return match version {
-                    Version::Committed(_) if &version_id == txn_id => Err(Error::new(ErrorKind::Conflict, "cannot acquire an exclusive lock on a transactional version after committing")),
+                    Version::Committed(_) if &version_id == txn_id => Err(Error::Committed),
                     Version::Committed(value) => {
                         assert!(&version_id < txn_id);
                         let state = ExclusiveReadGuardState::Canon(self.clone(), *txn_id, value);
@@ -330,10 +296,7 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
     ) -> Result<TxnLockReadGuardExclusive<TxnId, T>> {
         if let Some((version_id, version)) = self.read_inner(txn_id)? {
             match version {
-                Version::Committed(_) if &version_id == txn_id => Err(Error::new(
-                    ErrorKind::Conflict,
-                    "cannot acquire an exclusive lock on a transactional version after committing",
-                )),
+                Version::Committed(_) if &version_id == txn_id => Err(Error::Committed),
                 Version::Committed(value) => {
                     assert!(&version_id < txn_id);
                     let state = ExclusiveReadGuardState::Canon(self.clone(), *txn_id, value);
@@ -341,19 +304,13 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
                 }
                 Version::Pending(lock) => {
                     assert_eq!(&version_id, txn_id);
-                    let guard = lock
-                        .try_write_owned()
-                        .map_err(|err| Error::new(ErrorKind::WouldBlock, err))?;
-
+                    let guard = lock.try_write_owned().map_err(|_err| Error::WouldBlock)?;
                     let state = ExclusiveReadGuardState::Pending(self.notify.clone(), guard);
                     Ok(TxnLockReadGuardExclusive { state })
                 }
             }
         } else {
-            Err(Error::new(
-                ErrorKind::WouldBlock,
-                format!("unable to acquire an exclusive lock at {}", txn_id),
-            ))
+            Err(Error::WouldBlock)
         }
     }
 
@@ -361,10 +318,7 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
         let mut state = self.state.lock().expect("lock state");
         if let Some(version) = state.versions.get(txn_id) {
             return match version {
-                Version::Committed(_) => Err(Error::new(
-                    ErrorKind::Conflict,
-                    "cannot write-lock a committed version",
-                )),
+                Version::Committed(_) => Err(Error::Committed),
                 Version::Pending(lock) => Ok(Some(lock.clone())),
             };
         }
@@ -372,10 +326,7 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
         let mut canon = None;
         for (version_id, version) in &state.versions {
             if version_id > txn_id {
-                return Err(Error::new(
-                    ErrorKind::Conflict,
-                    "there is already a transactional write lock in the future",
-                ));
+                return Err(Error::Conflict);
             }
 
             match version {
@@ -392,10 +343,7 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
 
             Ok(Some(lock))
         } else {
-            Err(Error::new(
-                ErrorKind::Outdated,
-                format!("value has already been finalized at {}", txn_id),
-            ))
+            Err(Error::Outdated)
         }
     }
 
@@ -417,19 +365,14 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
     /// Synchronously lock this value for writing at the given `txn_id`, if possible.
     pub fn try_write(&self, txn_id: &TxnId) -> Result<TxnLockWriteGuard<T>> {
         if let Some(lock) = self.write_inner(txn_id)? {
-            let guard = lock
-                .try_write_owned()
-                .map_err(|err| Error::new(ErrorKind::WouldBlock, err))?;
-
-            return Ok(TxnLockWriteGuard {
-                notify: self.notify.clone(),
-                guard,
-            });
+            lock.try_write_owned()
+                .map(|guard| TxnLockWriteGuard {
+                    notify: self.notify.clone(),
+                    guard,
+                })
+                .map_err(|_err| Error::WouldBlock)
         } else {
-            Err(Error::new(
-                ErrorKind::WouldBlock,
-                format!("unable to acquire a write lock at {}", txn_id),
-            ))
+            Err(Error::WouldBlock)
         }
     }
 }
