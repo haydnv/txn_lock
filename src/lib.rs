@@ -435,7 +435,9 @@ impl<TxnId: fmt::Display + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
     /// Roll back the value of this [`TxnLock`] at the given `txn_id`.
     pub fn rollback(&self, txn_id: &TxnId) {
         let mut state = self.state.lock().expect("lock state");
-        state.versions.remove(txn_id);
+        if state.versions.remove(txn_id).is_some() {
+            self.notify.notify_waiters();
+        }
     }
 
     /// Drop all values of this [`TxnLock`] older than the given `txn_id`.
