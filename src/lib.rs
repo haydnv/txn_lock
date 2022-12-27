@@ -9,15 +9,22 @@
 //! use txn_lock::*;
 //!
 //! let lock = TxnLock::new(0, "zero");
+//!
+//! assert_eq!(*lock.try_read(0).expect("read"), "zero");
+//! assert_eq!(lock.try_write(1).unwrap_err(), Error::WouldBlock);
+//!
+//! block_on(lock.commit(&0));
+//!
 //! {
 //!     let mut guard = lock.try_write(1).expect("write lock");
 //!     *guard = "one";
 //! }
 //!
+//! assert_eq!(*lock.try_read(0).expect("read past version"), "zero");
+//! assert_eq!(*lock.try_read(1).expect("read current version"), "one");
+//!
 //! block_on(lock.commit(&1));
 //!
-//! assert_eq!(*lock.try_read(0).expect("old value"), "zero");
-//! assert_eq!(*lock.try_read(1).expect("current value"), "one");
 //! assert_eq!(*lock.try_read_exclusive(2).expect("new value"), "one");
 //!
 //! lock.rollback(&2);
@@ -32,7 +39,6 @@
 //! assert_eq!(lock.try_read(0).unwrap_err(), Error::Outdated);
 //! assert_eq!(*lock.try_read(2).expect("old value"), "one");
 //! assert_eq!(*lock.try_read(3).expect("current value"), "three");
-//! assert_eq!(lock.try_read(4).unwrap_err(), Error::WouldBlock);
 //!
 //! ```
 
@@ -290,9 +296,9 @@ impl<TxnId, T> Clone for TxnLock<TxnId, T> {
 
 impl<TxnId: Ord, T> TxnLock<TxnId, T> {
     /// Create a new transactional lock.
-    pub fn new(last_commit: TxnId, value: T) -> Self {
+    pub fn new(txn_id: TxnId, value: T) -> Self {
         let mut versions = VecDeque::new();
-        versions.push_back((last_commit, Version::Committed(Arc::new(value))));
+        versions.push_back((txn_id, Version::Pending(Arc::new(RwLock::new(value)))));
 
         Self {
             notify: Arc::new(Notify::new()),
