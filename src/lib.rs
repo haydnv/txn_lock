@@ -36,7 +36,7 @@
 //!
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
@@ -236,7 +236,7 @@ impl<T> Clone for Version<T> {
 }
 
 struct LockState<TxnId, T> {
-    versions: BTreeMap<TxnId, Version<T>>,
+    versions: VecDeque<(TxnId, Version<T>)>,
 }
 
 pub struct TxnLock<TxnId, T> {
@@ -256,8 +256,8 @@ impl<TxnId, T> Clone for TxnLock<TxnId, T> {
 impl<TxnId: Copy + Ord, T> TxnLock<TxnId, T> {
     /// Create a new transactional lock.
     pub fn new(last_commit: TxnId, value: T) -> Self {
-        let mut versions = BTreeMap::new();
-        versions.insert(last_commit, Version::Committed(Arc::new(value)));
+        let mut versions = VecDeque::new();
+        versions.push_back((last_commit, Version::Committed(Arc::new(value))));
 
         Self {
             notify: Arc::new(Notify::new()),
@@ -269,11 +269,16 @@ impl<TxnId: Copy + Ord, T> TxnLock<TxnId, T> {
 impl<TxnId: Ord, T> TxnLock<TxnId, T> {
     fn create_value(&self, txn_id: TxnId, value: T) -> Arc<RwLock<T>> {
         let mut state = self.state.lock().expect("lock state");
-        assert!(!state.versions.contains_key(&txn_id));
+
+        if let Some((prev_id, _)) = state.versions.iter().last() {
+            assert!(prev_id < &txn_id);
+        } else {
+            panic!("transaction lock has no canonical version");
+        }
 
         let lock = Arc::new(RwLock::new(value));
         let version = Version::Pending(lock.clone());
-        state.versions.insert(txn_id, version);
+        state.versions.push_back((txn_id, version));
         lock
     }
 }
@@ -283,10 +288,6 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
         let state = self.state.lock().expect("lock state");
         assert!(!state.versions.is_empty());
 
-        if let Some(version) = state.versions.get(txn_id) {
-            return Ok(Some((*txn_id, version.clone())));
-        }
-
         let mut version = None;
         for (candidate_id, candidate) in &state.versions {
             if candidate_id < txn_id {
@@ -295,6 +296,8 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
                 } else {
                     version = Some((candidate_id, candidate));
                 }
+            } else if candidate_id == txn_id {
+                return Ok(Some((*txn_id, candidate.clone())));
             } else {
                 break;
             }
@@ -396,22 +399,20 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
         let mut state = self.state.lock().expect("lock state");
         assert!(!state.versions.is_empty());
 
-        if let Some(version) = state.versions.get(txn_id) {
-            return match version {
-                Version::Committed(_) => Err(Error::Committed),
-                Version::Pending(lock) => Ok(Some(lock.clone())),
-            };
-        }
-
         let mut canon = None;
         for (version_id, version) in &state.versions {
             if version_id > txn_id {
                 return Err(Error::Conflict);
-            }
-
-            match version {
-                Version::Pending(_) => return Ok(None),
-                Version::Committed(value) => canon = Some(value),
+            } else if version_id == txn_id {
+                return match version {
+                    Version::Pending(lock) => Ok(Some(lock.clone())),
+                    Version::Committed(_value) => Err(Error::Committed),
+                };
+            } else {
+                match version {
+                    Version::Pending(_) => return Ok(None),
+                    Version::Committed(value) => canon = Some(value),
+                }
             }
         }
 
@@ -419,7 +420,7 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
             let lock = Arc::new(RwLock::new(T::clone(&*canon)));
             state
                 .versions
-                .insert(*txn_id, Version::Pending(lock.clone()));
+                .push_back((*txn_id, Version::Pending(lock.clone())));
 
             Ok(Some(lock))
         } else {
@@ -459,6 +460,7 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
 
 impl<TxnId: fmt::Display + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
     /// Commit the value of this [`TxnLock`] at the given `txn_id`.
+    /// This will wait until any earlier write locks have been committed or rolled back.
     ///
     /// Panics:
     ///  - when called twice with the same `txn_id`
@@ -481,9 +483,17 @@ impl<TxnId: fmt::Display + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
             }
         };
 
-        let canon = if let Some((txn_id, version)) = state.versions.remove_entry(txn_id) {
+        let pending = state
+            .versions
+            .back()
+            .map(|(version_id, _version)| version_id == txn_id)
+            .expect("latest version");
+
+        let canon = if pending {
+            let (txn_id, version) = state.versions.pop_back().expect("version to commit");
+
             let value = match version {
-                Version::Committed(_) => panic!("duplicate commit {}", txn_id),
+                Version::Committed(_value) => panic!("duplicate commit {}", txn_id),
                 Version::Pending(lock) => {
                     let guard = lock.try_read().expect("canon");
                     Arc::new(T::clone(&*guard))
@@ -492,10 +502,11 @@ impl<TxnId: fmt::Display + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
 
             state
                 .versions
-                .insert(txn_id, Version::Committed(value.clone()));
+                .push_back((txn_id, Version::Committed(value.clone())));
 
             value
         } else {
+            // TODO: binary search
             let mut canon = None;
             for (version_id, version) in &state.versions {
                 if version_id > txn_id {
@@ -524,7 +535,17 @@ impl<TxnId: fmt::Display + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
         let mut state = self.state.lock().expect("lock state");
         assert!(!state.versions.is_empty());
 
-        if state.versions.remove(txn_id).is_some() {
+        // TODO: binary search
+        let mut index = None;
+        for (i, (version_id, _version)) in state.versions.iter().enumerate() {
+            if version_id == txn_id {
+                index = Some(i);
+                break;
+            }
+        }
+
+        if let Some(i) = index {
+            state.versions.remove(i);
             self.notify.notify_waiters();
         }
     }
@@ -534,16 +555,8 @@ impl<TxnId: fmt::Display + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
         let mut state = self.state.lock().expect("lock state");
         assert!(!state.versions.is_empty());
 
-        let finalized = state
-            .versions
-            .keys()
-            .rev()
-            .filter(|version_id| *version_id <= txn_id)
-            .copied()
-            .collect::<Vec<_>>();
-
-        for version_id in &finalized[1..] {
-            state.versions.remove(version_id);
+        while state.versions.len() > 1 && &state.versions[1].0 <= txn_id {
+            state.versions.pop_front();
         }
     }
 }
