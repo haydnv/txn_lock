@@ -10,7 +10,7 @@
 //!
 //! let lock = TxnLock::new(0, "zero");
 //! {
-//!     let mut guard = lock.try_write(&1).expect("write lock");
+//!     let mut guard = lock.try_write(1).expect("write lock");
 //!     *guard = "one";
 //! }
 //!
@@ -18,12 +18,12 @@
 //!
 //! assert_eq!(*lock.try_read(&0).expect("old value"), "zero");
 //! assert_eq!(*lock.try_read(&1).expect("current value"), "one");
-//! assert_eq!(*lock.try_read_exclusive(&2).expect("new value"), "one");
+//! assert_eq!(*lock.try_read_exclusive(2).expect("new value"), "one");
 //!
 //! lock.rollback(&2);
 //!
 //! {
-//!     let mut guard = lock.try_write(&3).expect("write lock");
+//!     let mut guard = lock.try_write(3).expect("write lock");
 //!     *guard = "three";
 //! }
 //!
@@ -36,6 +36,7 @@
 //!
 //! ```
 
+use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
@@ -119,7 +120,7 @@ pub struct TxnLockReadGuardExclusive<TxnId, T> {
     state: ExclusiveReadGuardState<TxnId, T>,
 }
 
-impl<TxnId: Copy + Ord, T: Clone> TxnLockReadGuardExclusive<TxnId, T> {
+impl<TxnId: Ord, T: Clone> TxnLockReadGuardExclusive<TxnId, T> {
     /// Upgrade this exclusive read lock to a write lock.
     pub fn upgrade(mut self) -> TxnLockWriteGuard<T> {
         let mut state = ExclusiveReadGuardState::Upgraded;
@@ -253,7 +254,7 @@ impl<TxnId, T> Clone for TxnLock<TxnId, T> {
     }
 }
 
-impl<TxnId: Copy + Ord, T> TxnLock<TxnId, T> {
+impl<TxnId: Ord, T> TxnLock<TxnId, T> {
     /// Create a new transactional lock.
     pub fn new(last_commit: TxnId, value: T) -> Self {
         let mut versions = VecDeque::new();
@@ -283,8 +284,13 @@ impl<TxnId: Ord, T> TxnLock<TxnId, T> {
     }
 }
 
-impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
-    fn read_inner(&self, txn_id: &TxnId) -> Result<Option<(TxnId, Version<T>)>> {
+enum Write<TxnId, T> {
+    Pending(TxnId),
+    Version(Arc<RwLock<T>>),
+}
+
+impl<TxnId: fmt::Display + fmt::Debug + Ord, T: Clone> TxnLock<TxnId, T> {
+    fn read_inner(&self, txn_id: &TxnId) -> Result<Option<(Ordering, Version<T>)>> {
         let state = self.state.lock().expect("lock state");
         assert!(!state.versions.is_empty());
 
@@ -294,17 +300,17 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
                 if candidate.is_pending() {
                     return Ok(None);
                 } else {
-                    version = Some((candidate_id, candidate));
+                    version = Some((Ordering::Less, candidate));
                 }
             } else if candidate_id == txn_id {
-                return Ok(Some((*txn_id, candidate.clone())));
+                return Ok(Some((Ordering::Equal, candidate.clone())));
             } else {
                 break;
             }
         }
 
-        if let Some((version_id, version)) = version {
-            return Ok(Some((*version_id, version.clone())));
+        if let Some((ordering, version)) = version {
+            return Ok(Some((ordering, version.clone())));
         } else {
             Err(Error::Outdated)
         }
@@ -313,7 +319,7 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
     /// Lock this value for reading at the given `txn_id`.
     pub async fn read(&self, txn_id: &TxnId) -> Result<TxnLockReadGuard<T>> {
         loop {
-            if let Some((_version_id, version)) = self.read_inner(txn_id)? {
+            if let Some((_ordering, version)) = self.read_inner(txn_id)? {
                 return match version {
                     Version::Pending(lock) => {
                         let guard = lock.read_owned().await;
@@ -329,7 +335,7 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
 
     /// Synchronously Lock this value for reading at the given `txn_id`, if possible.
     pub fn try_read(&self, txn_id: &TxnId) -> Result<TxnLockReadGuard<T>> {
-        if let Some((_version_id, version)) = self.read_inner(txn_id)? {
+        if let Some((_ordering, version)) = self.read_inner(txn_id)? {
             match version {
                 Version::Pending(lock) => lock
                     .try_read_owned()
@@ -346,19 +352,19 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
     /// Lock this value for exclusive reading at the given `txn_id`.
     pub async fn read_exclusive(
         &self,
-        txn_id: &TxnId,
+        txn_id: TxnId,
     ) -> Result<TxnLockReadGuardExclusive<TxnId, T>> {
         loop {
-            if let Some((version_id, version)) = self.read_inner(txn_id)? {
+            if let Some((ordering, version)) = self.read_inner(&txn_id)? {
                 return match version {
-                    Version::Committed(_) if &version_id == txn_id => Err(Error::Committed),
+                    Version::Committed(_) if ordering == Ordering::Equal => Err(Error::Committed),
                     Version::Committed(value) => {
-                        assert!(&version_id < txn_id);
-                        let state = ExclusiveReadGuardState::Canon(self.clone(), *txn_id, value);
+                        assert_eq!(ordering, Ordering::Less);
+                        let state = ExclusiveReadGuardState::Canon(self.clone(), txn_id, value);
                         Ok(TxnLockReadGuardExclusive { state })
                     }
                     Version::Pending(lock) => {
-                        assert_eq!(&version_id, txn_id);
+                        assert_eq!(ordering, Ordering::Equal);
                         let guard = lock.write_owned().await;
                         let state = ExclusiveReadGuardState::Pending(self.notify.clone(), guard);
                         Ok(TxnLockReadGuardExclusive { state })
@@ -371,20 +377,17 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
     }
 
     /// Synchronously lock this value for exclusive reading at the given `txn_id`, if possible.
-    pub fn try_read_exclusive(
-        &self,
-        txn_id: &TxnId,
-    ) -> Result<TxnLockReadGuardExclusive<TxnId, T>> {
-        if let Some((version_id, version)) = self.read_inner(txn_id)? {
+    pub fn try_read_exclusive(&self, txn_id: TxnId) -> Result<TxnLockReadGuardExclusive<TxnId, T>> {
+        if let Some((ordering, version)) = self.read_inner(&txn_id)? {
             match version {
-                Version::Committed(_) if &version_id == txn_id => Err(Error::Committed),
+                Version::Committed(_) if ordering == Ordering::Equal => Err(Error::Committed),
                 Version::Committed(value) => {
-                    assert!(&version_id < txn_id);
-                    let state = ExclusiveReadGuardState::Canon(self.clone(), *txn_id, value);
+                    assert_eq!(ordering, Ordering::Less);
+                    let state = ExclusiveReadGuardState::Canon(self.clone(), txn_id, value);
                     Ok(TxnLockReadGuardExclusive { state })
                 }
                 Version::Pending(lock) => {
-                    assert_eq!(&version_id, txn_id);
+                    assert_eq!(ordering, Ordering::Equal);
                     let guard = lock.try_write_owned().map_err(|_err| Error::WouldBlock)?;
                     let state = ExclusiveReadGuardState::Pending(self.notify.clone(), guard);
                     Ok(TxnLockReadGuardExclusive { state })
@@ -395,30 +398,30 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
         }
     }
 
-    fn write_inner(&self, txn_id: &TxnId) -> Result<Option<Arc<RwLock<T>>>> {
+    fn write_inner(&self, txn_id: TxnId) -> Result<Write<TxnId, T>> {
         let mut state = self.state.lock().expect("lock state");
         assert!(!state.versions.is_empty());
 
         if let Some((version_id, version)) = state.versions.back() {
-            if version_id == txn_id {
+            if version_id == &txn_id {
                 return match version {
-                    Version::Pending(lock) => Ok(Some(lock.clone())),
+                    Version::Pending(lock) => Ok(Write::Version(lock.clone())),
                     Version::Committed(_value) => Err(Error::Committed),
                 };
-            } else if version_id > txn_id {
+            } else if version_id > &txn_id {
                 return Err(Error::Conflict);
-            } else if version_id < txn_id {
+            } else if version_id < &txn_id {
                 if version.is_pending() {
-                    return Ok(None);
+                    return Ok(Write::Pending(txn_id));
                 }
             }
         }
 
-        if &state.versions.front().unwrap().0 > txn_id {
+        if &state.versions.front().unwrap().0 > &txn_id {
             return Err(Error::Outdated);
         }
 
-        let (left, _right) = binary_search(&state.versions, txn_id);
+        let (left, _right) = binary_search(&state.versions, &txn_id);
         let canon = match &state.versions[left].1 {
             Version::Committed(canon) => canon,
             Version::Pending(_lock) => unreachable!(),
@@ -427,42 +430,45 @@ impl<TxnId: fmt::Display + fmt::Debug + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
         let lock = Arc::new(RwLock::new(T::clone(&*canon)));
         state
             .versions
-            .push_back((*txn_id, Version::Pending(lock.clone())));
+            .push_back((txn_id, Version::Pending(lock.clone())));
 
-        Ok(Some(lock))
+        Ok(Write::Version(lock.clone()))
     }
 
     /// Lock this value for writing at the given `txn_id`.
-    pub async fn write(&self, txn_id: &TxnId) -> Result<TxnLockWriteGuard<T>> {
+    pub async fn write(&self, mut txn_id: TxnId) -> Result<TxnLockWriteGuard<T>> {
         loop {
-            if let Some(lock) = self.write_inner(txn_id)? {
-                let guard = lock.write_owned().await;
-                return Ok(TxnLockWriteGuard {
-                    notify: self.notify.clone(),
-                    guard,
-                });
-            }
+            txn_id = match self.write_inner(txn_id)? {
+                Write::Pending(txn_id) => txn_id,
+                Write::Version(lock) => {
+                    let guard = lock.write_owned().await;
+                    return Ok(TxnLockWriteGuard {
+                        notify: self.notify.clone(),
+                        guard,
+                    });
+                }
+            };
 
             self.notify.notified().await;
         }
     }
 
     /// Synchronously lock this value for writing at the given `txn_id`, if possible.
-    pub fn try_write(&self, txn_id: &TxnId) -> Result<TxnLockWriteGuard<T>> {
-        if let Some(lock) = self.write_inner(txn_id)? {
-            lock.try_write_owned()
+    pub fn try_write(&self, txn_id: TxnId) -> Result<TxnLockWriteGuard<T>> {
+        match self.write_inner(txn_id)? {
+            Write::Pending(_) => Err(Error::WouldBlock),
+            Write::Version(lock) => lock
+                .try_write_owned()
                 .map(|guard| TxnLockWriteGuard {
                     notify: self.notify.clone(),
                     guard,
                 })
-                .map_err(|_err| Error::WouldBlock)
-        } else {
-            Err(Error::WouldBlock)
+                .map_err(|_err| Error::WouldBlock),
         }
     }
 }
 
-impl<TxnId: fmt::Display + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
+impl<TxnId: fmt::Display + Ord, T: Clone> TxnLock<TxnId, T> {
     /// Commit the value of this [`TxnLock`] at the given `txn_id`.
     /// This will wait until any earlier write locks have been committed or rolled back.
     ///
