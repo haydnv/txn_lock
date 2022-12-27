@@ -16,8 +16,8 @@
 //!
 //! block_on(lock.commit(&1));
 //!
-//! assert_eq!(*lock.try_read(&0).expect("old value"), "zero");
-//! assert_eq!(*lock.try_read(&1).expect("current value"), "one");
+//! assert_eq!(*lock.try_read(0).expect("old value"), "zero");
+//! assert_eq!(*lock.try_read(1).expect("current value"), "one");
 //! assert_eq!(*lock.try_read_exclusive(2).expect("new value"), "one");
 //!
 //! lock.rollback(&2);
@@ -29,10 +29,10 @@
 //!
 //! lock.finalize(&2);
 //!
-//! assert_eq!(lock.try_read(&0).unwrap_err(), Error::Outdated);
-//! assert_eq!(*lock.try_read(&2).expect("old value"), "one");
-//! assert_eq!(*lock.try_read(&3).expect("current value"), "three");
-//! assert_eq!(lock.try_read(&4).unwrap_err(), Error::WouldBlock);
+//! assert_eq!(lock.try_read(0).unwrap_err(), Error::Outdated);
+//! assert_eq!(*lock.try_read(2).expect("old value"), "one");
+//! assert_eq!(*lock.try_read(3).expect("current value"), "three");
+//! assert_eq!(lock.try_read(4).unwrap_err(), Error::WouldBlock);
 //!
 //! ```
 
@@ -73,40 +73,46 @@ impl std::error::Error for Error {}
 
 type Result<T> = std::result::Result<T, Error>;
 
-pub enum TxnLockReadGuard<T> {
+pub enum TxnLockReadGuard<TxnId, T> {
     Committed(Arc<T>),
-    Pending(Arc<Notify>, OwnedRwLockReadGuard<T>),
+    Pending(Arc<Notify>, Arc<RwLock<T>>, TxnId, OwnedRwLockReadGuard<T>),
 }
 
-impl<T> Deref for TxnLockReadGuard<T> {
+impl<TxnId: Clone, T> Clone for TxnLockReadGuard<TxnId, T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Committed(value) => Self::Committed(value.clone()),
+            Self::Pending(notify, lock, txn_id, _guard) => {
+                let guard = lock.clone().try_read_owned().expect("read lock");
+                Self::Pending(notify.clone(), lock.clone(), txn_id.clone(), guard)
+            }
+        }
+    }
+}
+
+impl<TxnId, T> Deref for TxnLockReadGuard<TxnId, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
         match self {
             Self::Committed(value) => value,
-            Self::Pending(_notify, guard) => guard.deref(),
+            Self::Pending(_notify, _lock, _txn_id, guard) => guard.deref(),
         }
     }
 }
 
-impl<T> Drop for TxnLockReadGuard<T> {
+impl<TxnId, T> Drop for TxnLockReadGuard<TxnId, T> {
     fn drop(&mut self) {
         match self {
             Self::Committed(_) => {}
-            Self::Pending(notify, _) => notify.notify_waiters(),
+            Self::Pending(notify, _, _, _) => notify.notify_waiters(),
         }
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for TxnLockReadGuard<T> {
+impl<TxnId, T: fmt::Debug> fmt::Debug for TxnLockReadGuard<TxnId, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Debug::fmt(self.deref(), f)
-    }
-}
-
-impl<T: fmt::Display> fmt::Display for TxnLockReadGuard<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Display::fmt(self.deref(), f)
+        write!(f, "transactional read lock on {:?}", self.deref())
     }
 }
 
@@ -317,13 +323,18 @@ impl<TxnId: fmt::Display + fmt::Debug + Ord, T: Clone> TxnLock<TxnId, T> {
     }
 
     /// Lock this value for reading at the given `txn_id`.
-    pub async fn read(&self, txn_id: &TxnId) -> Result<TxnLockReadGuard<T>> {
+    pub async fn read(&self, txn_id: TxnId) -> Result<TxnLockReadGuard<TxnId, T>> {
         loop {
-            if let Some((_ordering, version)) = self.read_inner(txn_id)? {
+            if let Some((_ordering, version)) = self.read_inner(&txn_id)? {
                 return match version {
                     Version::Pending(lock) => {
-                        let guard = lock.read_owned().await;
-                        Ok(TxnLockReadGuard::Pending(self.notify.clone(), guard))
+                        let guard = lock.clone().read_owned().await;
+                        Ok(TxnLockReadGuard::Pending(
+                            self.notify.clone(),
+                            lock,
+                            txn_id,
+                            guard,
+                        ))
                     }
                     Version::Committed(value) => Ok(TxnLockReadGuard::Committed(value)),
                 };
@@ -334,12 +345,15 @@ impl<TxnId: fmt::Display + fmt::Debug + Ord, T: Clone> TxnLock<TxnId, T> {
     }
 
     /// Synchronously Lock this value for reading at the given `txn_id`, if possible.
-    pub fn try_read(&self, txn_id: &TxnId) -> Result<TxnLockReadGuard<T>> {
-        if let Some((_ordering, version)) = self.read_inner(txn_id)? {
+    pub fn try_read(&self, txn_id: TxnId) -> Result<TxnLockReadGuard<TxnId, T>> {
+        if let Some((_ordering, version)) = self.read_inner(&txn_id)? {
             match version {
                 Version::Pending(lock) => lock
+                    .clone()
                     .try_read_owned()
-                    .map(|guard| TxnLockReadGuard::Pending(self.notify.clone(), guard))
+                    .map(|guard| {
+                        TxnLockReadGuard::Pending(self.notify.clone(), lock, txn_id, guard)
+                    })
                     .map_err(|_err| Error::WouldBlock),
 
                 Version::Committed(value) => Ok(TxnLockReadGuard::Committed(value)),
