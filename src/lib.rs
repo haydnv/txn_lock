@@ -469,16 +469,17 @@ impl<TxnId: fmt::Display + fmt::Debug + Ord, T: Clone> TxnLock<TxnId, T> {
         #[cfg(feature = "logging")]
         trace!("write {} at {}", state.name, txn_id);
 
-        if let Some((version_id, version)) = state.versions.back() {
-            if version_id == &txn_id {
+        let (version_id, version) = state.versions.back().expect("latest version");
+        let canon = match txn_id.cmp(version_id) {
+            Ordering::Equal => {
                 return match version {
                     Version::Pending(lock) => Ok(Write::Version(lock.clone())),
                     Version::Committed(_value) => Err(Error::Committed),
-                };
-            } else if version_id > &txn_id {
-                return Err(Error::Conflict);
-            } else if version_id < &txn_id {
-                if version.is_pending() {
+                }
+            }
+            Ordering::Less => return Err(Error::Conflict),
+            Ordering::Greater => match version {
+                Version::Pending(_lock) => {
                     #[cfg(feature = "logging")]
                     debug!(
                         "write to {} at {} is pending a write at {}",
@@ -487,17 +488,8 @@ impl<TxnId: fmt::Display + fmt::Debug + Ord, T: Clone> TxnLock<TxnId, T> {
 
                     return Ok(Write::Pending(txn_id));
                 }
-            }
-        }
-
-        if &state.versions.front().unwrap().0 > &txn_id {
-            return Err(Error::Outdated);
-        }
-
-        let (left, _right) = binary_search(&state.versions, &txn_id);
-        let canon = match &state.versions[left].1 {
-            Version::Committed(canon) => canon,
-            Version::Pending(_lock) => unreachable!(),
+                Version::Committed(value) => value.clone(),
+            },
         };
 
         let lock = Arc::new(RwLock::new(T::clone(&*canon)));
@@ -544,7 +536,7 @@ impl<TxnId: fmt::Display + Ord, T: Clone> TxnLock<TxnId, T> {
         let mut state = self.state.lock().expect("lock state");
 
         #[cfg(feature = "logging")]
-        trace!("commit {} at {}", state.name, txn_id);
+        trace!("commit {} at {}...", state.name, txn_id);
 
         for (version_id, version) in state.versions.iter() {
             if version_id >= txn_id {
@@ -562,46 +554,50 @@ impl<TxnId: fmt::Display + Ord, T: Clone> TxnLock<TxnId, T> {
             }
         }
 
-        let pending = state
-            .versions
-            .back()
-            .map(|(version_id, _version)| version_id == txn_id)
-            .expect("latest version");
+        let canon = match state.versions.back_mut().expect("latest version") {
+            (version_id, version) if version_id == txn_id => {
+                let value = match version {
+                    Version::Pending(lock) => {
+                        let guard = lock.try_read().expect("canon");
+                        Arc::new(T::clone(&*guard))
+                    }
+                    Version::Committed(value) => {
+                        #[cfg(feature = "logging")]
+                        warn!("duplicate commit at {}...", txn_id);
+                        value.clone()
+                    }
+                };
 
-        if pending {
-            let (txn_id, version) = state.versions.pop_back().expect("version to commit");
-
-            let value = match version {
-                Version::Committed(value) => {
-                    #[cfg(feature = "logging")]
-                    warn!("duplicate commit {}", txn_id);
-                    value
-                }
-                Version::Pending(lock) => {
-                    let guard = lock.try_read().expect("canon");
-                    Arc::new(T::clone(&*guard))
-                }
-            };
-
-            state
-                .versions
-                .push_back((txn_id, Version::Committed(value.clone())));
-
-            Some(value)
-        } else {
-            if &state.versions[0].0 > txn_id {
-                panic!("value has already been finalized at {}", txn_id);
+                *version = Version::Committed(value.clone());
+                value
             }
+            (version_id, version) if &*version_id < txn_id => match version {
+                Version::Pending(_) => unreachable!(),
+                Version::Committed(value) => value.clone(),
+            },
+            _ => {
+                #[cfg(feature = "logging")]
+                trace!("{} has no version to commit at {}...", state.name, txn_id);
 
-            let (left, _right) = binary_search(&state.versions, txn_id);
-            match &state.versions[left] {
-                (version_id, Version::Committed(value)) => {
-                    assert!(version_id <= txn_id);
-                    Some(value.clone())
+                if &state.versions[0].0 > txn_id {
+                    panic!("value has already been finalized at {}", txn_id);
                 }
-                _ => unreachable!(),
+
+                let (left, _right) = bisect(&state.versions, txn_id);
+                match &state.versions[left] {
+                    (version_id, Version::Committed(value)) => {
+                        assert!(version_id <= txn_id);
+                        value.clone()
+                    }
+                    _ => unreachable!(),
+                }
             }
-        }
+        };
+
+        #[cfg(feature = "logging")]
+        trace!("committed {} at {}", state.name, txn_id);
+
+        Some(canon)
     }
 
     /// Commit the value of this [`TxnLock`] at the given `txn_id`.
@@ -630,9 +626,11 @@ impl<TxnId: fmt::Display + Ord, T: Clone> TxnLock<TxnId, T> {
 
         if &state.versions[0].0 > txn_id {
             return;
+        } else if &state.versions.back().expect("latest version").0 < txn_id {
+            return;
         }
 
-        let (left, right) = binary_search(&state.versions, txn_id);
+        let (left, right) = bisect(&state.versions, txn_id);
         if left == right {
             state.versions.remove(left);
             self.notify.notify_waiters();
@@ -673,25 +671,20 @@ impl<TxnId, T> fmt::Debug for TxnLock<TxnId, T> {
     }
 }
 
-fn binary_search<TxnId: PartialOrd, T>(
-    versions: &VecDeque<(TxnId, T)>,
-    txn_id: &TxnId,
-) -> (usize, usize) {
+fn bisect<TxnId: Ord, T>(versions: &VecDeque<(TxnId, T)>, needle: &TxnId) -> (usize, usize) {
     assert!(!versions.is_empty());
+    debug_assert!(&versions[0].0 <= needle);
+    debug_assert!(&versions[versions.len() - 1].0 >= needle);
 
     let mut left = 0;
     let mut right = versions.len();
 
     while (right - left) > 1 {
-        let mid = right / 2;
-
-        match &versions[mid].0 {
-            version_id if version_id > txn_id => right = mid,
-            version_id if version_id < txn_id => left = mid,
-            _ => {
-                right = mid;
-                left = mid;
-            }
+        let mid = (right - left) / 2;
+        match needle.cmp(&versions[mid].0) {
+            Ordering::Equal => return (mid, mid),
+            Ordering::Less => left = mid,
+            Ordering::Greater => right = mid,
         }
     }
 
