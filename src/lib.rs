@@ -318,8 +318,9 @@ impl<TxnId: Ord, T> TxnLock<TxnId, T> {
         let mut state = self.state.lock().expect("lock state");
         debug_assert!(!state.versions.is_empty());
 
-        if let Some((prev_id, _)) = state.versions.iter().last() {
-            assert!(prev_id < &txn_id);
+        if let Some((prev_id, version)) = state.versions.iter().last() {
+            debug_assert!(prev_id < &txn_id);
+            debug_assert!(!version.is_pending());
         } else {
             panic!("transaction lock has no canonical version");
         }
@@ -647,7 +648,7 @@ impl<TxnId: fmt::Display + Ord, T: Clone> TxnLock<TxnId, T> {
         let mut state = self.state.lock().expect("lock state");
         debug_assert!(!state.versions.is_empty());
 
-        while &state.versions[0].0 < txn_id {
+        while &state.versions[0].0 < txn_id && state.versions.len() > 1 {
             state.versions.pop_front();
         }
 
