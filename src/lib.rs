@@ -578,7 +578,7 @@ impl<TxnId: fmt::Display + Ord, T: Clone> TxnLock<TxnId, T> {
             },
             _ => {
                 #[cfg(feature = "logging")]
-                trace!("{} has no version to commit at {}...", state.name, txn_id);
+                trace!("{} has no version to commit at {}", state.name, txn_id);
 
                 if &state.versions[0].0 > txn_id {
                     panic!("value has already been finalized at {}", txn_id);
@@ -586,11 +586,17 @@ impl<TxnId: fmt::Display + Ord, T: Clone> TxnLock<TxnId, T> {
 
                 let (left, _right) = bisect(&state.versions, txn_id);
                 match &state.versions[left] {
-                    (version_id, Version::Committed(value)) => {
-                        assert!(version_id <= txn_id);
-                        value.clone()
+                    (version_id, version) => {
+                        assert!(version_id < txn_id);
+
+                        match version {
+                            Version::Committed(value) => value.clone(),
+                            Version::Pending(_lock) => panic!(
+                                "cannot commit at {} when {} is still pending",
+                                txn_id, version_id
+                            ),
+                        }
                     }
-                    _ => unreachable!(),
                 }
             }
         };
@@ -648,16 +654,21 @@ impl<TxnId: fmt::Display + Ord, T: Clone> TxnLock<TxnId, T> {
         let mut state = self.state.lock().expect("lock state");
         debug_assert!(!state.versions.is_empty());
 
-        while &state.versions[0].0 < txn_id && state.versions.len() > 1 {
-            state.versions.pop_front();
-        }
-
-        if &state.versions[0].0 == txn_id {
+        loop {
             if state.versions.len() == 1 {
-                assert!(!state.versions[0].1.is_pending());
-            } else {
-                state.versions.pop_front();
+                if &state.versions[0].0 <= txn_id {
+                    assert!(
+                        !state.versions[0].1.is_pending(),
+                        "finalize with no canonical version"
+                    );
+                }
+
+                break;
+            } else if &state.versions[0].0 > txn_id {
+                break;
             }
+
+            state.versions.pop_front();
         }
 
         assert!(!state.versions.is_empty());
@@ -682,7 +693,7 @@ fn bisect<TxnId: Ord, T>(versions: &VecDeque<(TxnId, T)>, needle: &TxnId) -> (us
 
     while (right - left) > 1 {
         let mid = (right - left) / 2;
-        match needle.cmp(&versions[mid].0) {
+        match &versions[mid].0.cmp(needle) {
             Ordering::Equal => return (mid, mid),
             Ordering::Less => left = mid,
             Ordering::Greater => right = mid,
