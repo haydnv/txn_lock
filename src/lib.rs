@@ -14,7 +14,11 @@
 //! assert_eq!(*lock.try_read(0).expect("read"), "zero");
 //! assert_eq!(lock.try_write(1).unwrap_err(), Error::WouldBlock);
 //!
-//! block_on(lock.commit(&0));
+//! {
+//!     let commit = block_on(lock.commit(0)).expect("commit guard");
+//!     assert_eq!(*commit, "zero");
+//!     // this commit guard will block future commits until dropped
+//! }
 //!
 //! {
 //!     let mut guard = lock.try_write(1).expect("write lock");
@@ -24,7 +28,7 @@
 //! assert_eq!(*lock.try_read(0).expect("read past version"), "zero");
 //! assert_eq!(*lock.try_read(1).expect("read current version"), "one");
 //!
-//! block_on(lock.commit(&1));
+//! block_on(lock.commit(1));
 //!
 //! assert_eq!(*lock.try_read_exclusive(2).expect("new value"), "one");
 //!
@@ -35,11 +39,10 @@
 //!     *guard = "three";
 //! }
 //!
-//! lock.finalize(&1);
+//! assert_eq!(*block_on(lock.finalize(&1)).expect("finalized version"), "one");
 //!
 //! assert_eq!(lock.try_read(0).unwrap_err(), Error::Outdated);
 //! assert_eq!(*lock.try_read(3).expect("current value"), "three");
-//!
 //! ```
 
 use std::collections::BTreeMap;
@@ -67,7 +70,7 @@ impl fmt::Display for Error {
             Self::Committed => "cannot acquire an exclusive lock after committing",
             Self::Conflict => "there is already a transactional write lock in the future",
             Self::Outdated => "the value has already been finalized",
-            Self::WouldBlock => "unable to acquire a lock",
+            Self::WouldBlock => "synchronous lock acquisition failed",
         })
     }
 }
@@ -82,126 +85,297 @@ impl std::error::Error for Error {}
 
 type Result<T> = std::result::Result<T, Error>;
 
-/// A read-only view of a [`TxnLock`] at a specific `TxnId`
-pub enum TxnLockReadGuard<TxnId, T> {
-    Read(Arc<Notify>, Arc<RwLock<T>>, TxnId, OwnedRwLockReadGuard<T>),
-    Committed(Arc<T>),
+#[derive(Copy, Debug, Clone, Eq, PartialEq)]
+enum VersionState {
+    Read,
+    Exclude,
+    Write,
+    Commit,
 }
 
-impl<TxnId: Copy, T> Clone for TxnLockReadGuard<TxnId, T> {
+struct Version<T> {
+    state: Arc<Mutex<VersionState>>,
+    lock: Arc<RwLock<T>>,
+}
+
+impl<T> Version<T> {
+    fn new(state: VersionState, value: T) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(state)),
+            lock: Arc::new(RwLock::new(value)),
+        }
+    }
+
+    fn is_exclusive(&self) -> bool {
+        let state = self.state.lock().expect("version state");
+        match &*state {
+            VersionState::Read => false,
+            VersionState::Exclude => true,
+            VersionState::Write => true,
+            VersionState::Commit => false,
+        }
+    }
+
+    fn is_final(&self) -> bool {
+        let state = self.state.lock().expect("version state");
+        &*state == &VersionState::Commit
+    }
+
+    fn commit(&self) -> Option<OwnedRwLockReadGuard<T>> {
+        let guard = self.lock.clone().try_read_owned().ok()?;
+
+        let mut state = self.state.lock().expect("version state");
+        *state = VersionState::Commit;
+
+        Some(guard)
+    }
+
+    async fn rollback(self) -> OwnedRwLockReadGuard<T> {
+        if self.is_final() {
+            panic!("cannot roll back a committed version");
+        }
+
+        self.lock.read_owned().await
+    }
+
+    async fn read(self, notify: Arc<Notify>) -> TxnLockReadGuard<T> {
+        let guard = self.lock.clone().read_owned().await;
+
+        TxnLockReadGuard {
+            lock: self.lock,
+            guard,
+            notify,
+        }
+    }
+
+    fn try_read(self, notify: Arc<Notify>) -> Result<TxnLockReadGuard<T>> {
+        self.lock
+            .clone()
+            .try_read_owned()
+            .map(|guard| TxnLockReadGuard {
+                lock: self.lock,
+                guard,
+                notify,
+            })
+            .map_err(|_| Error::WouldBlock)
+    }
+
+    async fn read_exclusive(self, notify: Arc<Notify>) -> Result<TxnLockReadGuardExclusive<T>> {
+        {
+            let mut state = self.state.lock().expect("version state");
+            if &*state == &VersionState::Commit {
+                return Err(Error::Committed);
+            } else if &*state == &VersionState::Read {
+                *state = VersionState::Exclude;
+            };
+        }
+
+        let guard = self.lock.clone().write_owned().await;
+
+        Ok(TxnLockReadGuardExclusive {
+            state: ReadGuardState::Active(guard, self),
+            notify,
+        })
+    }
+
+    fn try_read_exclusive(self, notify: Arc<Notify>) -> Result<TxnLockReadGuardExclusive<T>> {
+        {
+            let mut state = self.state.lock().expect("version state");
+            if &*state == &VersionState::Commit {
+                return Err(Error::Committed);
+            } else if &*state == &VersionState::Read {
+                *state = VersionState::Exclude;
+            };
+        }
+
+        self.lock
+            .clone()
+            .try_write_owned()
+            .map(|guard| TxnLockReadGuardExclusive {
+                state: ReadGuardState::Active(guard, self),
+                notify,
+            })
+            .map_err(|_| Error::WouldBlock)
+    }
+
+    async fn write(self, notify: Arc<Notify>) -> Result<TxnLockWriteGuard<T>> {
+        {
+            let mut state = self.state.lock().expect("version state");
+            if &*state == &VersionState::Commit {
+                return Err(Error::Committed);
+            } else {
+                *state = VersionState::Write;
+            };
+        }
+
+        let guard = self.lock.clone().write_owned().await;
+
+        Ok(TxnLockWriteGuard {
+            state: WriteGuardState::Active(guard, self, notify),
+        })
+    }
+
+    fn try_write(self, notify: Arc<Notify>) -> Result<TxnLockWriteGuard<T>> {
+        {
+            let mut state = self.state.lock().expect("version state");
+            if &*state == &VersionState::Commit {
+                return Err(Error::Committed);
+            } else {
+                *state = VersionState::Write;
+            };
+        }
+
+        self.lock
+            .clone()
+            .try_write_owned()
+            .map(|guard| TxnLockWriteGuard {
+                state: WriteGuardState::Active(guard, self, notify),
+            })
+            .map_err(|_| Error::WouldBlock)
+    }
+}
+
+impl<T> Clone for Version<T> {
     fn clone(&self) -> Self {
-        match self {
-            Self::Read(notify, lock, txn_id, _guard) => {
-                let guard = lock.clone().try_read_owned().expect("read lock");
-                Self::Read(notify.clone(), lock.clone(), *txn_id, guard)
-            }
-            Self::Committed(value) => Self::Committed(value.clone()),
+        Self {
+            state: self.state.clone(),
+            lock: self.lock.clone(),
         }
     }
 }
 
-impl<TxnId, T> Deref for TxnLockReadGuard<TxnId, T> {
+/// A read-only view of a [`TxnLock`] at a specific `TxnId`
+pub struct TxnLockReadGuard<T> {
+    lock: Arc<RwLock<T>>,
+    guard: OwnedRwLockReadGuard<T>,
+    notify: Arc<Notify>,
+}
+
+impl<T> Clone for TxnLockReadGuard<T> {
+    fn clone(&self) -> Self {
+        Self {
+            lock: self.lock.clone(),
+
+            guard: self
+                .lock
+                .clone()
+                .try_read_owned()
+                .expect("read guard clone"),
+
+            notify: self.notify.clone(),
+        }
+    }
+}
+
+impl<T> Deref for TxnLockReadGuard<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Read(_notify, _lock, _txn_id, guard) => guard.deref(),
-            Self::Committed(value) => value,
-        }
+        self.guard.deref()
     }
 }
 
-impl<TxnId, T> Drop for TxnLockReadGuard<TxnId, T> {
+impl<T> Drop for TxnLockReadGuard<T> {
     fn drop(&mut self) {
-        match self {
-            Self::Read(notify, _, _, _) => notify.notify_waiters(),
-            Self::Committed(_) => {}
-        }
+        self.notify.notify_waiters()
     }
 }
 
-impl<TxnId, T: fmt::Debug> fmt::Debug for TxnLockReadGuard<TxnId, T> {
+impl<T: fmt::Debug> fmt::Debug for TxnLockReadGuard<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "transactional read lock on {:?}", self.deref())
     }
 }
 
-enum ExclusiveReadGuardState<TxnId, T> {
-    Read(TxnLock<TxnId, T>, TxnId, OwnedRwLockWriteGuard<T>),
-    Pending(Arc<Notify>, OwnedRwLockWriteGuard<T>),
+enum ReadGuardState<T> {
+    Active(OwnedRwLockWriteGuard<T>, Version<T>),
+    Downgraded,
     Upgraded,
 }
 
 /// An exclusive, upgradable read-only view of a [`TxnLock`] at a specific `TxnId`
-pub struct TxnLockReadGuardExclusive<TxnId, T> {
-    state: ExclusiveReadGuardState<TxnId, T>,
+pub struct TxnLockReadGuardExclusive<T> {
+    state: ReadGuardState<T>,
+    notify: Arc<Notify>,
 }
 
-impl<TxnId: Ord, T: Clone> TxnLockReadGuardExclusive<TxnId, T> {
-    /// Upgrade this exclusive read lock to a write lock.
-    pub fn upgrade(mut self) -> TxnLockWriteGuard<T> {
-        let mut state = ExclusiveReadGuardState::Upgraded;
+impl<T: Clone> TxnLockReadGuardExclusive<T> {
+    /// Downgrade this exclusive read lock to a non-exclusive read lock.
+    pub fn downgrade(mut self) -> TxnLockReadGuard<T> {
+        let mut state = ReadGuardState::Downgraded;
         std::mem::swap(&mut self.state, &mut state);
 
-        let (notify, guard) = match state {
-            ExclusiveReadGuardState::Read(txn_lock, txn_id, guard) => {
-                let mut state = txn_lock.state.lock().expect("lock state");
-                let version = state.versions.get_mut(&txn_id).expect("version");
-
-                let lock = match version {
-                    Version::Read(lock) => lock.clone(),
-                    Version::Pending(_lock) => unreachable!(),
-                    Version::Committed(_) => unreachable!(),
-                };
-
-                *version = Version::Pending(lock);
-                (txn_lock.notify.clone(), guard)
-            }
-            ExclusiveReadGuardState::Pending(notify, guard) => (notify, guard),
-            ExclusiveReadGuardState::Upgraded => unreachable!(),
-        };
-
-        let state = WriteGuardState::Pending(notify, guard);
-        TxnLockWriteGuard { state }
+        match state {
+            ReadGuardState::Active(guard, version) => TxnLockReadGuard {
+                lock: version.lock,
+                guard: guard.downgrade(),
+                notify: self.notify.clone(),
+            },
+            ReadGuardState::Downgraded => unreachable!("exclusive read downgrade"),
+            ReadGuardState::Upgraded => unreachable!("upgrade downgraded exclusive read"),
+        }
     }
-}
 
-impl<TxnId, T> Deref for TxnLockReadGuardExclusive<TxnId, T> {
-    type Target = T;
+    /// Upgrade this exclusive read lock to a write lock.
+    pub fn upgrade(mut self) -> TxnLockWriteGuard<T> {
+        let mut state = ReadGuardState::Upgraded;
+        std::mem::swap(&mut self.state, &mut state);
 
-    fn deref(&self) -> &Self::Target {
-        match &self.state {
-            ExclusiveReadGuardState::Read(_lock, _txn_id, value) => value,
-            ExclusiveReadGuardState::Pending(_notify, guard) => guard.deref(),
-            ExclusiveReadGuardState::Upgraded => unreachable!(),
+        match state {
+            ReadGuardState::Active(guard, version) => TxnLockWriteGuard {
+                state: WriteGuardState::Active(guard, version, self.notify.clone()),
+            },
+            ReadGuardState::Downgraded => unreachable!("exclusive read downgrade"),
+            ReadGuardState::Upgraded => unreachable!("upgrade downgraded exclusive read"),
         }
     }
 }
 
-impl<TxnId, T> Drop for TxnLockReadGuardExclusive<TxnId, T> {
-    fn drop(&mut self) {
+impl<T> Deref for TxnLockReadGuardExclusive<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
         match &self.state {
-            ExclusiveReadGuardState::Read(txn_lock, _, _) => txn_lock.notify.notify_waiters(),
-            ExclusiveReadGuardState::Pending(notify, _) => notify.notify_waiters(),
-            ExclusiveReadGuardState::Upgraded => {}
-        };
+            ReadGuardState::Active(guard, _) => guard.deref(),
+            ReadGuardState::Downgraded => unreachable!("downgraded read lock"),
+            ReadGuardState::Upgraded => unreachable!("upgraded read lock"),
+        }
     }
 }
 
-impl<TxnId, T: fmt::Debug> fmt::Debug for TxnLockReadGuardExclusive<TxnId, T> {
+impl<T> Drop for TxnLockReadGuardExclusive<T> {
+    fn drop(&mut self) {
+        match &self.state {
+            ReadGuardState::Active(_guard, version) => {
+                {
+                    let mut state = version.state.lock().expect("version state");
+                    if &*state == &VersionState::Exclude {
+                        *state = VersionState::Read;
+                    }
+                }
+
+                self.notify.notify_waiters()
+            }
+            ReadGuardState::Downgraded => self.notify.notify_waiters(),
+            ReadGuardState::Upgraded => {}
+        }
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for TxnLockReadGuardExclusive<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(self.deref(), f)
     }
 }
 
-impl<TxnId, T: fmt::Display> fmt::Display for TxnLockReadGuardExclusive<TxnId, T> {
+impl<T: fmt::Display> fmt::Display for TxnLockReadGuardExclusive<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Display::fmt(self.deref(), f)
     }
 }
 
 enum WriteGuardState<T> {
-    Pending(Arc<Notify>, OwnedRwLockWriteGuard<T>),
+    Active(OwnedRwLockWriteGuard<T>, Version<T>, Arc<Notify>),
     Downgraded,
 }
 
@@ -211,15 +385,17 @@ pub struct TxnLockWriteGuard<T> {
 }
 
 impl<T> TxnLockWriteGuard<T> {
-    pub fn downgrade<TxnId>(mut self) -> TxnLockReadGuardExclusive<TxnId, T> {
+    /// Downgrade to an exclusive read guard
+    pub fn downgrade(mut self) -> TxnLockReadGuardExclusive<T> {
         let mut state = WriteGuardState::Downgraded;
         std::mem::swap(&mut self.state, &mut state);
 
         match state {
-            WriteGuardState::Pending(notify, guard) => TxnLockReadGuardExclusive {
-                state: ExclusiveReadGuardState::Pending(notify, guard),
+            WriteGuardState::Active(guard, version, notify) => TxnLockReadGuardExclusive {
+                state: ReadGuardState::Active(guard, version),
+                notify,
             },
-            WriteGuardState::Downgraded => unreachable!(),
+            WriteGuardState::Downgraded => unreachable!("write guard downgrade"),
         }
     }
 }
@@ -229,8 +405,8 @@ impl<T> Deref for TxnLockWriteGuard<T> {
 
     fn deref(&self) -> &Self::Target {
         match &self.state {
-            WriteGuardState::Pending(_notify, guard) => guard.deref(),
-            WriteGuardState::Downgraded => unreachable!(),
+            WriteGuardState::Active(guard, _, _) => guard.deref(),
+            WriteGuardState::Downgraded => unreachable!("downgraded write guard"),
         }
     }
 }
@@ -238,8 +414,8 @@ impl<T> Deref for TxnLockWriteGuard<T> {
 impl<T> DerefMut for TxnLockWriteGuard<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match &mut self.state {
-            WriteGuardState::Pending(_notify, guard) => guard.deref_mut(),
-            WriteGuardState::Downgraded => unreachable!(),
+            WriteGuardState::Active(guard, _, _) => guard.deref_mut(),
+            WriteGuardState::Downgraded => unreachable!("downgraded write guard"),
         }
     }
 }
@@ -247,7 +423,7 @@ impl<T> DerefMut for TxnLockWriteGuard<T> {
 impl<T> Drop for TxnLockWriteGuard<T> {
     fn drop(&mut self) {
         match &self.state {
-            WriteGuardState::Pending(notify, _guard) => notify.notify_waiters(),
+            WriteGuardState::Active(_, _, notify) => notify.notify_waiters(),
             WriteGuardState::Downgraded => {}
         }
     }
@@ -265,47 +441,75 @@ impl<T: fmt::Display> fmt::Display for TxnLockWriteGuard<T> {
     }
 }
 
-enum Version<T> {
-    Committed(Arc<T>),
-    Read(Arc<RwLock<T>>),
-    Pending(Arc<RwLock<T>>),
-}
-
-impl<T> Version<T> {
-    fn is_final(&self) -> bool {
-        match self {
-            Self::Committed(_) => true,
-            _ => false,
-        }
-    }
-}
-
-impl<T> Clone for Version<T> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Committed(value) => Self::Committed(value.clone()),
-            Self::Read(lock) => Self::Read(lock.clone()),
-            Self::Pending(lock) => Self::Pending(lock.clone()),
-        }
-    }
-}
-
 struct LockState<TxnId, T> {
     name: String,
     versions: BTreeMap<TxnId, Version<T>>,
 }
 
+impl<TxnId: fmt::Display + Copy + Ord, T: Clone> LockState<TxnId, T> {
+    fn create_version(
+        &mut self,
+        txn_id: TxnId,
+        state: VersionState,
+        last_commit: Option<&TxnId>,
+    ) -> Result<Option<Version<T>>> {
+        let mut versions = self
+            .versions
+            .iter()
+            .rev()
+            .skip_while(|(id, _)| *id > &txn_id);
+
+        let canon = loop {
+            let (version_id, version) = if let Some(entry) = versions.next() {
+                entry
+            } else {
+                return Err(Error::Outdated);
+            };
+
+            if version.is_exclusive() {
+                if let Some(last_commit) = last_commit {
+                    if last_commit > version_id {
+                        #[cfg(feature = "logging")]
+                        debug!("the version of {} at {} is dead", self.name, version_id);
+                        continue;
+                    }
+                }
+
+                #[cfg(feature = "logging")]
+                debug!(
+                    "cannot yet lock {} at {} due to an exclusive lock at {}",
+                    self.name, txn_id, version_id
+                );
+
+                return Ok(None);
+            } else if version.is_final() {
+                let value = version.lock.try_read().expect("canonical version");
+                break T::clone(&*value);
+            }
+        };
+
+        #[cfg(feature = "logging")]
+        trace!("creating new version of {} at {}...", self.name, txn_id);
+
+        let version = Version::new(state, canon);
+        self.versions.insert(txn_id, version.clone());
+        Ok(Some(version))
+    }
+}
+
 /// A futures-aware read-write lock which supports transaction-specific versioning
 pub struct TxnLock<TxnId, T> {
-    notify: Arc<Notify>,
     state: Arc<Mutex<LockState<TxnId, T>>>,
+    last_commit: Arc<RwLock<Option<TxnId>>>,
+    notify: Arc<Notify>,
 }
 
 impl<TxnId, T> Clone for TxnLock<TxnId, T> {
     fn clone(&self) -> Self {
         Self {
-            notify: self.notify.clone(),
             state: self.state.clone(),
+            last_commit: self.last_commit.clone(),
+            notify: self.notify.clone(),
         }
     }
 }
@@ -314,129 +518,99 @@ impl<TxnId: Ord, T> TxnLock<TxnId, T> {
     /// Create a new transactional lock.
     pub fn new<Name: fmt::Display>(name: Name, txn_id: TxnId, value: T) -> Self {
         let mut versions = BTreeMap::new();
-        versions.insert(txn_id, Version::Pending(Arc::new(RwLock::new(value))));
+        versions.insert(txn_id, Version::new(VersionState::Write, value));
 
         Self {
-            notify: Arc::new(Notify::new()),
             state: Arc::new(Mutex::new(LockState {
                 name: name.to_string(),
                 versions,
             })),
+            last_commit: Arc::new(RwLock::new(None)),
+            notify: Arc::new(Notify::new()),
         }
     }
 }
 
 impl<TxnId: fmt::Display + fmt::Debug + Ord + Copy, T: Clone> TxnLock<TxnId, T> {
-    fn read_inner(&self, txn_id: TxnId) -> Result<Option<Version<T>>> {
+    fn read_inner(&self, txn_id: TxnId, last_commit: Option<&TxnId>) -> Result<Option<Version<T>>> {
         let mut state = self.state.lock().expect("lock state");
-        debug_assert!(!state.versions.is_empty());
-
-        #[cfg(feature = "logging")]
-        trace!("read {} at {}", state.name, txn_id);
 
         if let Some(version) = state.versions.get(&txn_id) {
             return Ok(Some(version.clone()));
         }
 
-        let mut candidates = state
-            .versions
-            .iter()
-            .rev()
-            .filter(|(candidate_id, _)| *candidate_id < &txn_id);
-
-        let canon = loop {
-            if let Some((candidate_id, candidate)) = candidates.next() {
-                assert_ne!(candidate_id, &txn_id);
-
-                match candidate {
-                    Version::Pending(_) => {
-                        #[cfg(feature = "logging")]
-                        debug!(
-                            "read of {} at {} is pending a lock at {}",
-                            state.name, txn_id, candidate_id
-                        );
-
-                        return Ok(None);
-                    }
-                    Version::Read(lock) => {
-                        let value = lock.try_read().expect("read lock");
-                        break T::clone(&*value);
-                    }
-                    Version::Committed(value) => break T::clone(&*value),
-                }
-            } else {
-                return Err(Error::Outdated);
-            }
-        };
-
-        let version = Version::Read(Arc::new(RwLock::new(canon)));
-        state.versions.insert(txn_id, version.clone());
-        Ok(Some(version))
+        state.create_version(txn_id, VersionState::Read, last_commit)
     }
 
     /// Lock this value for reading at the given `txn_id`.
-    pub async fn read(&self, txn_id: TxnId) -> Result<TxnLockReadGuard<TxnId, T>> {
+    pub async fn read(&self, txn_id: TxnId) -> Result<TxnLockReadGuard<T>> {
         loop {
-            if let Some(version) = self.read_inner(txn_id)? {
-                let lock = match version {
-                    Version::Read(lock) => lock,
-                    Version::Pending(lock) => lock,
-                    Version::Committed(value) => {
-                        return Ok(TxnLockReadGuard::Committed(value));
-                    }
-                };
-
-                let guard = lock.clone().read_owned().await;
-                return Ok(TxnLockReadGuard::Read(
-                    self.notify.clone(),
-                    lock,
-                    txn_id,
-                    guard,
-                ));
+            let version = {
+                let last_commit = self.last_commit.read().await;
+                self.read_inner(txn_id, last_commit.as_ref())?
             };
+
+            if let Some(version) = version {
+                let guard = version.read(self.notify.clone()).await;
+                return Ok(guard);
+            }
 
             self.notify.notified().await;
         }
     }
 
     /// Synchronously Lock this value for reading at the given `txn_id`, if possible.
-    pub fn try_read(&self, txn_id: TxnId) -> Result<TxnLockReadGuard<TxnId, T>> {
-        if let Some(version) = self.read_inner(txn_id)? {
-            let lock = match version {
-                Version::Read(lock) => lock,
-                Version::Pending(lock) => lock,
-                Version::Committed(value) => return Ok(TxnLockReadGuard::Committed(value)),
-            };
-
-            lock.clone()
-                .try_read_owned()
-                .map(|guard| TxnLockReadGuard::Read(self.notify.clone(), lock, txn_id, guard))
-                .map_err(|_err| Error::WouldBlock)
+    pub fn try_read(&self, txn_id: TxnId) -> Result<TxnLockReadGuard<T>> {
+        let last_commit = self.last_commit.try_read().map_err(|_| Error::WouldBlock)?;
+        if let Some(version) = self.read_inner(txn_id, last_commit.as_ref())? {
+            version.try_read(self.notify.clone())
         } else {
             Err(Error::WouldBlock)
         }
     }
 
-    /// Lock this value for exclusive reading at the given `txn_id`.
-    pub async fn read_exclusive(
+    fn lock_exclusive(
         &self,
         txn_id: TxnId,
-    ) -> Result<TxnLockReadGuardExclusive<TxnId, T>> {
+        version_state: VersionState,
+        last_commit: Option<&TxnId>,
+    ) -> Result<Option<Version<T>>> {
+        debug_assert_ne!(version_state, VersionState::Read);
+        debug_assert_ne!(version_state, VersionState::Commit);
+
+        let mut state = self.state.lock().expect("lock state");
+        assert!(!state.versions.is_empty());
+
+        let latest = state.versions.keys().last().expect("latest_read");
+        if latest > &txn_id {
+            #[cfg(feature = "logging")]
+            debug!(
+                "cannot lock {} exclusively at {} due to a future lock at {}",
+                state.name, txn_id, latest
+            );
+
+            return Err(Error::Conflict);
+        }
+
+        // as long as there are no versions ahead of this one, it's no problem to lock
+
+        if let Some(version) = state.versions.get(&txn_id) {
+            return Ok(Some(version.clone()));
+        }
+
+        state.create_version(txn_id, version_state, last_commit)
+    }
+
+    /// Lock this value for exclusive reading at the given `txn_id`.
+    pub async fn read_exclusive(&self, txn_id: TxnId) -> Result<TxnLockReadGuardExclusive<T>> {
         loop {
-            if let Some(version) = self.read_inner(txn_id)? {
-                return match version {
-                    Version::Read(lock) => {
-                        let guard = lock.write_owned().await;
-                        let state = ExclusiveReadGuardState::Read(self.clone(), txn_id, guard);
-                        Ok(TxnLockReadGuardExclusive { state })
-                    }
-                    Version::Pending(lock) => {
-                        let guard = lock.write_owned().await;
-                        let state = ExclusiveReadGuardState::Pending(self.notify.clone(), guard);
-                        Ok(TxnLockReadGuardExclusive { state })
-                    }
-                    Version::Committed(_value) => Err(Error::Committed),
-                };
+            let version = {
+                let last_commit = self.last_commit.read().await;
+                self.lock_exclusive(txn_id, VersionState::Exclude, last_commit.as_ref())?
+            };
+
+            if let Some(version) = version {
+                return version.read_exclusive(self.notify.clone()).await;
             }
 
             self.notify.notified().await;
@@ -444,88 +618,27 @@ impl<TxnId: fmt::Display + fmt::Debug + Ord + Copy, T: Clone> TxnLock<TxnId, T> 
     }
 
     /// Synchronously lock this value for exclusive reading at the given `txn_id`, if possible.
-    pub fn try_read_exclusive(&self, txn_id: TxnId) -> Result<TxnLockReadGuardExclusive<TxnId, T>> {
-        if let Some(version) = self.read_inner(txn_id)? {
-            match version {
-                Version::Read(lock) => {
-                    let guard = lock.try_write_owned().map_err(|_err| Error::WouldBlock)?;
-                    let state = ExclusiveReadGuardState::Read(self.clone(), txn_id, guard);
-                    Ok(TxnLockReadGuardExclusive { state })
-                }
-                Version::Pending(lock) => {
-                    let guard = lock.try_write_owned().map_err(|_err| Error::WouldBlock)?;
-                    let state = ExclusiveReadGuardState::Pending(self.notify.clone(), guard);
-                    Ok(TxnLockReadGuardExclusive { state })
-                }
-                Version::Committed(_value) => Err(Error::Committed),
-            }
+    pub fn try_read_exclusive(&self, txn_id: TxnId) -> Result<TxnLockReadGuardExclusive<T>> {
+        let last_commit = self.last_commit.try_read().map_err(|_| Error::WouldBlock)?;
+
+        let version = self.lock_exclusive(txn_id, VersionState::Exclude, last_commit.as_ref())?;
+        if let Some(version) = version {
+            version.try_read_exclusive(self.notify.clone())
         } else {
             Err(Error::WouldBlock)
         }
     }
 
-    fn write_inner(&self, txn_id: TxnId) -> Result<Option<Arc<RwLock<T>>>> {
-        let mut state = self.state.lock().expect("lock state");
-        debug_assert!(!state.versions.is_empty());
-
-        #[cfg(feature = "logging")]
-        trace!("write {} at {}", state.name, txn_id);
-
-        let latest_read = *state.versions.keys().last().expect("latest version ID");
-
-        if latest_read > txn_id {
-            #[cfg(feature = "logging")]
-            debug!(
-                "cannot lock {} at {} since it already has a lock in the future at {}",
-                state.name, txn_id, latest_read
-            );
-
-            return Err(Error::Conflict);
-        }
-
-        if latest_read == txn_id {
-            let version = state
-                .versions
-                .get_mut(&latest_read)
-                .expect("latest version");
-            let lock = match version {
-                Version::Read(lock) => lock.clone(),
-                Version::Pending(lock) => return Ok(Some(lock.clone())),
-                Version::Committed(_) => return Err(Error::Committed),
-            };
-
-            *version = Version::Pending(lock.clone());
-            return Ok(Some(lock));
-        }
-
-        assert!(latest_read < txn_id);
-        let mut versions = state.versions.values().rev();
-        let canon = loop {
-            if let Some(version) = versions.next() {
-                match version {
-                    Version::Read(_) => {}
-                    Version::Pending(_) => return Ok(None),
-                    Version::Committed(canon) => break canon,
-                }
-            } else {
-                panic!("{} has no canonical version", state.name);
-            }
-        };
-
-        let lock = Arc::new(RwLock::new(T::clone(&*canon)));
-        let version = Version::Pending(lock.clone());
-        state.versions.insert(txn_id, version);
-        Ok(Some(lock))
-    }
-
     /// Lock this value for writing at the given `txn_id`.
     pub async fn write(&self, txn_id: TxnId) -> Result<TxnLockWriteGuard<T>> {
         loop {
-            if let Some(lock) = self.write_inner(txn_id)? {
-                let guard = lock.write_owned().await;
-                return Ok(TxnLockWriteGuard {
-                    state: WriteGuardState::Pending(self.notify.clone(), guard),
-                });
+            let version = {
+                let last_commit = self.last_commit.read().await;
+                self.lock_exclusive(txn_id, VersionState::Write, last_commit.as_ref())?
+            };
+
+            if let Some(version) = version {
+                return version.write(self.notify.clone()).await;
             }
 
             self.notify.notified().await;
@@ -534,173 +647,232 @@ impl<TxnId: fmt::Display + fmt::Debug + Ord + Copy, T: Clone> TxnLock<TxnId, T> 
 
     /// Synchronously lock this value for writing at the given `txn_id`, if possible.
     pub fn try_write(&self, txn_id: TxnId) -> Result<TxnLockWriteGuard<T>> {
-        if let Some(lock) = self.write_inner(txn_id)? {
-            lock.try_write_owned()
-                .map(|guard| WriteGuardState::Pending(self.notify.clone(), guard))
-                .map(|state| TxnLockWriteGuard { state })
-                .map_err(|_err| Error::WouldBlock)
+        let last_commit = self.last_commit.try_read().map_err(|_| Error::WouldBlock)?;
+
+        let version = self.lock_exclusive(txn_id, VersionState::Write, last_commit.as_ref())?;
+        if let Some(version) = version {
+            version.try_write(self.notify.clone())
         } else {
             Err(Error::WouldBlock)
         }
     }
 }
 
-enum Commit<T> {
-    Canon(Arc<T>),
-    Pending,
-    Noop,
+/// A RAII guard which blocks commits until dropped, allowing access to the just-committed value
+pub struct TxnLockCommit<TxnId, T> {
+    guard: OwnedRwLockReadGuard<T>,
+    _last_commit: OwnedRwLockWriteGuard<Option<TxnId>>,
 }
 
-impl<TxnId: fmt::Display + Ord + Copy, T: Clone> TxnLock<TxnId, T> {
-    fn commit_inner(&self, txn_id: &TxnId) -> Commit<T> {
-        let mut state = self.state.lock().expect("lock state");
+impl<TxnId, T> Deref for TxnLockCommit<TxnId, T> {
+    type Target = T;
 
-        #[cfg(feature = "logging")]
-        trace!("commit {} at {}...", state.name, txn_id);
+    fn deref(&self) -> &Self::Target {
+        self.guard.deref()
+    }
+}
 
-        if let Some((txn_id, version)) = state.versions.remove_entry(txn_id) {
-            let canon = match version {
-                Version::Read(lock) => lock.try_read().expect("new canon").clone(),
-                Version::Pending(lock) => {
-                    if let Ok(value) = lock.try_read() {
-                        value.clone()
+/// Guard allowing access to a rolled-back value
+pub struct TxnLockRollback<T> {
+    guard: OwnedRwLockReadGuard<T>,
+}
+
+impl<T> Deref for TxnLockRollback<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard.deref()
+    }
+}
+
+/// Guard allowing access to a finalized value
+pub struct TxnLockFinalize<T> {
+    guard: OwnedRwLockReadGuard<T>,
+}
+
+impl<T> Deref for TxnLockFinalize<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard.deref()
+    }
+}
+
+enum Commit<T> {
+    NoOp,
+    Pending,
+    Version(OwnedRwLockReadGuard<T>),
+}
+
+impl<TxnId: fmt::Debug + fmt::Display + Copy + Ord, T: Clone> TxnLock<TxnId, T> {
+    fn commit_inner(&self, txn_id: &TxnId, last_commit: Option<&TxnId>) -> Commit<T> {
+        let state = self.state.lock().expect("lock state");
+
+        if !state.versions.contains_key(txn_id) {
+            return Commit::NoOp;
+        }
+
+        for (version_id, version) in state.versions.iter().rev() {
+            match &*version.state.lock().expect("version state") {
+                VersionState::Exclude | VersionState::Write if version_id < txn_id => {
+                    if let Some(last_commit) = last_commit {
+                        assert_ne!(version_id, last_commit);
+
+                        if version_id > last_commit {
+                            #[cfg(feature = "logging")]
+                            debug!(
+                                "commit of {} at {} is pending a commit at {}",
+                                state.name, txn_id, version_id
+                            );
+
+                            return Commit::Pending;
+                        } else {
+                            // this version is dead, don't let it halt progress
+                        }
                     } else {
+                        #[cfg(feature = "logging")]
+                        debug!(
+                            "commit of {} at {} is pending a commit at {}",
+                            state.name, txn_id, version_id
+                        );
+
                         return Commit::Pending;
                     }
                 }
-                Version::Committed(value) => {
+                VersionState::Commit if version_id == txn_id => {
                     #[cfg(feature = "logging")]
-                    warn!("duplicate commit at {}...", txn_id);
-
-                    T::clone(&*value)
+                    warn!("duplicate commit of {} at {}", state.name, txn_id);
                 }
-            };
+                VersionState::Commit if version_id < txn_id => break,
+                _ => {}
+            }
+        }
 
-            let canon = Arc::new(canon);
+        let version = state.versions.get(txn_id).expect("version to commit");
 
-            state
-                .versions
-                .insert(txn_id, Version::Committed(canon.clone()));
-
-            Commit::Canon(canon)
+        if let Some(guard) = version.commit() {
+            Commit::Version(guard)
         } else {
-            Commit::Noop
+            Commit::Pending
         }
     }
 
     /// Commit the value of this [`TxnLock`] at the given `txn_id`.
     /// This will wait until any earlier write locks have been committed or rolled back.
     ///
-    /// Panics:
-    /// - when called with a `txn_id` which has already been finalized.
-    pub async fn commit(&self, txn_id: &TxnId) -> Option<Arc<T>> {
-        let canon = loop {
-            match self.commit_inner(txn_id) {
-                Commit::Pending => {}
-                Commit::Noop => break None,
-                Commit::Canon(canon) => break Some(canon),
+    /// **Panics**:
+    ///  - when called with a `txn_id` which has already been finalized.
+    ///  - when attempting to commit a version at a `txn_id` less than the last committed version
+    pub async fn commit(&self, txn_id: TxnId) -> Option<TxnLockCommit<TxnId, T>> {
+        let guard = loop {
+            {
+                let mut last_commit = self.last_commit.clone().write_owned().await;
+
+                match self.commit_inner(&txn_id, last_commit.as_ref()) {
+                    Commit::Pending => {}
+                    Commit::NoOp => {
+                        *last_commit = Some(txn_id);
+                        break None;
+                    }
+                    Commit::Version(guard) => {
+                        *last_commit = Some(txn_id);
+                        break Some(TxnLockCommit {
+                            guard,
+                            _last_commit: last_commit,
+                        })
+                    }
+                }
             }
+
+            self.notify.notified().await;
         };
 
         self.notify.notify_waiters();
-        canon
+        guard
     }
 
     /// Roll back the value of this [`TxnLock`] at the given `txn_id`.
     ///
     /// Returns the version that was rolled back, if any lock was acquired at `txn_id`.
-    pub async fn rollback(&self, txn_id: &TxnId) -> Option<impl Deref<Target = T>> {
+    ///
+    /// **Panics**:
+    ///  - if the initial version is rolled back
+    ///  - if a committed version is rolled back
+    pub async fn rollback(&self, txn_id: &TxnId) -> Option<TxnLockRollback<T>> {
         #[cfg(feature = "logging")]
         trace!("rollback at {}", txn_id);
 
-        let lock = {
+        let version = {
             let mut state = self.state.lock().expect("lock state");
-            debug_assert!(!state.versions.is_empty());
+            let version = state.versions.remove(txn_id);
 
-            if let Some(version) = state.versions.remove(txn_id) {
-                assert!(
-                    !state.versions.is_empty(),
-                    "canonical version of {} was rolled back at {}",
-                    state.name,
-                    txn_id
-                );
+            assert!(
+                !state.versions.is_empty(),
+                "the only version of {} was rolled back at {}",
+                state.name,
+                txn_id
+            );
 
-                self.notify.notify_waiters();
+            version
+        }?;
 
-                match version {
-                    Version::Read(lock) => Some(lock),
-                    Version::Pending(lock) => Some(lock),
-                    Version::Committed(_value) => {
-                        panic!("tried to roll back a committed version at {}", txn_id)
-                    }
-                }
-            } else {
-                None
-            }
-        };
-
-        if let Some(lock) = lock {
-            Some(lock.read_owned().await)
-        } else {
-            None
-        }
+        let guard = version.rollback().await;
+        self.notify.notify_waiters();
+        Some(TxnLockRollback { guard })
     }
 
-    /// Drop all values of this [`TxnLock`] older than the given `txn_id`,
-    /// except for the last commit.
+    /// Drop all values of this [`TxnLock`] as old as than the given `txn_id` up to the last commit.
     ///
     /// Returns `Some(Arc<T>)` with the finalized version, if any lock was acquired at `txn_id`.
-    pub fn finalize(&self, txn_id: &TxnId) -> Option<Arc<T>> {
+    ///
+    /// **Panics**:
+    ///  - if the initial version is finalized before being committed
+    ///  - if the last commit is finalized
+    pub async fn finalize(&self, txn_id: &TxnId) -> Option<TxnLockFinalize<T>> {
         #[cfg(feature = "logging")]
         trace!("finalize {}", txn_id);
+
+        let last_commit = self.last_commit.read().await;
 
         let mut state = self.state.lock().expect("lock state");
         assert!(!state.versions.is_empty());
 
-        let last_commit = if let Some(version_id) = state
-            .versions
-            .iter()
-            .rev()
-            .filter(|(_id, version)| version.is_final())
-            .map(|(version_id, _)| version_id)
-            .next()
-        {
-            *version_id
-        } else {
-            panic!("{} has no canonical version", state.name);
-        };
-
-        let cutoff = Ord::min(last_commit, *txn_id);
-
-        // this should normally be empty, i.e. it won't allocate
-        let mut older: Vec<TxnId> = state
-            .versions
-            .keys()
-            .rev()
-            .filter(|version_id| *version_id < &cutoff)
-            .copied()
-            .collect();
-
-        while let Some(version_id) = older.pop() {
-            state.versions.remove(&version_id);
+        if let Some(last_commit) = last_commit.as_ref() {
+            if last_commit < txn_id {
+                panic!(
+                    "cannot finalize {} at {} since the last commit was at {}",
+                    state.name, txn_id, last_commit
+                );
+            }
+        } else if state.versions.len() == 1 {
+            let version_id = state.versions.keys().next().expect("latest version ID");
+            if version_id > txn_id {
+                panic!(
+                    "cannot finalize the only version {} of {} at {}",
+                    version_id, state.name, txn_id
+                );
+            }
         }
 
-        if txn_id == &last_commit {
-            if let Some(version) = state.versions.get(txn_id) {
-                if let Version::Committed(canon) = version {
-                    Some(canon.clone())
-                } else {
-                    panic!("{} has no canonical version", state.name);
-                }
+        let version = state.versions.remove(txn_id);
+
+        while let Some(next) = state.versions.keys().next().copied() {
+            if &next < txn_id {
+                state.versions.remove(&next);
             } else {
-                None
+                break;
             }
-        } else if let Some(version) = state.versions.remove(txn_id) {
-            if let Version::Committed(canon) = version {
-                Some(canon)
-            } else {
-                panic!("{} has no canonical version", state.name);
-            }
+        }
+
+        assert!(!state.versions.is_empty());
+
+        if let Some(version) = version {
+            let guard = version
+                .lock
+                .try_read_owned()
+                .expect("read finalized version");
+
+            Some(TxnLockFinalize { guard })
         } else {
             None
         }
