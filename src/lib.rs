@@ -51,7 +51,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "logging")]
-use log::{debug, trace, warn};
+use log::{debug, trace};
 
 use tokio::sync::{Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
@@ -739,11 +739,11 @@ impl<TxnId: fmt::Debug + fmt::Display + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
                         return Commit::Pending;
                     }
                 }
+                VersionState::Commit if version_id < txn_id => break,
                 VersionState::Commit if version_id == txn_id => {
                     #[cfg(feature = "logging")]
-                    warn!("duplicate commit of {} at {}", state.name, txn_id);
+                    log::warn!("duplicate commit of {} at {}", state.name, txn_id);
                 }
-                VersionState::Commit if version_id < txn_id => break,
                 _ => {}
             }
         }
@@ -771,15 +771,21 @@ impl<TxnId: fmt::Debug + fmt::Display + Copy + Ord, T: Clone> TxnLock<TxnId, T> 
                 match self.commit_inner(&txn_id, last_commit.as_ref()) {
                     Commit::Pending => {}
                     Commit::NoOp => {
-                        *last_commit = Some(txn_id);
+                        *last_commit = last_commit
+                            .map(|last_commit| Ord::max(txn_id, last_commit))
+                            .or_else(|| Some(txn_id));
+
                         break None;
                     }
                     Commit::Version(guard) => {
-                        *last_commit = Some(txn_id);
+                        *last_commit = last_commit
+                            .map(|last_commit| Ord::max(txn_id, last_commit))
+                            .or_else(|| Some(txn_id));
+
                         break Some(TxnLockCommit {
                             guard,
                             _last_commit: last_commit,
-                        })
+                        });
                     }
                 }
             }
