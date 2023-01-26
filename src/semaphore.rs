@@ -53,7 +53,7 @@
 //! [`tokio::sync::Semaphore`]: https://docs.rs/tokio/latest/tokio/sync/struct.Semaphore.html
 
 use std::cmp::Ordering;
-use std::collections::btree_map;
+use std::collections::{btree_map, BTreeMap};
 use std::ops::{Deref, Range};
 use std::sync::{Arc, Mutex};
 
@@ -132,8 +132,17 @@ impl<R> Version<R> {
         }
     }
 
-    fn reserve(reservation: Reservation<R>) -> Self {
+    fn with_reservation(reservation: Reservation<R>) -> Self {
         Self::new(vec![reservation])
+    }
+
+    fn with_reservations<W: IntoIterator<Item = R>>(reserve: W) -> Self {
+        let reserved = reserve
+            .into_iter()
+            .map(|range| Reservation::Write(Arc::new(range)))
+            .collect();
+
+        Self::new(reserved)
     }
 }
 
@@ -144,15 +153,35 @@ enum VersionResult<I, R> {
 
 /// A semaphore used to maintain the ACID compliance of transactional resource
 pub struct Semaphore<I, R> {
-    versions: Arc<Mutex<btree_map::BTreeMap<I, Version<R>>>>,
+    versions: Arc<Mutex<BTreeMap<I, Version<R>>>>,
     notify: Arc<Notify>,
+}
+
+impl<I, R> Clone for Semaphore<I, R> {
+    fn clone(&self) -> Self {
+        Self {
+            versions: self.versions.clone(),
+            notify: self.notify.clone(),
+        }
+    }
 }
 
 impl<I: Ord, R: Overlap> Semaphore<I, R> {
     /// Construct a new transactional [`Semaphore`].
     pub fn new() -> Self {
         Self {
-            versions: Arc::new(Mutex::new(btree_map::BTreeMap::new())),
+            versions: Arc::new(Mutex::new(BTreeMap::new())),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Construct a new transactional [`Semaphore`] and reserve its initial value.
+    pub fn with_reservations<W: IntoIterator<Item = R>>(txn_id: I, reserve: W) -> Self {
+        let mut versions = BTreeMap::new();
+        versions.insert(txn_id, Version::with_reservations(reserve));
+
+        Self {
+            versions: Arc::new(Mutex::new(BTreeMap::new())),
             notify: Arc::new(Notify::new()),
         }
     }
@@ -177,7 +206,7 @@ impl<I: Ord, R: Overlap> Semaphore<I, R> {
             }
         }
 
-        let version = Version::reserve(Reservation::Read(range.clone()));
+        let version = Version::with_reservation(Reservation::Read(range.clone()));
         let semaphore = version.semaphore.clone();
         versions.insert(txn_id, version);
 
@@ -260,7 +289,7 @@ impl<I: Ord, R: Overlap> Semaphore<I, R> {
                 Ok(VersionResult::Version(version.semaphore.clone(), range))
             }
             btree_map::Entry::Vacant(entry) => {
-                let version = Version::reserve(Reservation::Write(range.clone()));
+                let version = Version::with_reservation(Reservation::Write(range.clone()));
                 let semaphore = version.semaphore.clone();
                 entry.insert(version);
 
