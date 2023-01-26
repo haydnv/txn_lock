@@ -1,9 +1,9 @@
 //! A semaphore used to maintain the ACID compliance of a mutable data store.
 //!
-//! This differs from a traditional semaphore by tracking read and write permits
+//! This differs from a traditional semaphore by tracking read and write reservations
 //! rather than an [`AtomicUsize`]. This is because of the additional logical constraints of
 //! a transactional resource--
-//! a write permit blocks future read permits and a read permit blocks past write permits.
+//! a write permit blocks future read permits and a read permit conflicts with past write permits.
 //!
 //! More information: [https://en.wikipedia.org/wiki/ACID](https://en.wikipedia.org/wiki/ACID)
 
@@ -210,6 +210,36 @@ impl<TxnId: Ord, Range: Overlap> Semaphore<TxnId, Range> {
             }
 
             self.notify.notified().await;
+        }
+    }
+
+    /// Mark a transaction completed, un-blocking waiting requests for future permits.
+    ///
+    /// Call this when the transactional resource is no longer writable at `txn_id`
+    /// (due to a commit, rollback, timeout, or any other reason).
+    ///
+    /// Set `drop_past` to `true` to finalize all transactions older than `txn_id`.
+    pub fn finalize(&self, txn_id: &TxnId, drop_past: bool)
+    where
+        TxnId: Copy,
+    {
+        let mut versions = self.versions.lock().expect("versions");
+
+        let notify = if drop_past {
+            let mut notify = false;
+
+            while let Some(version_id) = versions.keys().next().copied() {
+                assert!(versions.remove(&version_id).is_some());
+                notify = true;
+            }
+
+            notify
+        } else {
+            versions.remove(txn_id).is_some()
+        };
+
+        if notify {
+            self.notify.notify_waiters();
         }
     }
 }
