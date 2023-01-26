@@ -61,7 +61,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(match self {
             Self::Committed => "cannot acquire an exclusive lock after committing",
-            Self::Conflict => "there is already a transactional write lock in the future",
+            Self::Conflict => "there is a conflicting transactional lock on this resource",
             Self::Outdated => "the value has already been finalized",
             Self::WouldBlock => "synchronous lock acquisition failed",
         })
