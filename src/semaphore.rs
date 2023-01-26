@@ -145,6 +145,23 @@ impl<TxnId: Ord, Range: Overlap> Semaphore<TxnId, Range> {
         }
     }
 
+    /// Synchronously acquire a permit to read a section of transactional resource, if possible.
+    pub fn try_read(&self, txn_id: TxnId, range: Range) -> Result<Permit<Range>> {
+        let range = Arc::new(range);
+
+        match self.read_inner(txn_id, range) {
+            VersionResult::Pending(_, _) => Err(Error::WouldBlock),
+            VersionResult::Version(semaphore, range) => semaphore
+                .try_acquire_owned()
+                .map(|_permit| Permit {
+                    _permit,
+                    notify: self.notify.clone(),
+                    range,
+                })
+                .map_err(Error::from),
+        }
+    }
+
     fn write_inner(&self, txn_id: TxnId, range: Arc<Range>) -> Result<VersionResult<TxnId, Range>> {
         let mut versions = self.versions.lock().expect("versions");
 
@@ -213,6 +230,23 @@ impl<TxnId: Ord, Range: Overlap> Semaphore<TxnId, Range> {
         }
     }
 
+    /// Synchronously acquire a permit to write to a section of transactional resource, if possible.
+    pub fn try_write(&self, txn_id: TxnId, range: Range) -> Result<Permit<Range>> {
+        let range = Arc::new(range);
+
+        match self.write_inner(txn_id, range)? {
+            VersionResult::Pending(_, _) => Err(Error::WouldBlock),
+            VersionResult::Version(semaphore, range) => semaphore
+                .try_acquire_many_owned(PERMITS)
+                .map(|_permit| Permit {
+                    _permit,
+                    notify: self.notify.clone(),
+                    range,
+                })
+                .map_err(Error::from),
+        }
+    }
+
     /// Mark a transaction completed, un-blocking waiting requests for future permits.
     ///
     /// Call this when the transactional resource is no longer writable at `txn_id`
@@ -229,8 +263,12 @@ impl<TxnId: Ord, Range: Overlap> Semaphore<TxnId, Range> {
             let mut notify = false;
 
             while let Some(version_id) = versions.keys().next().copied() {
-                assert!(versions.remove(&version_id).is_some());
-                notify = true;
+                if &version_id > txn_id {
+                    break;
+                } else {
+                    assert!(versions.remove(&version_id).is_some());
+                    notify = true;
+                }
             }
 
             notify

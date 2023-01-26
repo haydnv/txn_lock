@@ -82,4 +82,13 @@ impl From<tokio::sync::AcquireError> for Error {
     }
 }
 
+impl From<tokio::sync::TryAcquireError> for Error {
+    fn from(cause: tokio::sync::TryAcquireError) -> Self {
+        match cause {
+            tokio::sync::TryAcquireError::Closed => Error::Outdated,
+            tokio::sync::TryAcquireError::NoPermits => Error::WouldBlock,
+        }
+    }
+}
+
 type Result<T> = std::result::Result<T, Error>;
