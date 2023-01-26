@@ -43,8 +43,10 @@
 //! ```
 
 pub mod lock;
+pub mod semaphore;
 
 use std::fmt;
+use tokio::sync::AcquireError;
 
 /// An error which may occur when attempting to acquire a transactional lock
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -73,5 +75,11 @@ impl fmt::Debug for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<tokio::sync::AcquireError> for Error {
+    fn from(_: AcquireError) -> Self {
+        Self::Outdated
+    }
+}
 
 type Result<T> = std::result::Result<T, Error>;
