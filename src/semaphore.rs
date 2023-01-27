@@ -52,6 +52,7 @@
 //!
 //! [`tokio::sync::Semaphore`]: https://docs.rs/tokio/latest/tokio/sync/struct.Semaphore.html
 
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{btree_map, BTreeMap};
 use std::ops::{Deref, Range};
@@ -64,12 +65,12 @@ use super::{Error, Result};
 const PERMITS: u32 = u32::MAX >> 3;
 
 /// A range supported by a transactional [`Semaphore`]
-pub trait Overlap {
+pub trait Overlap<T> {
     /// A commutative method which returns `true` if `self` overlaps `other`.
-    fn overlaps(&self, other: &Self) -> bool;
+    fn overlaps(&self, other: &T) -> bool;
 }
 
-impl<Idx: PartialOrd<Idx>> Overlap for Range<Idx> {
+impl<Idx: PartialOrd<Idx>> Overlap<Range<Idx>> for Range<Idx> {
     fn overlaps(&self, other: &Self) -> bool {
         if other.start >= self.start && other.start < self.end {
             // check if other.start is in self.start..self.end
@@ -111,7 +112,7 @@ enum Reservation<R> {
 }
 
 impl<R> Reservation<R> {
-    fn range(&self) -> &R {
+    fn range(&self) -> &Arc<R> {
         match self {
             Self::Read(range) => range,
             Self::Write(range) => range,
@@ -146,9 +147,15 @@ impl<R> Version<R> {
     }
 }
 
-enum VersionResult<I, R> {
+enum VersionRead<I, R> {
     Version(Arc<tokio::sync::Semaphore>, Arc<R>),
     Pending(I, Arc<R>),
+}
+
+enum RangeRead<I, R> {
+    Range(Arc<R>),
+    Pending(I),
+    None,
 }
 
 /// A semaphore used to maintain the ACID compliance of transactional resource
@@ -166,7 +173,7 @@ impl<I, R> Clone for Semaphore<I, R> {
     }
 }
 
-impl<I: Ord, R: Overlap> Semaphore<I, R> {
+impl<I: Ord, R: Overlap<R>> Semaphore<I, R> {
     /// Construct a new transactional [`Semaphore`].
     pub fn new() -> Self {
         Self {
@@ -186,12 +193,68 @@ impl<I: Ord, R: Overlap> Semaphore<I, R> {
         }
     }
 
-    fn read_inner(&self, txn_id: I, range: Arc<R>) -> VersionResult<I, R> {
+    fn maybe_read_inner<Q>(&self, txn_id: I, range: &Q) -> RangeRead<I, R>
+    where
+        Q: Eq,
+        R: Overlap<Q> + Borrow<Q>,
+    {
+        let versions = self.versions.lock().expect("versions");
+
+        // check if there's already a reservation at the requested version
+        if let Some(version) = versions.get(&txn_id) {
+            for res in &version.reservations {
+                if (&**res.range()).borrow() == range {
+                    return RangeRead::Range(res.range().clone());
+                }
+            }
+        }
+
+        // if there's an overlapping write lock, wait it out
+        // (i.e. don't leak information about an un-committed version)
+        let mut found = RangeRead::None;
+        for (_, version) in versions.iter().take_while(|(id, _)| *id < &txn_id) {
+            for reservation in &version.reservations {
+                match reservation {
+                    Reservation::Read(locked) => {
+                        if (&**locked).borrow() == range {
+                            found = RangeRead::Range(locked.clone());
+                        }
+                    }
+                    Reservation::Write(locked) => {
+                        if locked.overlaps(range) {
+                            return RangeRead::Pending(txn_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        found
+    }
+
+    /// Return a reserved range, if any is accessible at the given `txn_id`.
+    pub async fn maybe_range<Q>(&self, mut txn_id: I, range: &Q) -> Option<Arc<R>>
+    where
+        Q: Eq,
+        R: Overlap<Q> + Borrow<Q>,
+    {
+        loop {
+            txn_id = match self.maybe_read_inner(txn_id, range) {
+                RangeRead::None => return None,
+                RangeRead::Range(range) => return Some(range),
+                RangeRead::Pending(id) => id,
+            };
+
+            self.notify.notified().await;
+        }
+    }
+
+    fn read_inner(&self, txn_id: I, range: Arc<R>) -> VersionRead<I, R> {
         let mut versions = self.versions.lock().expect("versions");
 
         if let Some(version) = versions.get(&txn_id) {
             // this Tokio semaphore will coordinate access within this version
-            return VersionResult::Version(version.semaphore.clone(), range);
+            return VersionRead::Version(version.semaphore.clone(), range);
         }
 
         // handle creating a new version
@@ -200,7 +263,7 @@ impl<I: Ord, R: Overlap> Semaphore<I, R> {
                 if let Reservation::Write(locked) = reservation {
                     if locked.overlaps(&range) {
                         // if there's a write lock in the past, wait it out
-                        return VersionResult::Pending(txn_id, range);
+                        return VersionRead::Pending(txn_id, range);
                     }
                 }
             }
@@ -210,20 +273,20 @@ impl<I: Ord, R: Overlap> Semaphore<I, R> {
         let semaphore = version.semaphore.clone();
         versions.insert(txn_id, version);
 
-        VersionResult::Version(semaphore, range)
+        VersionRead::Version(semaphore, range)
     }
 
-    /// Acquire a permit to read a section of transactional resource, if possible.
+    /// Acquire a permit to read a section of a transactional resource, if possible.
     pub async fn read(&self, mut txn_id: I, range: R) -> Result<Permit<R>> {
         let mut range = Arc::new(range);
 
         loop {
             match self.read_inner(txn_id, range) {
-                VersionResult::Pending(id, r) => {
+                VersionRead::Pending(id, r) => {
                     txn_id = id;
                     range = r;
                 }
-                VersionResult::Version(semaphore, range) => {
+                VersionRead::Version(semaphore, range) => {
                     return Ok(Permit {
                         _permit: semaphore.acquire_owned().await?,
                         notify: self.notify.clone(),
@@ -241,8 +304,8 @@ impl<I: Ord, R: Overlap> Semaphore<I, R> {
         let range = Arc::new(range);
 
         match self.read_inner(txn_id, range) {
-            VersionResult::Pending(_, _) => Err(Error::WouldBlock),
-            VersionResult::Version(semaphore, range) => semaphore
+            VersionRead::Pending(_, _) => Err(Error::WouldBlock),
+            VersionRead::Version(semaphore, range) => semaphore
                 .try_acquire_owned()
                 .map(|_permit| Permit {
                     _permit,
@@ -253,7 +316,7 @@ impl<I: Ord, R: Overlap> Semaphore<I, R> {
         }
     }
 
-    fn write_inner(&self, txn_id: I, range: Arc<R>) -> Result<VersionResult<I, R>> {
+    fn write_inner(&self, txn_id: I, range: Arc<R>) -> Result<VersionRead<I, R>> {
         let mut versions = self.versions.lock().expect("versions");
 
         // handle creating a new version
@@ -264,7 +327,7 @@ impl<I: Ord, R: Overlap> Semaphore<I, R> {
                         if let Reservation::Write(locked) = reservation {
                             if locked.overlaps(&range) {
                                 // if there's a write lock in the past, wait it out
-                                return Ok(VersionResult::Pending(txn_id, range));
+                                return Ok(VersionRead::Pending(txn_id, range));
                             }
                         }
                     }
@@ -286,14 +349,14 @@ impl<I: Ord, R: Overlap> Semaphore<I, R> {
         match versions.entry(txn_id) {
             btree_map::Entry::Occupied(entry) => {
                 let version = entry.get();
-                Ok(VersionResult::Version(version.semaphore.clone(), range))
+                Ok(VersionRead::Version(version.semaphore.clone(), range))
             }
             btree_map::Entry::Vacant(entry) => {
                 let version = Version::with_reservation(Reservation::Write(range.clone()));
                 let semaphore = version.semaphore.clone();
                 entry.insert(version);
 
-                Ok(VersionResult::Version(semaphore, range))
+                Ok(VersionRead::Version(semaphore, range))
             }
         }
     }
@@ -304,11 +367,11 @@ impl<I: Ord, R: Overlap> Semaphore<I, R> {
 
         loop {
             match self.write_inner(txn_id, range)? {
-                VersionResult::Pending(id, r) => {
+                VersionRead::Pending(id, r) => {
                     txn_id = id;
                     range = r;
                 }
-                VersionResult::Version(semaphore, range) => {
+                VersionRead::Version(semaphore, range) => {
                     return Ok(Permit {
                         _permit: semaphore.acquire_many_owned(PERMITS).await?,
                         notify: self.notify.clone(),
@@ -326,8 +389,8 @@ impl<I: Ord, R: Overlap> Semaphore<I, R> {
         let range = Arc::new(range);
 
         match self.write_inner(txn_id, range)? {
-            VersionResult::Pending(_, _) => Err(Error::WouldBlock),
-            VersionResult::Version(semaphore, range) => semaphore
+            VersionRead::Pending(_, _) => Err(Error::WouldBlock),
+            VersionRead::Version(semaphore, range) => semaphore
                 .try_acquire_many_owned(PERMITS)
                 .map(|_permit| Permit {
                     _permit,

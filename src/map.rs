@@ -11,10 +11,9 @@ use std::collections::btree_map::{BTreeMap, Entry};
 use std::iter;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
-use crate::Error;
 
 use super::semaphore::*;
-use super::Result;
+use super::{Error, Result};
 
 #[derive(Eq, PartialEq, Ord, PartialOrd)]
 enum Range<K> {
@@ -31,12 +30,21 @@ impl<K> Clone for Range<K> {
     }
 }
 
-impl<K: Eq> Overlap for Range<K> {
+impl<K: Eq> Overlap<Self> for Range<K> {
     fn overlaps(&self, other: &Self) -> bool {
         match (self, other) {
-            (Range::One(l), Range::One(r)) => l == r,
-            (Range::All, _) => true,
-            (_, Range::All) => true,
+            (Self::One(l), Self::One(r)) => l == r,
+            (Self::All, _) => true,
+            (_, Self::All) => true,
+        }
+    }
+}
+
+impl<K: Eq> Overlap<K> for Range<K> {
+    fn overlaps(&self, other: &K) -> bool {
+        match self {
+            Self::One(this) => &**this == other,
+            Self::All => true,
         }
     }
 }
@@ -134,7 +142,7 @@ impl<I: Ord + Copy, K: Ord, V> TxnMapLock<I, K, V> {
     fn insert_inner(&self, txn_id: I, range: Range<K>, delta: Delta<V>) -> Result<()> {
         let mut state = self.state.lock().expect("lock state");
 
-        if txn_id <= state.finalized {
+        if state.finalized >= Some(txn_id) {
             return Err(Error::Outdated);
         }
 
@@ -161,6 +169,8 @@ impl<I: Ord + Copy, K: Ord, V> TxnMapLock<I, K, V> {
                 update_deltas(deltas, range, delta)
             }
         };
+
+        Ok(())
     }
 
     /// Insert a new entry into this [`TxnMapLock`].
