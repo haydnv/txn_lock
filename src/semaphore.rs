@@ -175,7 +175,7 @@ impl<I: Ord, R: Overlap> Semaphore<I, R> {
         }
     }
 
-    /// Construct a new transactional [`Semaphore`] and reserve its initial value.
+    /// Construct a new transactional [`Semaphore`] with write reservations for its initial value.
     pub fn with_reservations<W: IntoIterator<Item = R>>(txn_id: I, reserve: W) -> Self {
         let mut versions = BTreeMap::new();
         versions.insert(txn_id, Version::with_reservations(reserve));
