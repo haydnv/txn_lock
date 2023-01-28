@@ -195,8 +195,7 @@ impl<I: Ord, R: Overlap<R>> Semaphore<I, R> {
 
     fn maybe_read_inner<Q>(&self, txn_id: I, range: &Q) -> RangeRead<I, R>
     where
-        Q: Eq,
-        R: Overlap<Q> + Borrow<Q>,
+        R: Overlap<Q> + PartialEq<Q>,
     {
         let versions = self.versions.lock().expect("versions");
 
@@ -235,8 +234,7 @@ impl<I: Ord, R: Overlap<R>> Semaphore<I, R> {
     /// Return a reserved range, if any is accessible at the given `txn_id`.
     pub async fn maybe_range<Q>(&self, mut txn_id: I, range: &Q) -> Option<Arc<R>>
     where
-        Q: Eq,
-        R: Overlap<Q> + Borrow<Q>,
+        R: Overlap<Q> + PartialEq<Q>,
     {
         loop {
             txn_id = match self.maybe_read_inner(txn_id, range) {
