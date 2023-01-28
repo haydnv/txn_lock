@@ -195,6 +195,61 @@ impl<R: Overlaps<R>> Node<R> {
             _ => unreachable!(),
         }
     }
+
+    fn write<'a>(&'a self, target: &'a R) -> Pin<Box<dyn Future<Output = Result<Permit<R>>> + 'a>> {
+        Box::pin(async move {
+            let overlap = self.range.overlaps(target);
+
+            if overlap == Overlap::Equal {
+                return self
+                    .semaphore
+                    .clone()
+                    .acquire_many_owned(PERMITS)
+                    .map_ok(|permit| Permit {
+                        range: self.range.clone(),
+                        permit,
+                    })
+                    .map_err(Error::from)
+                    .await;
+            }
+
+            // make sure the target range is not locked
+            let _permit = self.semaphore.acquire().await;
+
+            match overlap {
+                Overlap::WideGreater => self.left.as_ref().expect("left").write(target).await,
+                Overlap::Wide => self.center.as_ref().expect("center").write(target).await,
+                Overlap::WideLess => self.right.as_ref().expect("right").write(target).await,
+                _ => unreachable!(),
+            }
+        })
+    }
+
+    fn try_write(&self, target: &R) -> Result<Permit<R>> {
+        let overlap = self.range.overlaps(target);
+
+        if overlap == Overlap::Equal {
+            return self
+                .semaphore
+                .clone()
+                .try_acquire_many_owned(PERMITS)
+                .map(|permit| Permit {
+                    range: self.range.clone(),
+                    permit,
+                })
+                .map_err(Error::from);
+        }
+
+        // make sure the target range is not locked
+        let _permit = self.semaphore.try_acquire()?;
+
+        match overlap {
+            Overlap::WideGreater => self.left.as_ref().expect("left").try_write(target),
+            Overlap::Wide => self.center.as_ref().expect("center").try_write(target),
+            Overlap::WideLess => self.right.as_ref().expect("branch right").try_write(target),
+            _ => unreachable!(),
+        }
+    }
 }
 
 struct Version<R> {
