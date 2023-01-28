@@ -52,6 +52,8 @@
 //!
 //! [`tokio::sync::Semaphore`]: https://docs.rs/tokio/latest/tokio/sync/struct.Semaphore.html
 
+mod range;
+
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{btree_map, BTreeMap};
