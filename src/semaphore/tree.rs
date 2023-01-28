@@ -1,10 +1,15 @@
 use std::mem;
 use std::ops::Range;
-use tokio::sync::Semaphore;
+use std::sync::Arc;
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use crate::Result;
 
 const PERMITS: u32 = u32::MAX >> 3;
 
-/// An [`Overlap`] is the result of a comparison between two ranges
+/// An [`Overlap`] is the result of a comparison between two ranges,
+/// the equivalent of [`std::cmp::Ordering`] for hierarchical data.
 #[derive(Eq, PartialEq, Copy, Clone, PartialOrd)]
 pub enum Overlap {
     /// A lack of overlap where the compared range is entirely less than another
@@ -48,21 +53,30 @@ impl<Idx: PartialOrd<Idx>> Overlaps<Range<Idx>> for Range<Idx> {
     }
 }
 
+/// A transactional semaphore permit
+pub struct Permit<R> {
+    range: Arc<R>,
+    permit: OwnedSemaphorePermit,
+    left: Option<Box<Self>>,
+    center: Option<Box<Self>>,
+    right: Option<Box<Self>>,
+}
+
 /// A node in a 3-ary tree of overlapping ranges
 struct Node<R> {
-    range: R,
-    semaphore: Semaphore,
+    range: Arc<R>,
+    semaphore: Arc<Semaphore>,
 
-    left: Option<Box<Node<R>>>,
-    center: Option<Box<Node<R>>>,
-    right: Option<Box<Node<R>>>,
+    left: Option<Box<Self>>,
+    center: Option<Box<Self>>,
+    right: Option<Box<Self>>,
 }
 
 impl<R> Node<R> {
     fn new(range: R) -> Self {
         Self {
-            range,
-            semaphore: Semaphore::new(PERMITS as usize),
+            range: Arc::new(range),
+            semaphore: Arc::new(Semaphore::new(PERMITS as usize)),
             left: None,
             center: None,
             right: None,
@@ -70,27 +84,49 @@ impl<R> Node<R> {
     }
 }
 
+impl<R> Node<R> {
+    fn try_read(&self) -> Result<Permit<R>> {
+        fn try_read<R>(node: Option<&Box<Node<R>>>) -> Result<Option<Box<Permit<R>>>> {
+            if let Some(node) = node {
+                node.try_read().map(Box::new).map(Some)
+            } else {
+                Ok(None)
+            }
+        }
+
+        Ok(Permit {
+            range: self.range.clone(),
+            permit: self.semaphore.clone().try_acquire_owned()?,
+            left: try_read(self.left.as_ref())?,
+            center: try_read(self.center.as_ref())?,
+            right: try_read(self.right.as_ref())?,
+        })
+    }
+}
+
 impl<R: Overlaps<R>> Node<R> {
-    fn insert(self: &mut Box<Self>, range: R) {
-        fn insert_range<R: Overlaps<R>>(node: &mut Option<Box<Node<R>>>, range: R) {
+    fn insert(&mut self, range: R) -> &Node<R> {
+        fn insert_range<R: Overlaps<R>>(node: &mut Option<Box<Node<R>>>, range: R) -> &Node<R> {
             if let Some(node) = node {
                 node.insert(range)
             } else {
                 let child = Node::new(range);
                 *node = Some(Box::new(child));
+                node.as_ref().expect("new node")
             }
         }
 
         match self.range.overlaps(&range) {
-            Overlap::Less => insert_range(&mut self.left, range),
-            Overlap::Greater => insert_range(&mut self.right, range),
+            Overlap::Equal => self,
+            Overlap::Greater => insert_range(&mut self.left, range),
             Overlap::Wide => insert_range(&mut self.center, range),
+            Overlap::Less => insert_range(&mut self.right, range),
             Overlap::Narrow => {
                 let mut child = Box::new(Node::new(range));
                 mem::swap(self, &mut child);
                 self.center = Some(child);
+                self
             }
-            Overlap::Equal => {}
         }
     }
 }
