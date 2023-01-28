@@ -1,6 +1,8 @@
 use std::ops::{Deref, Range};
+use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::future::{Future, TryFutureExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{Error, Result};
@@ -133,6 +135,41 @@ impl<R: Overlaps<R>> Node<R> {
         }
     }
 
+    fn read<'a>(&'a self, target: &'a R) -> Pin<Box<dyn Future<Output = Result<Permit<R>>> + 'a>> {
+        Box::pin(async move {
+            let overlap = self.range.overlaps(target);
+
+            if overlap == Overlap::Equal {
+                return self
+                    .semaphore
+                    .clone()
+                    .acquire_owned()
+                    .map_ok(|permit| Permit {
+                        range: self.range.clone(),
+                        permit,
+                    })
+                    .map_err(Error::from)
+                    .await;
+            }
+
+            // make sure the target range is not locked
+            let _permit = self.semaphore.acquire().await;
+
+            match overlap {
+                Overlap::WideGreater => self.left.as_ref().expect("left").read(target).await,
+                Overlap::Wide => self.center.as_ref().expect("center").read(target).await,
+                Overlap::WideLess => {
+                    self.right
+                        .as_ref()
+                        .expect("branch right")
+                        .read(target)
+                        .await
+                }
+                _ => unreachable!(),
+            }
+        })
+    }
+
     fn try_read(&self, target: &R) -> Result<Permit<R>> {
         let overlap = self.range.overlaps(target);
 
@@ -152,12 +189,8 @@ impl<R: Overlaps<R>> Node<R> {
         let _permit = self.semaphore.try_acquire()?;
 
         match overlap {
-            Overlap::WideGreater => self.left.as_ref().expect("branch left").try_read(target),
-            Overlap::Wide => self
-                .center
-                .as_ref()
-                .expect("branch center")
-                .try_read(target),
+            Overlap::WideGreater => self.left.as_ref().expect("left").try_read(target),
+            Overlap::Wide => self.center.as_ref().expect("center").try_read(target),
             Overlap::WideLess => self.right.as_ref().expect("branch right").try_read(target),
             _ => unreachable!(),
         }
@@ -245,8 +278,13 @@ impl<R: Overlaps<R>> Version<R> {
 
     fn try_read(&mut self, range: R) -> Result<Permit<R>> {
         let (i, range) = self.insert(range);
-        // after calling insert there is exactly one root which contains the range to reserve
         let root = &self.roots[i];
         root.try_read(&range)
+    }
+
+    async fn read(&mut self, range: R) -> Result<Permit<R>> {
+        let (i, range) = self.insert(range);
+        let root = &self.roots[i];
+        root.read(&range).await
     }
 }
