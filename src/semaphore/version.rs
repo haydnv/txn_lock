@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::{Error, Result};
+
 const PERMITS: u32 = u32::MAX >> 3;
 
 /// An [`Overlap`] is the result of a comparison between two ranges,
@@ -130,6 +132,36 @@ impl<R: Overlaps<R>> Node<R> {
             _ => unreachable!(),
         }
     }
+
+    fn try_read(&self, target: &R) -> Result<Permit<R>> {
+        let overlap = self.range.overlaps(target);
+
+        if overlap == Overlap::Equal {
+            return self
+                .semaphore
+                .clone()
+                .try_acquire_owned()
+                .map(|permit| Permit {
+                    range: self.range.clone(),
+                    permit,
+                })
+                .map_err(Error::from);
+        }
+
+        // make sure the target range is not locked
+        let _permit = self.semaphore.try_acquire()?;
+
+        match overlap {
+            Overlap::WideGreater => self.left.as_ref().expect("branch left").try_read(target),
+            Overlap::Wide => self
+                .center
+                .as_ref()
+                .expect("branch center")
+                .try_read(target),
+            Overlap::WideLess => self.right.as_ref().expect("branch right").try_read(target),
+            _ => unreachable!(),
+        }
+    }
 }
 
 struct Version<R> {
@@ -167,35 +199,54 @@ impl<R: Overlaps<R>> Version<R> {
         hi
     }
 
-    fn insert(&mut self, range: R) -> &Node<R> {
+    fn insert(&mut self, range: R) -> (usize, Arc<R>) {
         let lo = self.bisect_left(&range);
         let hi = self.bisect_right(&range);
 
-        match (lo, hi) {
+        let range = match (lo, hi) {
             (l, r) if l == r => {
-                self.roots.insert(l, Node::new(range));
+                let node = Node::new(range);
+                let range = node.range.clone();
+                self.roots.insert(l, node);
+                range
             }
             (l, r) if l == r - 1 => match self.roots[l].range.overlaps(&range) {
-                Overlap::Equal => {}
-                Overlap::Wide => return self.roots[l].insert(Node::new(range)),
+                Overlap::Equal => self.roots[l].range.clone(),
+                Overlap::Wide => {
+                    let node = Node::new(range);
+                    let range = node.range.clone();
+                    self.roots[l].insert(node);
+                    range
+                }
                 _ => {
                     let mut root = Node::new(range);
+                    let range = root.range.clone();
                     let node = self.roots.remove(l);
                     root.insert(node);
                     self.roots.insert(l, root);
+                    range
                 }
             },
             (l, mut r) => {
                 let mut root = Node::new(range);
+                let range = root.range.clone();
                 while r > l {
                     let node = self.roots.remove(l);
                     root.insert(node);
                     r -= 1;
                 }
                 self.roots.insert(l, root);
+                range
             }
-        }
+        };
 
-        &self.roots[lo]
+        (lo, range)
+    }
+
+    fn try_read(&mut self, range: R) -> Result<Permit<R>> {
+        let (i, range) = self.insert(range);
+        // after calling insert there is exactly one root which contains the range to reserve
+        let root = &self.roots[i];
+        root.try_read(&range)
     }
 }
