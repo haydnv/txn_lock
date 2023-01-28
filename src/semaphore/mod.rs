@@ -52,7 +52,7 @@
 //!
 //! [`tokio::sync::Semaphore`]: https://docs.rs/tokio/latest/tokio/sync/struct.Semaphore.html
 
-mod tree;
+mod version;
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;
