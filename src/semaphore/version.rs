@@ -415,10 +415,8 @@ where
 
         let node = &roots[mid];
         if node.range.overlaps(range) == Overlap::Greater {
-            println!("{:?} is greater than {:?}", node, range);
             end = mid;
         } else {
-            println!("{:?} is less than or equal to than {:?}", node, range);
             start = mid + 1;
         }
     }

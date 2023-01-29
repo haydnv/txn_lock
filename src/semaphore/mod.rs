@@ -56,7 +56,6 @@
 
 mod version;
 
-use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{btree_map, BTreeMap};
 use std::fmt;
@@ -108,7 +107,8 @@ pub trait Overlaps<T> {
     /// Check whether `other` lies at least partially within `self`.
     fn contains_partial(&self, other: &T) -> bool {
         match self.overlaps(other) {
-            Overlap::Narrow | Overlap::WideLess | Overlap::Wide | Overlap::WideGreater => true,
+            Overlap::Narrow | Overlap::Equal => true,
+            Overlap::WideLess | Overlap::Wide | Overlap::WideGreater => true,
             _ => false,
         }
     }
@@ -229,12 +229,6 @@ enum VersionRead<I, R> {
     Pending(Arc<R>, I),
 }
 
-enum RangeRead<I, R> {
-    Range(Arc<R>),
-    Pending(I),
-    None,
-}
-
 /// A semaphore used to maintain the ACID compliance of transactional resource
 pub struct Semaphore<I, R> {
     versions: Arc<Mutex<BTreeMap<I, Version<R>>>>,
@@ -271,77 +265,26 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
         }
     }
 
-    fn maybe_read_inner<Q>(&self, txn_id: I, range: &Q) -> RangeRead<I, R>
-    where
-        R: Overlaps<Q> + PartialEq<Q>,
-    {
-        let versions = self.versions.lock().expect("versions");
-
-        // check if there's already a reservation at the requested version
-        if let Some(version) = versions.get(&txn_id) {
-            for res in &version.reservations {
-                if (&**res.range()).borrow() == range {
-                    return RangeRead::Range(res.range().clone());
-                }
-            }
-        }
-
-        // if there's an overlapping write lock, wait it out
-        // (i.e. don't leak information about an un-committed version)
-        let mut found = RangeRead::None;
-        for (_, version) in versions.iter().take_while(|(id, _)| *id < &txn_id) {
-            for reservation in &version.reservations {
-                match reservation {
-                    Reservation::Read(locked) => {
-                        if (&**locked).borrow() == range {
-                            found = RangeRead::Range(locked.clone());
-                        }
-                    }
-                    Reservation::Write(locked) if locked.contains_partial(range) => {
-                        return RangeRead::Pending(txn_id)
-                    }
-                    Reservation::Write(_locked) => {}
-                }
-            }
-        }
-
-        found
-    }
-
-    /// Return a reserved range, if any is accessible at the given `txn_id`.
-    pub async fn maybe_range<Q>(&self, mut txn_id: I, range: &Q) -> Option<Arc<R>>
-    where
-        R: Overlaps<Q> + PartialEq<Q>,
-    {
-        loop {
-            txn_id = match self.maybe_read_inner(txn_id, range) {
-                RangeRead::None => return None,
-                RangeRead::Range(range) => return Some(range),
-                RangeRead::Pending(id) => id,
-            };
-
-            self.notify.notified().await;
-        }
-    }
-
     fn read_inner(&self, txn_id: I, range: Arc<R>) -> VersionRead<I, R> {
         let mut versions = self.versions.lock().expect("versions");
 
-        if let Some(version) = versions.get_mut(&txn_id) {
-            let root = version.semaphore.insert(range.clone());
-            return VersionRead::Version(range, root);
-        }
-
-        // handle creating a new version
+        // check if there's an overlapping write lock in the past
         for (_, version) in versions.iter().take_while(|(id, _)| *id < &txn_id) {
             for reservation in &version.reservations {
                 if let Reservation::Write(locked) = reservation {
                     if locked.contains_partial(&range) {
                         // if there's a write lock in the past, wait it out
                         return VersionRead::Pending(range, txn_id);
+                    } else {
+                        println!("{:?} does not contain {:?}", locked, range);
                     }
                 }
             }
+        }
+
+        if let Some(version) = versions.get_mut(&txn_id) {
+            let root = version.semaphore.insert(range.clone());
+            return VersionRead::Version(range, root);
         }
 
         let mut version = Version::with_reservation(Reservation::Read(range.clone()));

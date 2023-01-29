@@ -2,13 +2,17 @@
 //!
 //! Example usage:
 //! ```
+//! use std::sync::Arc;
 //! use futures::executor::block_on;
+//!
 //! use txn_lock::map::*;
+//! use txn_lock::Error;
 //!
 //! let map = TxnMapLock::<u64, String, f32>::new();
-//! let one = "one".to_string();
-//! block_on(map.insert(1, one.clone(), 1.0));
-//! let value = block_on(map.get(1, &one)).expect("option");
+//!
+//! let one = Arc::new("one".to_string());
+//! block_on(map.insert(1, one.clone(), 1.0)).expect("insert");
+//! let value = block_on(map.get(1, one.clone())).expect("read");
 //! assert_eq!(*(value.expect("guard")), 1.0);
 //! ```
 
@@ -74,6 +78,7 @@ impl<K: Eq + Ord> Overlaps<K> for Range<K> {
     }
 }
 
+#[derive(Debug)]
 pub enum ValueRead<V> {
     Committed(Arc<V>),
     Pending(OwnedRwLockReadGuard<V>),
@@ -91,6 +96,7 @@ impl<V> Deref for ValueRead<V> {
 }
 
 /// A read guard on a value in a [`TxnMapLock`]
+#[derive(Debug)]
 pub struct ValueReadGuard<K, V> {
     _permit: Permit<Range<K>>,
     value: ValueRead<V>,
@@ -148,7 +154,7 @@ impl<I, K, V> Clone for TxnMapLock<I, K, V> {
     }
 }
 
-impl<I: Ord + Copy + fmt::Debug, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
+impl<I: Ord + Copy, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
     /// Construct a new [`TxnMapLock`].
     pub fn new() -> Self {
         Self {
@@ -183,28 +189,8 @@ impl<I: Ord + Copy + fmt::Debug, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
     }
 
     /// Read a value from this [`TxnMapLock`] at the given `txn_id`.
-    pub async fn get(&self, txn_id: I, key: &K) -> Result<Option<ValueReadGuard<K, V>>> {
-        // TODO: there must be a better way to do this
-        let range = {
-            if let Some(range) = self.semaphore.maybe_range::<K>(txn_id, key).await {
-                Range::<K>::clone(&*range)
-            } else {
-                let state = self.state.lock().expect("lock state");
-                if let Some((key, _)) = state.canon.get_key_value(key) {
-                    Range::One(key.clone())
-                } else if let Some(version) = state.pending.get(&txn_id) {
-                    if let Some((key, _)) = version.get_key_value(key) {
-                        Range::One(key.clone())
-                    } else {
-                        return Ok(None);
-                    }
-                } else {
-                    return Ok(None);
-                }
-            }
-        };
-
-        let _permit = self.semaphore.read(txn_id, range.clone()).await?;
+    pub async fn get(&self, txn_id: I, key: Arc<K>) -> Result<Option<ValueReadGuard<K, V>>> {
+        let _permit = self.semaphore.read(txn_id, Range::One(key.clone())).await?;
 
         let state = self.state.lock().expect("lock state");
         if state.finalized >= Some(txn_id) {
@@ -214,7 +200,7 @@ impl<I: Ord + Copy + fmt::Debug, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
         }
 
         if let Some(version) = state.pending.get(&txn_id) {
-            if let Some(value) = version.get(key) {
+            if let Some(value) = version.get(&key) {
                 let guard = value.clone().read_owned().await;
                 return Ok(Some(ValueReadGuard {
                     _permit,
@@ -224,7 +210,7 @@ impl<I: Ord + Copy + fmt::Debug, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
         }
 
         for version in state.committed.values().rev() {
-            if let Some(value) = version.get(key) {
+            if let Some(value) = version.get(&key) {
                 return Ok(Some(ValueReadGuard {
                     _permit,
                     value: ValueRead::Committed(value.clone()),
@@ -232,19 +218,18 @@ impl<I: Ord + Copy + fmt::Debug, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
             }
         }
 
-        if let Some(value) = state.canon.get(key) {
+        if let Some(value) = state.canon.get(&key) {
             return Ok(Some(ValueReadGuard {
                 _permit,
                 value: ValueRead::Committed(value.clone()),
             }));
         }
 
-        unreachable!("found a range for a nonexistent key")
+        Ok(None)
     }
 
     /// Insert a new entry into this [`TxnMapLock`] at the given `txn_id`.
-    pub async fn insert(&self, txn_id: I, key: K, value: V) -> Result<()> {
-        let key = Arc::new(key);
+    pub async fn insert(&self, txn_id: I, key: Arc<K>, value: V) -> Result<()> {
         let range = Range::One(key.clone());
         let _permit = self.semaphore.write(txn_id, range.clone()).await?;
 
