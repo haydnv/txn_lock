@@ -2,9 +2,14 @@
 //!
 //! Example usage:
 //! ```
+//! use futures::executor::block_on;
 //! use txn_lock::map::*;
+//!
 //! let map = TxnMapLock::<u64, String, f32>::new();
-//! map.insert(1, "one".to_string(), 1.0);
+//! let one = "one".to_string();
+//! block_on(map.insert(1, one.clone(), 1.0));
+//! let value = block_on(map.get(1, &one)).expect("option");
+//! assert_eq!(*(value.expect("guard")), 1.0);
 //! ```
 
 use std::cmp::Ordering;
@@ -69,11 +74,6 @@ impl<K: Eq + Ord> Overlaps<K> for Range<K> {
     }
 }
 
-enum Value<V> {
-    One(Arc<RwLock<V>>),
-    All,
-}
-
 pub enum ValueRead<V> {
     Committed(Arc<V>),
     Pending(OwnedRwLockReadGuard<V>),
@@ -124,10 +124,12 @@ impl<K, V> DerefMut for ValueWrite<K, V> {
     }
 }
 
+type Version<K, V> = BTreeMap<Arc<K>, Arc<RwLock<V>>>;
+
 struct State<I, K, V> {
     canon: BTreeMap<Arc<K>, Arc<V>>,
     committed: BTreeMap<I, BTreeMap<Arc<K>, Arc<V>>>,
-    pending: BTreeMap<I, BTreeMap<Range<K>, Value<V>>>,
+    pending: BTreeMap<I, Version<K, V>>,
     finalized: Option<I>,
 }
 
@@ -146,7 +148,7 @@ impl<I, K, V> Clone for TxnMapLock<I, K, V> {
     }
 }
 
-impl<I: Ord + Copy, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
+impl<I: Ord + Copy + fmt::Debug, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
     /// Construct a new [`TxnMapLock`].
     pub fn new() -> Self {
         Self {
@@ -162,36 +164,27 @@ impl<I: Ord + Copy, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
 
     /// Construct a new [`TxnMapLock`] with the given `contents`.
     pub fn with_contents<C: IntoIterator<Item = (K, V)>>(txn_id: I, contents: C) -> Self {
-        let deltas = contents
+        let version = contents
             .into_iter()
-            .map(|(k, v)| {
-                let range = Range::One(Arc::new(k));
-                let delta = Value::One(Arc::new(RwLock::new(v)));
-                (range, delta)
-            })
-            .collect::<BTreeMap<Range<K>, Value<V>>>();
-
-        let reserved = deltas
-            .keys()
-            .cloned()
-            .chain(iter::once(Range::All))
-            .collect::<Vec<Range<K>>>();
+            .map(|(key, value)| (Arc::new(key), Arc::new(RwLock::new(value))))
+            .collect();
 
         let state = State {
             canon: BTreeMap::new(),
             committed: BTreeMap::new(),
-            pending: BTreeMap::from_iter(iter::once((txn_id, deltas))),
+            pending: BTreeMap::from_iter(iter::once((txn_id, version))),
             finalized: None,
         };
 
         Self {
             state: Arc::new(Mutex::new(state)),
-            semaphore: Semaphore::with_reservations(txn_id, reserved),
+            semaphore: Semaphore::with_reservation(txn_id, Range::All),
         }
     }
 
     /// Read a value from this [`TxnMapLock`] at the given `txn_id`.
     pub async fn get(&self, txn_id: I, key: &K) -> Result<Option<ValueReadGuard<K, V>>> {
+        // TODO: there must be a better way to do this
         let range = {
             if let Some(range) = self.semaphore.maybe_range::<K>(txn_id, key).await {
                 Range::<K>::clone(&*range)
@@ -199,6 +192,12 @@ impl<I: Ord + Copy, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
                 let state = self.state.lock().expect("lock state");
                 if let Some((key, _)) = state.canon.get_key_value(key) {
                     Range::One(key.clone())
+                } else if let Some(version) = state.pending.get(&txn_id) {
+                    if let Some((key, _)) = version.get_key_value(key) {
+                        Range::One(key.clone())
+                    } else {
+                        return Ok(None);
+                    }
                 } else {
                     return Ok(None);
                 }
@@ -215,19 +214,12 @@ impl<I: Ord + Copy, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
         }
 
         if let Some(version) = state.pending.get(&txn_id) {
-            if let Some(delta) = version.get(&range) {
-                match delta {
-                    Value::All => {}
-                    Value::One(lock) => {
-                        // calling try_read is safe because the semaphore takes care of blocking
-                        let guard = lock.clone().try_read_owned().expect("value read guard");
-
-                        return Ok(Some(ValueReadGuard {
-                            _permit,
-                            value: ValueRead::Pending(guard),
-                        }));
-                    }
-                }
+            if let Some(value) = version.get(key) {
+                let guard = value.clone().read_owned().await;
+                return Ok(Some(ValueReadGuard {
+                    _permit,
+                    value: ValueRead::Pending(guard),
+                }));
             }
         }
 
@@ -253,10 +245,10 @@ impl<I: Ord + Copy, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
     /// Insert a new entry into this [`TxnMapLock`] at the given `txn_id`.
     pub async fn insert(&self, txn_id: I, key: K, value: V) -> Result<()> {
         let key = Arc::new(key);
-        let range = Range::One(key);
+        let range = Range::One(key.clone());
         let _permit = self.semaphore.write(txn_id, range.clone()).await?;
 
-        let value = Value::One(Arc::new(RwLock::new(value)));
+        let value = Arc::new(RwLock::new(value));
 
         let mut state = self.state.lock().expect("lock state");
 
@@ -264,12 +256,12 @@ impl<I: Ord + Copy, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
             return Err(Error::Outdated);
         }
 
-        fn update_deltas<K: Ord, V>(
-            deltas: &mut BTreeMap<Range<K>, Value<V>>,
-            range: Range<K>,
-            value: Value<V>,
+        fn version_entry<K: Ord, V>(
+            version: &mut Version<K, V>,
+            key: Arc<K>,
+            value: Arc<RwLock<V>>,
         ) {
-            match deltas.entry(range) {
+            match version.entry(key) {
                 Entry::Occupied(mut entry) => {
                     let existing_delta = entry.get_mut();
                     *existing_delta = value;
@@ -281,10 +273,10 @@ impl<I: Ord + Copy, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
         }
 
         match state.pending.entry(txn_id) {
-            Entry::Occupied(mut entry) => update_deltas(entry.get_mut(), range, value),
+            Entry::Occupied(mut entry) => version_entry(entry.get_mut(), key, value),
             Entry::Vacant(entry) => {
-                let deltas = entry.insert(BTreeMap::new());
-                update_deltas(deltas, range, value)
+                let version = entry.insert(BTreeMap::new());
+                version_entry(version, key, value)
             }
         };
 

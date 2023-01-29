@@ -259,10 +259,11 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
         }
     }
 
-    /// Construct a new transactional [`Semaphore`] with write reservations for its initial value.
-    pub fn with_reservations<W: IntoIterator<Item = R>>(txn_id: I, reserve: W) -> Self {
+    /// Construct a new transactional [`Semaphore`] with a write reservation for its initial value.
+    pub fn with_reservation(txn_id: I, reserve: R) -> Self {
+        let version = Version::with_reservation(Reservation::Write(Arc::new(reserve)));
         let mut versions: BTreeMap<I, Version<R>> = BTreeMap::new();
-        versions.insert(txn_id, reserve.into_iter().collect());
+        versions.insert(txn_id, version);
 
         Self {
             versions: Arc::new(Mutex::new(BTreeMap::new())),
