@@ -7,16 +7,17 @@
 //! map.insert(1, "one".to_string(), 1.0);
 //! ```
 
+use std::cmp::Ordering;
 use std::collections::btree_map::{BTreeMap, Entry};
-use std::iter;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
+use std::{fmt, iter};
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use super::semaphore::*;
 use super::{Error, Result};
 
-#[derive(Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum Range<K> {
     One(Arc<K>),
     All,
@@ -40,21 +41,30 @@ impl<K: PartialEq> PartialEq<K> for Range<K> {
     }
 }
 
-impl<K: Eq> Overlap<Self> for Range<K> {
-    fn overlaps(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::One(l), Self::One(r)) => l == r,
-            (Self::All, _) => true,
-            (_, Self::All) => true,
+impl<K: Eq + Ord> Overlaps<Self> for Range<K> {
+    fn overlaps(&self, other: &Self) -> Overlap {
+        match self {
+            Self::All => match other {
+                Self::All => Overlap::Equal,
+                _ => Overlap::Wide,
+            },
+            this => match other {
+                Self::All => Overlap::Narrow,
+                Self::One(that) => this.overlaps(&**that),
+            },
         }
     }
 }
 
-impl<K: Eq> Overlap<K> for Range<K> {
-    fn overlaps(&self, other: &K) -> bool {
+impl<K: Eq + Ord> Overlaps<K> for Range<K> {
+    fn overlaps(&self, other: &K) -> Overlap {
         match self {
-            Self::One(this) => &**this == other,
-            Self::All => true,
+            Self::All => Overlap::Wide,
+            Self::One(this) => match (&**this).cmp(other) {
+                Ordering::Less => Overlap::Less,
+                Ordering::Equal => Overlap::Equal,
+                Ordering::Greater => Overlap::Greater,
+            },
         }
     }
 }
@@ -136,7 +146,7 @@ impl<I, K, V> Clone for TxnMapLock<I, K, V> {
     }
 }
 
-impl<I: Ord + Copy, K: Ord, V> TxnMapLock<I, K, V> {
+impl<I: Ord + Copy, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
     /// Construct a new [`TxnMapLock`].
     pub fn new() -> Self {
         Self {

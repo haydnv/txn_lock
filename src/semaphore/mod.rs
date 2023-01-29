@@ -1,7 +1,7 @@
 //! A futures-aware semaphore used to maintain the ACID compliance of a mutable data store.
 //!
 //! This differs from [`tokio::sync::Semaphore`] by tracking read and write reservations
-//! rather than an atomic integer. This is because of the additional logical constraints of
+//! rather than a single atomic integer. This is because of the additional logical constraints of
 //! a transactional resource--
 //! a write permit blocks future read permits and a read permit conflicts with past write permits.
 //!
@@ -15,16 +15,18 @@
 //!
 //! let semaphore = Semaphore::<u64, Range<usize>>::new();
 //!
-//! // Multiple read permits within a transaction are fine
-//! let permit0_1 = semaphore.try_read(0, 0..1).expect("permit");
-//! let permit0_2 = semaphore.try_read(0, 0..1).expect("permit");
-//! // But they'll block a write permit in the same transaction
+//! // Multiple overlapping read permits within a transaction are fine
+//! let permit0_1 = semaphore.try_read(0, 0..1).expect("read 0..1");
+//! let permit0_2 = semaphore.try_read(0, 0..1).expect("read 0..1");
+//! // And non-overlapping write permits are fine
+//! let permit0_3 = semaphore.try_write(0, 2..3).expect("write 2..3");
+//! // But an overlapping write permit in the same transaction will block
 //! assert_eq!(semaphore.try_write(0, 0..2).unwrap_err(), Error::WouldBlock);
 //! std::mem::drop(permit0_1);
 //! assert_eq!(semaphore.try_write(0, 0..2).unwrap_err(), Error::WouldBlock);
 //! std::mem::drop(permit0_2);
-//! // Until they're all dropped
-//! let permit0_3 = semaphore.try_write(0, 0..2).expect("permit");
+//! // Until all overlapping permits are dropped
+//! let permit0_3 = semaphore.try_write(0, 0..2).expect("write 0..2");
 //!
 //! // Finalizing a transaction will un-block permits for later transactions
 //! // It's the caller's responsibility to make sure that data can't be mutated after finalizing
@@ -57,31 +59,97 @@ mod version;
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{btree_map, BTreeMap};
+use std::fmt;
 use std::ops::{Deref, Range};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{Notify, OwnedSemaphorePermit};
+use tokio::sync::Notify;
 
 use super::{Error, Result};
 
-const PERMITS: u32 = u32::MAX >> 3;
+use version::{Node, Permit as VersionPermit, Version as VersionSemaphore};
 
-/// A range supported by a transactional [`Semaphore`]
-pub trait Overlap<T> {
-    /// A commutative method which returns `true` if `self` overlaps `other`.
-    fn overlaps(&self, other: &T) -> bool;
+/// An [`Overlap`] is the result of a comparison between two ranges,
+/// the equivalent of [`Ordering`] for hierarchical data.
+#[derive(Debug, Eq, PartialEq, Copy, Clone, PartialOrd)]
+pub enum Overlap {
+    /// A lack of overlap where the compared range is entirely less than another
+    Less,
+
+    /// A lack of overlap where the compared range is entirely greater than another
+    Greater,
+
+    /// An overlap where the compared range is identical to another
+    Equal,
+
+    /// An overlap where the compared range is narrower than another
+    Narrow,
+
+    /// An overlap where the compared range is wider than another on both sides
+    Wide,
+
+    /// An overlap where the compared range is wider than another with a lesser start and end point
+    WideLess,
+
+    /// An overlap where the compared range is wider than another with a greater start and end point
+    WideGreater,
 }
 
-impl<Idx: PartialOrd<Idx>> Overlap<Range<Idx>> for Range<Idx> {
-    fn overlaps(&self, other: &Self) -> bool {
-        if other.start >= self.start && other.start < self.end {
-            // check if other.start is in self.start..self.end
-            true
-        } else if other.end >= self.start && other.end < self.end {
-            // check if other.end is in self.start..self.end
-            true
+/// A range supported by a transactional [`Semaphore`]
+pub trait Overlaps<T> {
+    /// Check whether `other` lies entirely within `self`.
+    fn contains(&self, other: &T) -> bool {
+        match self.overlaps(other) {
+            Overlap::Wide | Overlap::Equal => true,
+            _ => false,
+        }
+    }
+
+    /// Check whether `other` lies at least partially within `self`.
+    fn contains_partial(&self, other: &T) -> bool {
+        match self.overlaps(other) {
+            Overlap::Narrow | Overlap::WideLess | Overlap::Wide | Overlap::WideGreater => true,
+            _ => false,
+        }
+    }
+
+    /// Check whether `self` overlaps `other`.
+    ///
+    /// Examples:
+    /// ```
+    /// use txn_lock::semaphore::{Overlap, Overlaps};
+    /// assert_eq!((0..1).overlaps(&(2..5)), Overlap::Less);
+    /// assert_eq!((0..1).overlaps(&(0..1)), Overlap::Equal);
+    /// assert_eq!((2..3).overlaps(&(0..2)), Overlap::Greater);
+    /// assert_eq!((3..5).overlaps(&(1..7)), Overlap::Narrow);
+    /// assert_eq!((1..7).overlaps(&(3..5)), Overlap::Wide);
+    /// assert_eq!((1..4).overlaps(&(3..5)), Overlap::WideLess);
+    /// assert_eq!((3..5).overlaps(&(1..4)), Overlap::WideGreater);
+    /// ```
+    fn overlaps(&self, other: &T) -> Overlap;
+}
+
+impl<Idx: PartialOrd<Idx>> Overlaps<Range<Idx>> for Range<Idx> {
+    fn overlaps(&self, other: &Self) -> Overlap {
+        assert!(self.end >= self.start);
+        assert!(other.end >= other.start);
+
+        if self.start >= other.end {
+            Overlap::Greater
+        } else if self.end <= other.start {
+            Overlap::Less
+        } else if self.start == other.start && self.end == other.end {
+            Overlap::Equal
+        } else if self.start <= other.start && self.end >= other.end {
+            Overlap::Wide
+        } else if self.start >= other.start && self.end <= other.end {
+            Overlap::Narrow
+        } else if self.end > other.end {
+            Overlap::WideGreater
+        } else if self.start < other.start {
+            Overlap::WideLess
         } else {
-            false
+            unreachable!()
         }
     }
 }
@@ -89,16 +157,15 @@ impl<Idx: PartialOrd<Idx>> Overlap<Range<Idx>> for Range<Idx> {
 /// A permit to read a specific section of a transactional resource
 #[derive(Debug)]
 pub struct Permit<R> {
-    _permit: OwnedSemaphorePermit,
+    permit: VersionPermit<R>,
     notify: Arc<Notify>,
-    range: Arc<R>,
 }
 
 impl<R> Deref for Permit<R> {
     type Target = R;
 
     fn deref(&self) -> &Self::Target {
-        self.range.deref()
+        self.permit.deref()
     }
 }
 
@@ -123,14 +190,20 @@ impl<R> Reservation<R> {
 }
 
 struct Version<R> {
-    semaphore: Arc<tokio::sync::Semaphore>,
+    semaphore: VersionSemaphore<R>,
     reservations: Vec<Reservation<R>>,
 }
 
 impl<R> Version<R> {
     fn new(reservations: Vec<Reservation<R>>) -> Self {
+        let semaphore = if reservations.is_empty() {
+            VersionSemaphore::new()
+        } else {
+            VersionSemaphore::with_capacity(reservations.len())
+        };
+
         Self {
-            semaphore: Arc::new(tokio::sync::Semaphore::new(PERMITS as usize)),
+            semaphore,
             reservations,
         }
     }
@@ -138,8 +211,10 @@ impl<R> Version<R> {
     fn with_reservation(reservation: Reservation<R>) -> Self {
         Self::new(vec![reservation])
     }
+}
 
-    fn with_reservations<W: IntoIterator<Item = R>>(reserve: W) -> Self {
+impl<R> FromIterator<R> for Version<R> {
+    fn from_iter<T: IntoIterator<Item = R>>(reserve: T) -> Self {
         let reserved = reserve
             .into_iter()
             .map(|range| Reservation::Write(Arc::new(range)))
@@ -150,8 +225,8 @@ impl<R> Version<R> {
 }
 
 enum VersionRead<I, R> {
-    Version(Arc<tokio::sync::Semaphore>, Arc<R>),
-    Pending(I, Arc<R>),
+    Version(Arc<R>, Node<R>),
+    Pending(Arc<R>, I),
 }
 
 enum RangeRead<I, R> {
@@ -175,7 +250,7 @@ impl<I, R> Clone for Semaphore<I, R> {
     }
 }
 
-impl<I: Ord, R: Overlap<R>> Semaphore<I, R> {
+impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
     /// Construct a new transactional [`Semaphore`].
     pub fn new() -> Self {
         Self {
@@ -186,8 +261,8 @@ impl<I: Ord, R: Overlap<R>> Semaphore<I, R> {
 
     /// Construct a new transactional [`Semaphore`] with write reservations for its initial value.
     pub fn with_reservations<W: IntoIterator<Item = R>>(txn_id: I, reserve: W) -> Self {
-        let mut versions = BTreeMap::new();
-        versions.insert(txn_id, Version::with_reservations(reserve));
+        let mut versions: BTreeMap<I, Version<R>> = BTreeMap::new();
+        versions.insert(txn_id, reserve.into_iter().collect());
 
         Self {
             versions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -197,7 +272,7 @@ impl<I: Ord, R: Overlap<R>> Semaphore<I, R> {
 
     fn maybe_read_inner<Q>(&self, txn_id: I, range: &Q) -> RangeRead<I, R>
     where
-        R: Overlap<Q> + PartialEq<Q>,
+        R: Overlaps<Q> + PartialEq<Q>,
     {
         let versions = self.versions.lock().expect("versions");
 
@@ -221,11 +296,10 @@ impl<I: Ord, R: Overlap<R>> Semaphore<I, R> {
                             found = RangeRead::Range(locked.clone());
                         }
                     }
-                    Reservation::Write(locked) => {
-                        if locked.overlaps(range) {
-                            return RangeRead::Pending(txn_id);
-                        }
+                    Reservation::Write(locked) if locked.contains_partial(range) => {
+                        return RangeRead::Pending(txn_id)
                     }
+                    Reservation::Write(_locked) => {}
                 }
             }
         }
@@ -236,7 +310,7 @@ impl<I: Ord, R: Overlap<R>> Semaphore<I, R> {
     /// Return a reserved range, if any is accessible at the given `txn_id`.
     pub async fn maybe_range<Q>(&self, mut txn_id: I, range: &Q) -> Option<Arc<R>>
     where
-        R: Overlap<Q> + PartialEq<Q>,
+        R: Overlaps<Q> + PartialEq<Q>,
     {
         loop {
             txn_id = match self.maybe_read_inner(txn_id, range) {
@@ -252,28 +326,28 @@ impl<I: Ord, R: Overlap<R>> Semaphore<I, R> {
     fn read_inner(&self, txn_id: I, range: Arc<R>) -> VersionRead<I, R> {
         let mut versions = self.versions.lock().expect("versions");
 
-        if let Some(version) = versions.get(&txn_id) {
-            // this Tokio semaphore will coordinate access within this version
-            return VersionRead::Version(version.semaphore.clone(), range);
+        if let Some(version) = versions.get_mut(&txn_id) {
+            let root = version.semaphore.insert(range.clone());
+            return VersionRead::Version(range, root);
         }
 
         // handle creating a new version
         for (_, version) in versions.iter().take_while(|(id, _)| *id < &txn_id) {
             for reservation in &version.reservations {
                 if let Reservation::Write(locked) = reservation {
-                    if locked.overlaps(&range) {
+                    if locked.contains_partial(&range) {
                         // if there's a write lock in the past, wait it out
-                        return VersionRead::Pending(txn_id, range);
+                        return VersionRead::Pending(range, txn_id);
                     }
                 }
             }
         }
 
-        let version = Version::with_reservation(Reservation::Read(range.clone()));
-        let semaphore = version.semaphore.clone();
+        let mut version = Version::with_reservation(Reservation::Read(range.clone()));
+        let root = version.semaphore.insert(range.clone());
         versions.insert(txn_id, version);
 
-        VersionRead::Version(semaphore, range)
+        VersionRead::Version(range, root)
     }
 
     /// Acquire a permit to read a section of a transactional resource, if possible.
@@ -282,15 +356,14 @@ impl<I: Ord, R: Overlap<R>> Semaphore<I, R> {
 
         loop {
             match self.read_inner(txn_id, range) {
-                VersionRead::Pending(id, r) => {
+                VersionRead::Pending(r, id) => {
                     txn_id = id;
                     range = r;
                 }
-                VersionRead::Version(semaphore, range) => {
+                VersionRead::Version(range, root) => {
                     return Ok(Permit {
-                        _permit: semaphore.acquire_owned().await?,
+                        permit: root.read(&range).await?,
                         notify: self.notify.clone(),
-                        range,
                     })
                 }
             }
@@ -305,12 +378,11 @@ impl<I: Ord, R: Overlap<R>> Semaphore<I, R> {
 
         match self.read_inner(txn_id, range) {
             VersionRead::Pending(_, _) => Err(Error::WouldBlock),
-            VersionRead::Version(semaphore, range) => semaphore
-                .try_acquire_owned()
-                .map(|_permit| Permit {
-                    _permit,
+            VersionRead::Version(range, root) => root
+                .try_read(&range)
+                .map(|permit| Permit {
+                    permit,
                     notify: self.notify.clone(),
-                    range,
                 })
                 .map_err(Error::from),
         }
@@ -325,9 +397,9 @@ impl<I: Ord, R: Overlap<R>> Semaphore<I, R> {
                 Ordering::Greater => {
                     for reservation in &version.reservations {
                         if let Reservation::Write(locked) = reservation {
-                            if locked.overlaps(&range) {
+                            if locked.contains_partial(&range) {
                                 // if there's a write lock in the past, wait it out
-                                return Ok(VersionRead::Pending(txn_id, range));
+                                return Ok(VersionRead::Pending(range, txn_id));
                             }
                         }
                     }
@@ -337,7 +409,7 @@ impl<I: Ord, R: Overlap<R>> Semaphore<I, R> {
                 }
                 Ordering::Less => {
                     for reservation in &version.reservations {
-                        if reservation.range().overlaps(&range) {
+                        if reservation.range().contains_partial(&range) {
                             // can't allow writes to this range, there's already a future version
                             return Err(Error::Conflict);
                         }
@@ -347,16 +419,17 @@ impl<I: Ord, R: Overlap<R>> Semaphore<I, R> {
         }
 
         match versions.entry(txn_id) {
-            btree_map::Entry::Occupied(entry) => {
-                let version = entry.get();
-                Ok(VersionRead::Version(version.semaphore.clone(), range))
+            btree_map::Entry::Occupied(mut entry) => {
+                let version = entry.get_mut();
+                let root = version.semaphore.insert(range.clone());
+                Ok(VersionRead::Version(range, root))
             }
             btree_map::Entry::Vacant(entry) => {
-                let version = Version::with_reservation(Reservation::Write(range.clone()));
-                let semaphore = version.semaphore.clone();
+                let mut version = Version::with_reservation(Reservation::Write(range.clone()));
+                let root = version.semaphore.insert(range.clone());
                 entry.insert(version);
 
-                Ok(VersionRead::Version(semaphore, range))
+                Ok(VersionRead::Version(range, root))
             }
         }
     }
@@ -367,16 +440,17 @@ impl<I: Ord, R: Overlap<R>> Semaphore<I, R> {
 
         loop {
             match self.write_inner(txn_id, range)? {
-                VersionRead::Pending(id, r) => {
+                VersionRead::Pending(r, id) => {
                     txn_id = id;
                     range = r;
                 }
-                VersionRead::Version(semaphore, range) => {
+                VersionRead::Version(range, root) => {
+                    let permit = root.write(&range).await?;
+
                     return Ok(Permit {
-                        _permit: semaphore.acquire_many_owned(PERMITS).await?,
+                        permit,
                         notify: self.notify.clone(),
-                        range,
-                    })
+                    });
                 }
             }
 
@@ -390,12 +464,11 @@ impl<I: Ord, R: Overlap<R>> Semaphore<I, R> {
 
         match self.write_inner(txn_id, range)? {
             VersionRead::Pending(_, _) => Err(Error::WouldBlock),
-            VersionRead::Version(semaphore, range) => semaphore
-                .try_acquire_many_owned(PERMITS)
-                .map(|_permit| Permit {
-                    _permit,
+            VersionRead::Version(range, root) => root
+                .try_write(&range)
+                .map(|permit| Permit {
+                    permit,
                     notify: self.notify.clone(),
-                    range,
                 })
                 .map_err(Error::from),
         }
