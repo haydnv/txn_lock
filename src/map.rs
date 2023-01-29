@@ -12,6 +12,7 @@
 //!
 //! let one = Arc::new("one".to_string());
 //! block_on(map.insert(1, one.clone(), 1.0)).expect("insert");
+//!
 //! let value = block_on(map.get(1, one.clone())).expect("read");
 //! assert_eq!(*(value.expect("guard")), 1.0);
 //! ```

@@ -1,7 +1,7 @@
 use std::fmt;
 use std::ops::Deref;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::future::{self, Future, TryFutureExt};
 use futures::try_join;
@@ -50,6 +50,7 @@ impl<R: fmt::Debug> fmt::Debug for Permit<R> {
 pub struct Node<R> {
     range: Arc<R>,
     semaphore: Arc<Semaphore>,
+    write: Arc<Mutex<bool>>,
 
     left: Option<Box<Self>>,
     center: Option<Box<Self>>,
@@ -61,6 +62,7 @@ impl<R> Clone for Node<R> {
         Self {
             range: self.range.clone(),
             semaphore: self.semaphore.clone(),
+            write: self.write.clone(),
 
             left: self.left.clone(),
             center: self.center.clone(),
@@ -70,12 +72,13 @@ impl<R> Clone for Node<R> {
 }
 
 impl<R> Node<R> {
-    fn new(range: Arc<R>) -> Self {
+    fn new(range: Arc<R>, write: bool) -> Self {
         let semaphore = Arc::new(Semaphore::new(PERMITS as usize));
 
         Self {
             range,
             semaphore,
+            write: Arc::new(Mutex::new(write)),
             left: None,
             center: None,
             right: None,
@@ -103,7 +106,7 @@ impl<R> Node<R> {
             )?;
 
             Ok(NodePermit {
-                permit: permit,
+                permit,
                 children: [left, center, right],
             })
         })
@@ -121,7 +124,7 @@ impl<R> Node<R> {
         }
 
         Ok(NodePermit {
-            permit: permit,
+            permit,
             children: [
                 child_lock(self.left.as_ref())?,
                 child_lock(self.center.as_ref())?,
@@ -152,7 +155,7 @@ impl<R> Node<R> {
             )?;
 
             Ok(NodePermit {
-                permit: permit,
+                permit,
                 children: [left, center, right],
             })
         })
@@ -204,6 +207,17 @@ impl<R: Overlaps<R>> Node<R> {
             Overlap::WideLess => insert_node(&mut self.right, node),
             other => unreachable!("insert a range with overlap {:?}", other),
         }
+    }
+
+    fn is_pending_write(&self) -> bool {
+        if *self.write.lock().expect("write bit") {
+            return true;
+        }
+
+        [&self.left, &self.center, &self.right]
+            .into_iter()
+            .filter_map(|node| node.as_ref())
+            .any(|node| node.is_pending_write())
     }
 
     /// Acquire a read lock on this [`Node`] and its children.
@@ -331,44 +345,39 @@ pub struct Version<R> {
 impl<R> Version<R> {
     /// Create a new [`Version`] semaphore
     pub fn new() -> Self {
-        Self { roots: Vec::new() }
-    }
-
-    /// Create a new [`Version`] semaphore with memory allocated for `capacity` roots
-    pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            roots: Vec::with_capacity(capacity),
+            roots: Vec::with_capacity(1),
         }
     }
 }
 
 impl<R: Overlaps<R> + fmt::Debug> Version<R> {
     /// Create a new `range` semaphore and return its root [`Node`]
-    pub fn insert(&mut self, range: Arc<R>) -> Node<R> {
+    pub fn insert(&mut self, range: Arc<R>, write: bool) -> Node<R> {
         let insert_at = bisect_left(&self.roots, &range);
         let take_until = bisect_right(&self.roots, &range);
         assert!(take_until >= insert_at);
 
         if insert_at == take_until {
-            let root = Node::new(range);
+            let root = Node::new(range, write);
             self.roots.insert(insert_at, root);
         } else if take_until - insert_at == 1 {
             match self.roots[insert_at].range.overlaps(&range) {
                 Overlap::Equal => {}
                 Overlap::WideLess | Overlap::Wide | Overlap::WideGreater => {
-                    let node = Node::new(range);
+                    let node = Node::new(range, write);
                     self.roots[insert_at].insert(node);
                 }
                 Overlap::Narrow => {
                     let node = self.roots.remove(insert_at);
-                    let mut root = Node::new(range);
+                    let mut root = Node::new(range, write);
                     root.insert(node);
                     self.roots.insert(insert_at, root);
                 }
                 _ => unreachable!(),
             }
         } else {
-            let mut root = Node::new(range);
+            let mut root = Node::new(range, write);
 
             for _ in insert_at..take_until {
                 let node = self.roots.remove(insert_at);
@@ -379,6 +388,30 @@ impl<R: Overlaps<R> + fmt::Debug> Version<R> {
         }
 
         self.roots[insert_at].clone()
+    }
+
+    /// Return `true` if any part of the given range has been reserved for reading.
+    pub fn has_been_read_at(&self, target: &R) -> bool {
+        for root in &self.roots {
+            if root.range.contains_partial(target) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Return `true` if any part of the given range has been reserved for writing.
+    pub fn is_pending_write_at(&self, target: &R) -> bool {
+        for root in &self.roots {
+            if root.range.contains_partial(target) {
+                if root.is_pending_write() {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 }
 

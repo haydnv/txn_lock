@@ -66,7 +66,7 @@ use tokio::sync::Notify;
 
 use super::{Error, Result};
 
-use version::{Node, Permit as VersionPermit, Version as VersionSemaphore};
+use version::{Node, Permit as VersionPermit, Version};
 
 /// An [`Overlap`] is the result of a comparison between two ranges,
 /// the equivalent of [`Ordering`] for hierarchical data.
@@ -175,55 +175,6 @@ impl<R> Drop for Permit<R> {
     }
 }
 
-enum Reservation<R> {
-    Read(Arc<R>),
-    Write(Arc<R>),
-}
-
-impl<R> Reservation<R> {
-    fn range(&self) -> &Arc<R> {
-        match self {
-            Self::Read(range) => range,
-            Self::Write(range) => range,
-        }
-    }
-}
-
-struct Version<R> {
-    semaphore: VersionSemaphore<R>,
-    reservations: Vec<Reservation<R>>,
-}
-
-impl<R> Version<R> {
-    fn new(reservations: Vec<Reservation<R>>) -> Self {
-        let semaphore = if reservations.is_empty() {
-            VersionSemaphore::new()
-        } else {
-            VersionSemaphore::with_capacity(reservations.len())
-        };
-
-        Self {
-            semaphore,
-            reservations,
-        }
-    }
-
-    fn with_reservation(reservation: Reservation<R>) -> Self {
-        Self::new(vec![reservation])
-    }
-}
-
-impl<R> FromIterator<R> for Version<R> {
-    fn from_iter<T: IntoIterator<Item = R>>(reserve: T) -> Self {
-        let reserved = reserve
-            .into_iter()
-            .map(|range| Reservation::Write(Arc::new(range)))
-            .collect();
-
-        Self::new(reserved)
-    }
-}
-
 enum VersionRead<I, R> {
     Version(Arc<R>, Node<R>),
     Pending(Arc<R>, I),
@@ -254,8 +205,10 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
     }
 
     /// Construct a new transactional [`Semaphore`] with a write reservation for its initial value.
-    pub fn with_reservation(txn_id: I, reserve: R) -> Self {
-        let version = Version::with_reservation(Reservation::Write(Arc::new(reserve)));
+    pub fn with_reservation(txn_id: I, range: R) -> Self {
+        let mut version = Version::new();
+        version.insert(Arc::new(range), true);
+
         let mut versions: BTreeMap<I, Version<R>> = BTreeMap::new();
         versions.insert(txn_id, version);
 
@@ -269,26 +222,24 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
         let mut versions = self.versions.lock().expect("versions");
 
         // check if there's an overlapping write lock in the past
-        for (_, version) in versions.iter().take_while(|(id, _)| *id < &txn_id) {
-            for reservation in &version.reservations {
-                if let Reservation::Write(locked) = reservation {
-                    if locked.contains_partial(&range) {
+        for (version_id, version) in versions.iter_mut() {
+            match txn_id.cmp(version_id) {
+                Ordering::Greater => {
+                    if version.is_pending_write_at(&range) {
                         // if there's a write lock in the past, wait it out
                         return VersionRead::Pending(range, txn_id);
-                    } else {
-                        println!("{:?} does not contain {:?}", locked, range);
                     }
                 }
+                Ordering::Equal => {
+                    let root = version.insert(range.clone(), false);
+                    return VersionRead::Version(range, root);
+                }
+                Ordering::Less => break,
             }
         }
 
-        if let Some(version) = versions.get_mut(&txn_id) {
-            let root = version.semaphore.insert(range.clone());
-            return VersionRead::Version(range, root);
-        }
-
-        let mut version = Version::with_reservation(Reservation::Read(range.clone()));
-        let root = version.semaphore.insert(range.clone());
+        let mut version = Version::new();
+        let root = version.insert(range.clone(), false);
         versions.insert(txn_id, version);
 
         VersionRead::Version(range, root)
@@ -339,24 +290,18 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
         for (version_id, version) in versions.iter() {
             match txn_id.cmp(version_id) {
                 Ordering::Greater => {
-                    for reservation in &version.reservations {
-                        if let Reservation::Write(locked) = reservation {
-                            if locked.contains_partial(&range) {
-                                // if there's a write lock in the past, wait it out
-                                return Ok(VersionRead::Pending(range, txn_id));
-                            }
-                        }
+                    if version.is_pending_write_at(&range) {
+                        // if there's a write lock in the past, wait it out
+                        return Ok(VersionRead::Pending(range, txn_id));
                     }
                 }
                 Ordering::Equal => {
-                    // the Tokio semaphore will coordinate access within this version
+                    // this case is handled below
                 }
                 Ordering::Less => {
-                    for reservation in &version.reservations {
-                        if reservation.range().contains_partial(&range) {
-                            // can't allow writes to this range, there's already a future version
-                            return Err(Error::Conflict);
-                        }
+                    if version.has_been_read_at(&range) {
+                        // can't allow writes to this range, there's already a future version
+                        return Err(Error::Conflict);
                     }
                 }
             }
@@ -365,12 +310,12 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
         match versions.entry(txn_id) {
             btree_map::Entry::Occupied(mut entry) => {
                 let version = entry.get_mut();
-                let root = version.semaphore.insert(range.clone());
+                let root = version.insert(range.clone(), true);
                 Ok(VersionRead::Version(range, root))
             }
             btree_map::Entry::Vacant(entry) => {
-                let mut version = Version::with_reservation(Reservation::Write(range.clone()));
-                let root = version.semaphore.insert(range.clone());
+                let mut version = Version::new();
+                let root = version.insert(range.clone(), true);
                 entry.insert(version);
 
                 Ok(VersionRead::Version(range, root))
