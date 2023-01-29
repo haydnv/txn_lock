@@ -2,10 +2,11 @@ use std::ops::{Deref, Range};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use futures::future::{Future, TryFutureExt};
+use futures::future::{self, Future, TryFutureExt};
+use futures::try_join;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::{Error, Result};
+use crate::Result;
 
 const PERMITS: u32 = u32::MAX >> 3;
 
@@ -37,6 +38,11 @@ pub enum Overlap {
 
 /// A range supported by a transactional [`Semaphore`]
 pub trait Overlaps<T> {
+    /// Check whether `other` lies entirely within `self`.
+    fn contains(&self, other: &T) -> bool {
+        self.overlaps(other) == Overlap::Wide
+    }
+
     /// Check whether `self` overlaps `other`.
     ///
     /// Examples:
@@ -76,10 +82,15 @@ impl<Idx: PartialOrd<Idx>> Overlaps<Range<Idx>> for Range<Idx> {
     }
 }
 
+struct NodePermit {
+    permit: OwnedSemaphorePermit,
+    children: [Option<Box<NodePermit>>; 3],
+}
+
 /// A transactional semaphore permit
 pub struct Permit<R> {
     range: Arc<R>,
-    permit: OwnedSemaphorePermit,
+    permit: NodePermit,
 }
 
 impl<R> Deref for Permit<R> {
@@ -109,6 +120,106 @@ impl<R> Node<R> {
             center: None,
             right: None,
         }
+    }
+
+    fn acquire(&self) -> Pin<Box<dyn Future<Output = Result<NodePermit>> + '_>> {
+        Box::pin(async move {
+            let permit = self.semaphore.clone().acquire_owned().await?;
+
+            fn child_lock<R>(
+                node: Option<&Box<Node<R>>>,
+            ) -> Pin<Box<dyn Future<Output = Result<Option<Box<NodePermit>>>> + '_>> {
+                if let Some(node) = node {
+                    Box::pin(node.acquire().map_ok(Box::new).map_ok(Some))
+                } else {
+                    Box::pin(future::ready(Ok(None)))
+                }
+            }
+
+            let (left, center, right) = try_join!(
+                child_lock(self.left.as_ref()),
+                child_lock(self.center.as_ref()),
+                child_lock(self.right.as_ref()),
+            )?;
+
+            Ok(NodePermit {
+                permit,
+                children: [left, center, right],
+            })
+        })
+    }
+
+    fn try_acquire(&self) -> Result<NodePermit> {
+        let permit = self.semaphore.clone().try_acquire_owned()?;
+
+        fn child_lock<R>(node: Option<&Box<Node<R>>>) -> Result<Option<Box<NodePermit>>> {
+            if let Some(node) = node {
+                node.try_acquire().map(Box::new).map(Some)
+            } else {
+                Ok(None)
+            }
+        }
+
+        Ok(NodePermit {
+            permit,
+            children: [
+                child_lock(self.left.as_ref())?,
+                child_lock(self.center.as_ref())?,
+                child_lock(self.right.as_ref())?,
+            ],
+        })
+    }
+
+    fn acquire_many(&self, permits: u32) -> Pin<Box<dyn Future<Output = Result<NodePermit>> + '_>> {
+        Box::pin(async move {
+            let permit = self.semaphore.clone().acquire_many_owned(permits).await?;
+
+            fn child_lock<R>(
+                node: Option<&Box<Node<R>>>,
+                permits: u32,
+            ) -> Pin<Box<dyn Future<Output = Result<Option<Box<NodePermit>>>> + '_>> {
+                if let Some(node) = node {
+                    Box::pin(node.acquire_many(permits).map_ok(Box::new).map_ok(Some))
+                } else {
+                    Box::pin(future::ready(Ok(None)))
+                }
+            }
+
+            let (left, center, right) = try_join!(
+                child_lock(self.left.as_ref(), permits),
+                child_lock(self.center.as_ref(), permits),
+                child_lock(self.right.as_ref(), permits),
+            )?;
+
+            Ok(NodePermit {
+                permit,
+                children: [left, center, right],
+            })
+        })
+    }
+
+    fn try_acquire_many(&self, permits: u32) -> Result<NodePermit> {
+        let permit = self.semaphore.clone().try_acquire_owned()?;
+
+        fn child_lock<R>(
+            node: Option<&Box<Node<R>>>,
+            permits: u32,
+        ) -> Result<Option<Box<NodePermit>>> {
+            if let Some(node) = node {
+                node.try_acquire_many(permits).map(Box::new).map(Some)
+            } else {
+                Ok(None)
+            }
+        }
+
+        Ok(NodePermit {
+            permit,
+            children: [
+                child_lock(self.left.as_ref(), permits)?,
+                child_lock(self.center.as_ref(), permits)?,
+                child_lock(self.right.as_ref(), permits)?,
+            ],
+        })
     }
 }
 
@@ -141,18 +252,15 @@ impl<R: Overlaps<R>> Node<R> {
 
             if overlap == Overlap::Equal {
                 return self
-                    .semaphore
-                    .clone()
-                    .acquire_owned()
+                    .acquire()
                     .map_ok(|permit| Permit {
                         range: self.range.clone(),
                         permit,
                     })
-                    .map_err(Error::from)
                     .await;
             }
 
-            // make sure the target range is not locked
+            // make sure this range is not locked
             let _permit = self.semaphore.acquire().await;
 
             match overlap {
@@ -174,18 +282,13 @@ impl<R: Overlaps<R>> Node<R> {
         let overlap = self.range.overlaps(target);
 
         if overlap == Overlap::Equal {
-            return self
-                .semaphore
-                .clone()
-                .try_acquire_owned()
-                .map(|permit| Permit {
-                    range: self.range.clone(),
-                    permit,
-                })
-                .map_err(Error::from);
+            return self.try_acquire().map(|permit| Permit {
+                range: self.range.clone(),
+                permit,
+            });
         }
 
-        // make sure the target range is not locked
+        // make sure this range is not locked
         let _permit = self.semaphore.try_acquire()?;
 
         match overlap {
@@ -202,14 +305,11 @@ impl<R: Overlaps<R>> Node<R> {
 
             if overlap == Overlap::Equal {
                 return self
-                    .semaphore
-                    .clone()
-                    .acquire_many_owned(PERMITS)
+                    .acquire_many(PERMITS)
                     .map_ok(|permit| Permit {
                         range: self.range.clone(),
                         permit,
                     })
-                    .map_err(Error::from)
                     .await;
             }
 
@@ -229,15 +329,10 @@ impl<R: Overlaps<R>> Node<R> {
         let overlap = self.range.overlaps(target);
 
         if overlap == Overlap::Equal {
-            return self
-                .semaphore
-                .clone()
-                .try_acquire_many_owned(PERMITS)
-                .map(|permit| Permit {
-                    range: self.range.clone(),
-                    permit,
-                })
-                .map_err(Error::from);
+            return self.try_acquire_many(PERMITS).map(|permit| Permit {
+                range: self.range.clone(),
+                permit,
+            });
         }
 
         // make sure the target range is not locked
@@ -341,5 +436,17 @@ impl<R: Overlaps<R>> Version<R> {
         let (i, range) = self.insert(range);
         let root = &self.roots[i];
         root.read(&range).await
+    }
+
+    fn try_write(&mut self, range: R) -> Result<Permit<R>> {
+        let (i, range) = self.insert(range);
+        let root = &self.roots[i];
+        root.try_write(&range)
+    }
+
+    async fn write(&mut self, range: R) -> Result<Permit<R>> {
+        let (i, range) = self.insert(range);
+        let root = &self.roots[i];
+        root.write(&range).await
     }
 }
