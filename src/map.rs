@@ -27,8 +27,9 @@ use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use super::semaphore::*;
 use super::{Error, Result};
 
+/// A range used to reserve [`Semaphore`] permits in a [`TxnMapLock`]
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
-enum Range<K> {
+pub enum Range<K> {
     One(Arc<K>),
     All,
 }
@@ -79,35 +80,21 @@ impl<K: Eq + Ord> Overlaps<K> for Range<K> {
     }
 }
 
-#[derive(Debug)]
-pub enum ValueRead<V> {
-    Committed(Arc<V>),
-    Pending(OwnedRwLockReadGuard<V>),
-}
-
-impl<V> Deref for ValueRead<V> {
-    type Target = V;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Committed(value) => value.deref(),
-            Self::Pending(version) => version.deref(),
-        }
-    }
-}
-
 /// A read guard on a value in a [`TxnMapLock`]
 #[derive(Debug)]
-pub struct ValueReadGuard<K, V> {
-    _permit: Permit<Range<K>>,
-    value: ValueRead<V>,
+pub enum ValueReadGuard<K, V> {
+    Committed(Arc<V>),
+    Pending(Permit<Range<K>>, OwnedRwLockReadGuard<V>),
 }
 
 impl<K, V> Deref for ValueReadGuard<K, V> {
     type Target = V;
 
     fn deref(&self) -> &Self::Target {
-        self.value.deref()
+        match self {
+            Self::Committed(value) => value.deref(),
+            Self::Pending(_permit, value) => value.deref(),
+        }
     }
 }
 
@@ -140,6 +127,12 @@ struct State<I, K, V> {
     finalized: Option<I>,
 }
 
+impl<I: Copy, K, V> State<I, K, V> {
+    fn last_commit(&self) -> Option<I> {
+        self.committed.keys().last().copied()
+    }
+}
+
 /// A futures-aware read-write lock on a [`BTreeMap`] which supports transactional versioning
 pub struct TxnMapLock<I, K, V> {
     state: Arc<Mutex<State<I, K, V>>>,
@@ -153,6 +146,12 @@ impl<I, K, V> Clone for TxnMapLock<I, K, V> {
             semaphore: self.semaphore.clone(),
         }
     }
+}
+
+enum ReadCommitted<V> {
+    Committed(Option<Arc<V>>),
+    Finalized,
+    Pending,
 }
 
 impl<I: Ord + Copy, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
@@ -189,9 +188,39 @@ impl<I: Ord + Copy, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
         }
     }
 
+    fn get_committed(&self, txn_id: I, key: &K) -> ReadCommitted<V> {
+        let state = self.state.lock().expect("lock state");
+        if state.finalized > Some(txn_id) {
+            return ReadCommitted::Finalized;
+        } else if !state.committed.contains_key(&txn_id) {
+            return ReadCommitted::Pending;
+        }
+
+        let committed = state
+            .committed
+            .iter()
+            .rev()
+            .skip_while(|(id, _)| *id > &txn_id)
+            .map(|(_, version)| version);
+
+        for version in committed {
+            if let Some(value) = version.get(key) {
+                return ReadCommitted::Committed(Some(value.clone()));
+            }
+        }
+
+        ReadCommitted::Committed(state.canon.get(key).cloned())
+    }
+
     /// Read a value from this [`TxnMapLock`] at the given `txn_id`.
     pub async fn get(&self, txn_id: I, key: Arc<K>) -> Result<Option<ValueReadGuard<K, V>>> {
-        let _permit = self.semaphore.read(txn_id, Range::One(key.clone())).await?;
+        match self.get_committed(txn_id, &key) {
+            ReadCommitted::Committed(value) => return Ok(value.map(ValueReadGuard::Committed)),
+            ReadCommitted::Finalized => return Err(Error::Outdated),
+            ReadCommitted::Pending => {}
+        }
+
+        let permit = self.semaphore.read(txn_id, Range::One(key.clone())).await?;
 
         let state = self.state.lock().expect("lock state");
         if state.finalized >= Some(txn_id) {
@@ -203,27 +232,8 @@ impl<I: Ord + Copy, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
         if let Some(version) = state.pending.get(&txn_id) {
             if let Some(value) = version.get(&key) {
                 let guard = value.clone().read_owned().await;
-                return Ok(Some(ValueReadGuard {
-                    _permit,
-                    value: ValueRead::Pending(guard),
-                }));
+                return Ok(Some(ValueReadGuard::Pending(permit, guard)));
             }
-        }
-
-        for version in state.committed.values().rev() {
-            if let Some(value) = version.get(&key) {
-                return Ok(Some(ValueReadGuard {
-                    _permit,
-                    value: ValueRead::Committed(value.clone()),
-                }));
-            }
-        }
-
-        if let Some(value) = state.canon.get(&key) {
-            return Ok(Some(ValueReadGuard {
-                _permit,
-                value: ValueRead::Committed(value.clone()),
-            }));
         }
 
         Ok(None)
@@ -231,16 +241,19 @@ impl<I: Ord + Copy, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
 
     /// Insert a new entry into this [`TxnMapLock`] at the given `txn_id`.
     pub async fn insert(&self, txn_id: I, key: Arc<K>, value: V) -> Result<()> {
+        {
+            let state = self.state.lock().expect("lock state");
+            if state.finalized >= Some(txn_id) {
+                return Err(Error::Outdated);
+            } else if state.committed.contains_key(&txn_id) {
+                return Err(Error::Committed);
+            }
+        }
+
         let range = Range::One(key.clone());
         let _permit = self.semaphore.write(txn_id, range.clone()).await?;
 
-        let value = Arc::new(RwLock::new(value));
-
         let mut state = self.state.lock().expect("lock state");
-
-        if state.finalized >= Some(txn_id) {
-            return Err(Error::Outdated);
-        }
 
         fn version_entry<K: Ord, V>(
             version: &mut Version<K, V>,
@@ -258,6 +271,7 @@ impl<I: Ord + Copy, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
             }
         }
 
+        let value = Arc::new(RwLock::new(value));
         match state.pending.entry(txn_id) {
             Entry::Occupied(mut entry) => version_entry(entry.get_mut(), key, value),
             Entry::Vacant(entry) => {
