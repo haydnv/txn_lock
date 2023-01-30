@@ -163,7 +163,7 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
         }
     }
 
-    /// Finalize the state of this [`TxnMapLock`] at `txn_id`.
+    /// Finalize the state of this [`TxnSetLock`] at `txn_id`.
     /// This will merge in deltas and prevent further reads of versions earlier than `txn_id`.
     pub fn finalize(&self, txn_id: I) {
         let mut state = self.state();
@@ -214,7 +214,7 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
         Ok(self.state().contains_pending(&txn_id, key))
     }
 
-    /// Insert a new entry into this [`TxnMapLock`] at `txn_id`.
+    /// Insert a new entry into this [`TxnSetLock`] at `txn_id`.
     pub async fn insert(&self, txn_id: I, key: Arc<T>) -> Result<()> {
         // before acquiring a permit, check if this version has already been committed
         self.state().check_pending(&txn_id)?;
@@ -224,7 +224,7 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
         Ok(self.state().insert(txn_id, key))
     }
 
-    /// Insert a new entry into this [`TxnMapLock`] at `txn_id` synchronously, if possible.
+    /// Insert a new entry into this [`TxnSetLock`] at `txn_id` synchronously, if possible.
     pub fn try_insert(&self, txn_id: I, key: Arc<T>) -> Result<()> {
         // before acquiring a permit, check if this version has already been committed
         self.state().check_pending(&txn_id)?;

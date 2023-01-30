@@ -1,49 +1,16 @@
 //! Utilities to support transactional versioning.
 //!
-//! Example:
-//! ```
-//! use futures::executor::block_on;
-//! use txn_lock::lock::*;
-//! use txn_lock::Error;
+//! General-purpose locks and usage examples are provided
+//! in the [`map`], [`scalar`], and [`set`] modules.
 //!
-//! let lock = TxnLock::new("example", 0, "zero");
-//!
-//! assert_eq!(*lock.try_read(0).expect("read"), "zero");
-//! assert_eq!(lock.try_write(1).unwrap_err(), Error::WouldBlock);
-//!
-//! {
-//!     let commit = block_on(lock.commit(0)).expect("commit guard");
-//!     assert_eq!(*commit, "zero");
-//!     // this commit guard will block future commits until dropped
-//! }
-//!
-//! {
-//!     let mut guard = lock.try_write(1).expect("write lock");
-//!     *guard = "one";
-//! }
-//!
-//! assert_eq!(*lock.try_read(0).expect("read past version"), "zero");
-//! assert_eq!(*lock.try_read(1).expect("read current version"), "one");
-//!
-//! block_on(lock.commit(1));
-//!
-//! assert_eq!(*lock.try_read_exclusive(2).expect("new value"), "one");
-//!
-//! lock.rollback(&2);
-//!
-//! {
-//!     let mut guard = lock.try_write(3).expect("write lock");
-//!     *guard = "three";
-//! }
-//!
-//! assert_eq!(*block_on(lock.finalize(&1)).expect("finalized version"), "one");
-//!
-//! assert_eq!(lock.try_read(0).unwrap_err(), Error::Outdated);
-//! assert_eq!(*lock.try_read(3).expect("current value"), "three");
-//! ```
+//! More complex transaction locks (e.g. for a relational database) can be constructed using
+//! the [`semaphore`] module.
+
+extern crate core;
 
 pub mod lock;
 pub mod map;
+pub mod scalar;
 pub mod semaphore;
 pub mod set;
 
