@@ -51,6 +51,8 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
 
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+
 use super::semaphore::{Overlap, Overlaps, Permit, Semaphore};
 use super::{Error, Result};
 
@@ -67,7 +69,7 @@ impl Overlaps<Range> for Range {
 /// A read guard on a transactional value
 pub enum TxnLockReadGuard<T> {
     Committed(Arc<T>),
-    Pending(Permit<Range>, Arc<T>),
+    Pending(Permit<Range>, OwnedRwLockReadGuard<T>),
 }
 
 impl<T> Deref for TxnLockReadGuard<T> {
@@ -108,12 +110,14 @@ impl<T: fmt::Display> fmt::Display for TxnLockReadGuard<T> {
 struct State<I, T> {
     canon: Option<Arc<T>>,
     committed: BTreeMap<I, Option<Arc<T>>>,
-    pending: BTreeMap<I, Arc<T>>,
+    pending: BTreeMap<I, Arc<RwLock<T>>>,
     finalized: Option<I>,
 }
 
 impl<I: Ord, T> State<I, T> {
-    fn new(txn_id: I, version: Arc<T>) -> Self {
+    fn new(txn_id: I, value: T) -> Self {
+        let version = Arc::new(RwLock::new(value));
+
         State {
             canon: None,
             committed: BTreeMap::new(),
@@ -153,12 +157,14 @@ impl<I: Ord, T> State<I, T> {
     }
 
     #[inline]
-    fn read_pending(&self, txn_id: &I) -> Result<Arc<T>> {
+    fn read_pending(&self, txn_id: &I, permit: Permit<Range>) -> Result<TxnLockReadGuard<T>> {
         if let Some(version) = self.pending.get(&txn_id) {
-            return Ok(version.clone());
+            // the permit means it's safe to call try_read_owned().expect()
+            let guard = version.clone().try_read_owned().expect("version");
+            return Ok(TxnLockReadGuard::Pending(permit, guard));
         }
 
-        self.read_canon(txn_id)
+        self.read_canon(txn_id).map(TxnLockReadGuard::Committed)
     }
 }
 
@@ -188,12 +194,12 @@ impl<I: Copy + Ord, T: fmt::Debug> TxnLock<I, T> {
     /// Construct a new [`TxnLock`].
     pub fn new(txn_id: I, initial_value: T) -> Self {
         Self {
-            state: Arc::new(Mutex::new(State::new(txn_id, Arc::new(initial_value)))),
+            state: Arc::new(Mutex::new(State::new(txn_id, initial_value))),
             semaphore: Semaphore::new(),
         }
     }
 
-    /// Read this [`TxnLock`] at `txn_id`.
+    /// Acquire a read lock for this value at `txn_id`.
     pub async fn read(&self, txn_id: I) -> Result<TxnLockReadGuard<T>> {
         // before acquiring a permit, check if this version has already been committed
         if let Poll::Ready(result) = self.state().read_committed(&txn_id) {
@@ -201,13 +207,10 @@ impl<I: Copy + Ord, T: fmt::Debug> TxnLock<I, T> {
         }
 
         let permit = self.semaphore.read(txn_id, Range).await?;
-
-        self.state()
-            .read_pending(&txn_id)
-            .map(|value| TxnLockReadGuard::Pending(permit, value))
+        self.state().read_pending(&txn_id, permit)
     }
 
-    /// Read this [`TxnLock`] at `txn_id` synchronously, if possible.
+    /// Acquire a read lock for this value at `txn_id` synchronously, if possible.
     pub fn try_read(&self, txn_id: I) -> Result<TxnLockReadGuard<T>> {
         // before acquiring a permit, check if this version has already been committed
         if let Poll::Ready(result) = self.state().read_committed(&txn_id) {
@@ -215,9 +218,6 @@ impl<I: Copy + Ord, T: fmt::Debug> TxnLock<I, T> {
         }
 
         let permit = self.semaphore.try_read(txn_id, Range)?;
-
-        self.state()
-            .read_pending(&txn_id)
-            .map(|value| TxnLockReadGuard::Pending(permit, value))
+        self.state().read_pending(&txn_id, permit)
     }
 }
