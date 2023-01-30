@@ -44,12 +44,12 @@ pub use super::range::Range;
 
 /// A read guard on a value in a [`TxnMapLock`]
 #[derive(Debug)]
-pub enum ValueReadGuard<K, V> {
+pub enum TxnMapValueReadGuard<K, V> {
     Committed(Arc<V>),
     Pending(Permit<Range<K>>, Arc<V>),
 }
 
-impl<K, V> Deref for ValueReadGuard<K, V> {
+impl<K, V> Deref for TxnMapValueReadGuard<K, V> {
     type Target = V;
 
     fn deref(&self) -> &Self::Target {
@@ -60,13 +60,13 @@ impl<K, V> Deref for ValueReadGuard<K, V> {
     }
 }
 
-impl<K, V: PartialOrd> PartialOrd<V> for ValueReadGuard<K, V> {
+impl<K, V: PartialOrd> PartialOrd<V> for TxnMapValueReadGuard<K, V> {
     fn partial_cmp(&self, other: &V) -> Option<Ordering> {
         self.deref().partial_cmp(other)
     }
 }
 
-impl<K, V: PartialEq> PartialEq<V> for ValueReadGuard<K, V> {
+impl<K, V: PartialEq> PartialEq<V> for TxnMapValueReadGuard<K, V> {
     fn eq(&self, other: &V) -> bool {
         self.deref().eq(other)
     }
@@ -124,13 +124,17 @@ impl<I: Ord, K: Ord, V> State<I, K, V> {
     }
 
     #[inline]
-    fn get_committed(&self, txn_id: &I, key: &K) -> Poll<Result<Option<ValueReadGuard<K, V>>>> {
+    fn get_committed(
+        &self,
+        txn_id: &I,
+        key: &K,
+    ) -> Poll<Result<Option<TxnMapValueReadGuard<K, V>>>> {
         if self.finalized.as_ref() > Some(&txn_id) {
             Poll::Ready(Err(Error::Outdated))
         } else if self.committed.contains_key(&txn_id) {
             assert!(!self.pending.contains_key(&txn_id));
             let canon = self.get_canon(&txn_id, &key);
-            Poll::Ready(Ok(canon.map(ValueReadGuard::Committed)))
+            Poll::Ready(Ok(canon.map(TxnMapValueReadGuard::Committed)))
         } else {
             Poll::Pending
         }
@@ -142,15 +146,15 @@ impl<I: Ord, K: Ord, V> State<I, K, V> {
         txn_id: &I,
         key: &K,
         permit: Permit<Range<K>>,
-    ) -> Option<ValueReadGuard<K, V>> {
+    ) -> Option<TxnMapValueReadGuard<K, V>> {
         if let Some(version) = self.pending.get(&txn_id) {
             if let Some(value) = version.get(key) {
-                return Some(ValueReadGuard::Pending(permit, value.clone()));
+                return Some(TxnMapValueReadGuard::Pending(permit, value.clone()));
             }
         }
 
         let canon = self.get_canon(&txn_id, key);
-        canon.map(ValueReadGuard::Committed)
+        canon.map(TxnMapValueReadGuard::Committed)
     }
 
     #[inline]
@@ -264,7 +268,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
     }
 
     /// Read a value from this [`TxnMapLock`] at `txn_id`.
-    pub async fn get(&self, txn_id: I, key: &Arc<K>) -> Result<Option<ValueReadGuard<K, V>>> {
+    pub async fn get(&self, txn_id: I, key: &Arc<K>) -> Result<Option<TxnMapValueReadGuard<K, V>>> {
         // before acquiring a permit, check if this version has already been committed
         if let Poll::Ready(result) = self.state().get_committed(&txn_id, key) {
             return result;
@@ -276,7 +280,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
     }
 
     /// Read a value from this [`TxnMapLock`] at `txn_id` synchronously, if possible.
-    pub fn try_get(&self, txn_id: I, key: &Arc<K>) -> Result<Option<ValueReadGuard<K, V>>> {
+    pub fn try_get(&self, txn_id: I, key: &Arc<K>) -> Result<Option<TxnMapValueReadGuard<K, V>>> {
         // before acquiring a permit, check if this version has already been committed
         if let Poll::Ready(result) = self.state().get_committed(&txn_id, key) {
             return result;

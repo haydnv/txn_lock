@@ -8,7 +8,8 @@
 //!
 //! let lock = TxnLock::new(0, "zero");
 //!
-//! // assert_eq!(*lock.try_read(0).expect("read"), "zero");
+//! assert_eq!(block_on(lock.read(0)).expect("read"), "zero");
+//! assert_eq!(*lock.try_read(0).expect("read"), "zero");
 //! // assert_eq!(lock.try_write(1).unwrap_err(), Error::WouldBlock);
 //!
 //! {
@@ -42,30 +43,65 @@
 //! // assert_eq!(*lock.try_read(3).expect("current value"), "three");
 //! ```
 
-use core::fmt;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::iter;
-use std::sync::{Arc, Mutex};
+use std::ops::Deref;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::Poll;
 
-use super::semaphore::{Overlap, Overlaps, Semaphore};
+use super::semaphore::{Overlap, Overlaps, Permit, Semaphore};
+use super::{Error, Result};
 
+/// A range used to reserve a [`Permit`] to guard access to a [`TxnLock`]
 #[derive(Debug)]
-struct Range<T>(T);
+pub struct Range;
 
-impl<T> From<T> for Range<T> {
-    fn from(scalar: T) -> Self {
-        Self(scalar)
+impl Overlaps<Range> for Range {
+    fn overlaps(&self, _other: &Range) -> Overlap {
+        Overlap::Equal
     }
 }
 
-impl<T: Ord> Overlaps<Range<T>> for Range<T> {
-    fn overlaps(&self, other: &Range<T>) -> Overlap {
-        match self.0.cmp(&other.0) {
-            Ordering::Less => Overlap::Less,
-            Ordering::Equal => Overlap::Equal,
-            Ordering::Greater => Overlap::Greater,
+/// A read guard on a transactional value
+pub enum TxnLockReadGuard<T> {
+    Committed(Arc<T>),
+    Pending(Permit<Range>, Arc<T>),
+}
+
+impl<T> Deref for TxnLockReadGuard<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        match self {
+            Self::Committed(value) => value.deref(),
+            Self::Pending(_permit, value) => value.deref(),
         }
+    }
+}
+
+impl<T: PartialEq> PartialEq<T> for TxnLockReadGuard<T> {
+    fn eq(&self, other: &T) -> bool {
+        self.deref().eq(other)
+    }
+}
+
+impl<T: PartialOrd> PartialOrd<T> for TxnLockReadGuard<T> {
+    fn partial_cmp(&self, other: &T) -> Option<Ordering> {
+        self.deref().partial_cmp(other)
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for TxnLockReadGuard<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.deref().fmt(f)
+    }
+}
+
+impl<T: fmt::Display> fmt::Display for TxnLockReadGuard<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.deref().fmt(f)
     }
 }
 
@@ -76,7 +112,7 @@ struct State<I, T> {
     finalized: Option<I>,
 }
 
-impl<I: Ord, T: Ord> State<I, T> {
+impl<I: Ord, T> State<I, T> {
     fn new(txn_id: I, version: Arc<T>) -> Self {
         State {
             canon: None,
@@ -85,12 +121,51 @@ impl<I: Ord, T: Ord> State<I, T> {
             finalized: None,
         }
     }
+
+    #[inline]
+    fn read_canon(&self, txn_id: &I) -> Result<Arc<T>> {
+        let committed = self
+            .committed
+            .iter()
+            .rev()
+            .skip_while(|(id, _)| *id > txn_id)
+            .map(|(_, version)| version);
+
+        for version in committed {
+            if let Some(version) = version {
+                return Ok(version.clone());
+            }
+        }
+
+        self.canon.clone().ok_or_else(|| Error::Outdated)
+    }
+
+    #[inline]
+    fn read_committed(&self, txn_id: &I) -> Poll<Result<Arc<T>>> {
+        if self.finalized.as_ref() > Some(&txn_id) {
+            Poll::Ready(Err(Error::Outdated))
+        } else if self.committed.contains_key(&txn_id) {
+            assert!(!self.pending.contains_key(&txn_id));
+            Poll::Ready(self.read_canon(&txn_id))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    #[inline]
+    fn read_pending(&self, txn_id: &I) -> Result<Arc<T>> {
+        if let Some(version) = self.pending.get(&txn_id) {
+            return Ok(version.clone());
+        }
+
+        self.read_canon(txn_id)
+    }
 }
 
 /// A futures-aware read-write lock on a scalar value which supports transactional versioning.
 pub struct TxnLock<I, T> {
     state: Arc<Mutex<State<I, T>>>,
-    semaphore: Semaphore<I, Range<T>>,
+    semaphore: Semaphore<I, Range>,
 }
 
 impl<I, T> Clone for TxnLock<I, T> {
@@ -102,12 +177,47 @@ impl<I, T> Clone for TxnLock<I, T> {
     }
 }
 
-impl<I: Ord, T: Ord + fmt::Debug> TxnLock<I, T> {
+impl<I, T> TxnLock<I, T> {
+    #[inline]
+    fn state(&self) -> MutexGuard<State<I, T>> {
+        self.state.lock().expect("lock state")
+    }
+}
+
+impl<I: Copy + Ord, T: fmt::Debug> TxnLock<I, T> {
     /// Construct a new [`TxnLock`].
     pub fn new(txn_id: I, initial_value: T) -> Self {
         Self {
             state: Arc::new(Mutex::new(State::new(txn_id, Arc::new(initial_value)))),
             semaphore: Semaphore::new(),
         }
+    }
+
+    /// Read this [`TxnLock`] at `txn_id`.
+    pub async fn read(&self, txn_id: I) -> Result<TxnLockReadGuard<T>> {
+        // before acquiring a permit, check if this version has already been committed
+        if let Poll::Ready(result) = self.state().read_committed(&txn_id) {
+            return result.map(TxnLockReadGuard::Committed);
+        }
+
+        let permit = self.semaphore.read(txn_id, Range).await?;
+
+        self.state()
+            .read_pending(&txn_id)
+            .map(|value| TxnLockReadGuard::Pending(permit, value))
+    }
+
+    /// Read this [`TxnLock`] at `txn_id` synchronously, if possible.
+    pub fn try_read(&self, txn_id: I) -> Result<TxnLockReadGuard<T>> {
+        // before acquiring a permit, check if this version has already been committed
+        if let Poll::Ready(result) = self.state().read_committed(&txn_id) {
+            return result.map(TxnLockReadGuard::Committed);
+        }
+
+        let permit = self.semaphore.try_read(txn_id, Range)?;
+
+        self.state()
+            .read_pending(&txn_id)
+            .map(|value| TxnLockReadGuard::Pending(permit, value))
     }
 }
