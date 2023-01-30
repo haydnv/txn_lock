@@ -37,6 +37,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
 use std::{fmt, iter};
 
+use tokio::sync::{OwnedRwLockReadGuard, RwLock};
+
 use super::semaphore::*;
 use super::{Error, Result};
 
@@ -46,7 +48,7 @@ pub use super::range::Range;
 #[derive(Debug)]
 pub enum TxnMapValueReadGuard<K, V> {
     Committed(Arc<V>),
-    Pending(Permit<Range<K>>, Arc<V>),
+    Pending(Permit<Range<K>>, OwnedRwLockReadGuard<V>),
 }
 
 impl<K, V> Deref for TxnMapValueReadGuard<K, V> {
@@ -72,7 +74,7 @@ impl<K, V: PartialEq> PartialEq<V> for TxnMapValueReadGuard<K, V> {
     }
 }
 
-type Version<K, V> = BTreeMap<Arc<K>, Arc<V>>;
+type Version<K, V> = BTreeMap<Arc<K>, Arc<RwLock<V>>>;
 
 struct State<I, K, V> {
     canon: BTreeMap<Arc<K>, Arc<V>>,
@@ -149,7 +151,9 @@ impl<I: Ord, K: Ord, V> State<I, K, V> {
     ) -> Option<TxnMapValueReadGuard<K, V>> {
         if let Some(version) = self.pending.get(&txn_id) {
             if let Some(value) = version.get(key) {
-                return Some(TxnMapValueReadGuard::Pending(permit, value.clone()));
+                // the permit means it's safe to call try_read_owned().expect()
+                let guard = value.clone().try_read_owned().expect("read version");
+                return Some(TxnMapValueReadGuard::Pending(permit, guard));
             }
         }
 
@@ -160,7 +164,11 @@ impl<I: Ord, K: Ord, V> State<I, K, V> {
     #[inline]
     fn insert(&mut self, txn_id: I, key: Arc<K>, value: V) {
         #[inline]
-        fn version_entry<K: Ord, V>(version: &mut Version<K, V>, key: Arc<K>, value: Arc<V>) {
+        fn version_entry<K: Ord, V>(
+            version: &mut Version<K, V>,
+            key: Arc<K>,
+            value: Arc<RwLock<V>>,
+        ) {
             match version.entry(key) {
                 Entry::Occupied(mut entry) => {
                     let existing_delta = entry.get_mut();
@@ -172,7 +180,7 @@ impl<I: Ord, K: Ord, V> State<I, K, V> {
             }
         }
 
-        let value = Arc::new(value);
+        let value = Arc::new(RwLock::new(value));
         match self.pending.entry(txn_id) {
             Entry::Occupied(mut entry) => version_entry(entry.get_mut(), key, value),
             Entry::Vacant(entry) => {
@@ -219,7 +227,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
     pub fn with_contents<C: IntoIterator<Item = (K, V)>>(txn_id: I, contents: C) -> Self {
         let version = contents
             .into_iter()
-            .map(|(key, value)| (Arc::new(key), Arc::new(value)))
+            .map(|(key, value)| (Arc::new(key), Arc::new(RwLock::new(value))))
             .collect();
 
         Self {
@@ -229,12 +237,31 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
     }
 
     /// Commit the state of this [`TxnMapLock`] at `txn_id`.
+    /// Panics:
+    ///  - if any new value to commit is still locked (for reading or writing)
     pub fn commit(&self, txn_id: I) {
         let mut state = self.state();
 
         self.semaphore.finalize(&txn_id, false);
 
-        let version = state.pending.remove(&txn_id);
+        let version = if let Some(version) = state.pending.remove(&txn_id) {
+            let version = version
+                .into_iter()
+                .map(|(key, value)| {
+                    let value = if let Ok(value) = Arc::try_unwrap(value) {
+                        value.into_inner()
+                    } else {
+                        panic!("a value to commit at {} is still locked", txn_id);
+                    };
+
+                    (key, Arc::new(value))
+                })
+                .collect();
+
+            Some(version)
+        } else {
+            None
+        };
 
         match state.committed.entry(txn_id) {
             Entry::Occupied(_) => {

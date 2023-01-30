@@ -113,6 +113,7 @@ impl<I: Ord, T: Ord> State<I, T> {
 }
 
 /// A futures-aware read-write lock on a [`BTreeSet`] which supports transactional versioning.
+// TODO: handle the case where a write permit is acquired and then dropped without committing
 pub struct TxnSetLock<I, T> {
     state: Arc<Mutex<State<I, T>>>,
     semaphore: Semaphore<I, Range<T>>,
