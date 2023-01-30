@@ -24,11 +24,15 @@
 //!
 //! map.commit(1);
 //!
-//! let value = map.try_get(2, &one).expect("read");
-//! assert_eq!(*(value.expect("guard")), 1.0);
+//! let mut value = map.try_get_mut(2, one.clone()).expect("read").expect("value");
+//! assert_eq!(value, 1.0);
+//! *value = 2.0;
+//!
+//! assert_eq!(map.try_remove(2, one.clone()).unwrap_err(), Error::WouldBlock);
+//! std::mem::drop(value);
 //!
 //! let value = block_on(map.remove(2, one.clone())).expect("remove").expect("value");
-//! assert_eq!(*value, 1.0);
+//! assert_eq!(*value, 2.0);
 //!
 //! assert!(map.try_remove(2, one.clone()).expect("remove").is_none());
 //!
@@ -54,9 +58,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
 use std::{fmt, iter};
 
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
 
-use super::guard::TxnReadGuard;
+use super::guard::{TxnReadGuard, TxnWriteGuard};
 use super::semaphore::*;
 use super::{Error, Result};
 
@@ -64,6 +68,9 @@ pub use super::range::Range;
 
 /// A read guard on a value in a [`TxnMapLock`]
 pub type TxnMapValueReadGuard<K, V> = TxnReadGuard<Range<K>, V>;
+
+/// A write guard on a value in a [`TxnMapLock`]
+pub type TxnMapValueWriteGuard<K, V> = TxnWriteGuard<Range<K>, V>;
 
 type Canon<K, V> = BTreeMap<Arc<K>, Arc<V>>;
 type Committed<I, K, V> = BTreeMap<I, Option<BTreeMap<Arc<K>, Option<Arc<V>>>>>;
@@ -100,7 +107,7 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
 
     #[inline]
     fn get_canon(&self, txn_id: &I, key: &K) -> Option<Arc<V>> {
-        get_canon(&self.canon, &self.committed, txn_id, key)
+        get_canon(&self.canon, &self.committed, txn_id, key).cloned()
     }
 
     #[inline]
@@ -185,13 +192,15 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
                     }
                 }
                 Entry::Vacant(entry) => {
-                    let prior = get_canon(&self.canon, &self.committed, &txn_id, entry.key());
+                    let prior =
+                        get_canon(&self.canon, &self.committed, &txn_id, entry.key()).cloned();
+
                     entry.insert(None);
                     prior
                 }
             },
             Entry::Vacant(pending) => {
-                let prior_value = get_canon(&self.canon, &self.committed, &txn_id, &key);
+                let prior_value = get_canon(&self.canon, &self.committed, &txn_id, &key).cloned();
                 let version = iter::once((key, None)).collect();
                 pending.insert(version);
                 prior_value
@@ -200,13 +209,60 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
     }
 }
 
+impl<I: Copy + Ord, K: Ord, V: Clone + fmt::Debug> State<I, K, V> {
+    #[inline]
+    fn get_mut(
+        &mut self,
+        txn_id: I,
+        key: Arc<K>,
+        permit: Permit<Range<K>>,
+    ) -> Option<TxnMapValueWriteGuard<K, V>> {
+        #[inline]
+        fn new_value<V: Clone>(canon: &V) -> (Arc<RwLock<V>>, OwnedRwLockWriteGuard<V>) {
+            let value = V::clone(canon);
+            let value = Arc::new(RwLock::new(value));
+            let guard = value.clone().try_write_owned().expect("write version");
+            (value, guard)
+        }
+
+        match self.pending.entry(txn_id) {
+            Entry::Occupied(mut pending) => match pending.get_mut().entry(key) {
+                Entry::Occupied(delta) => {
+                    let value = delta.get().as_ref()?;
+
+                    // the permit means it's safe to call try_write_owned().expect()
+                    let guard = value.clone().try_write_owned().expect("write version");
+                    Some(TxnMapValueWriteGuard::new(permit, guard))
+                }
+                Entry::Vacant(delta) => {
+                    let canon = get_canon(&self.canon, &self.committed, &txn_id, delta.key())?;
+                    let (value, guard) = new_value(&**canon);
+
+                    delta.insert(Some(value));
+
+                    Some(TxnMapValueWriteGuard::new(permit, guard))
+                }
+            },
+            Entry::Vacant(pending) => {
+                let canon = get_canon(&self.canon, &self.committed, &txn_id, &key)?;
+                let (value, guard) = new_value(&**canon);
+
+                let version = iter::once((key, Some(value))).collect();
+                pending.insert(version);
+
+                Some(TxnMapValueWriteGuard::new(permit, guard))
+            }
+        }
+    }
+}
+
 #[inline]
-fn get_canon<I: Ord, K: Ord, V>(
-    canon: &Canon<K, V>,
-    committed: &Committed<I, K, V>,
-    txn_id: &I,
-    key: &K,
-) -> Option<Arc<V>> {
+fn get_canon<'a, I: Ord, K: Ord, V>(
+    canon: &'a Canon<K, V>,
+    committed: &'a Committed<I, K, V>,
+    txn_id: &'a I,
+    key: &'a K,
+) -> Option<&'a Arc<V>> {
     let committed = committed
         .iter()
         .rev()
@@ -216,15 +272,18 @@ fn get_canon<I: Ord, K: Ord, V>(
     for version in committed {
         if let Some(version) = version {
             if let Some(delta) = version.get(key) {
-                return delta.clone();
+                return delta.as_ref();
             }
         }
     }
 
-    canon.get(key).cloned()
+    canon.get(key)
 }
 
 /// A futures-aware read-write lock on a [`BTreeMap`] which supports transactional versioning
+///
+/// The `get_mut` and `try_get_mut` methods require the value type `V` to implement [`Clone`]
+/// in order to support multiple transactions with different versions.
 // TODO: handle the case where a write permit is acquired and then dropped without committing
 pub struct TxnMapLock<I, K, V> {
     state: Arc<Mutex<State<I, K, V>>>,
@@ -344,8 +403,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
         }
 
         let permit = self.semaphore.read(txn_id, Range::One(key.clone())).await?;
-        let state = self.state();
-        Ok(state.get_pending(&txn_id, key, permit))
+        Ok(self.state().get_pending(&txn_id, key, permit))
     }
 
     /// Read a value from this [`TxnMapLock`] at `txn_id` synchronously, if possible.
@@ -356,8 +414,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
         }
 
         let permit = self.semaphore.try_read(txn_id, Range::One(key.clone()))?;
-        let state = self.state();
-        Ok(state.get_pending(&txn_id, key, permit))
+        Ok(self.state().get_pending(&txn_id, key, permit))
     }
 
     /// Insert a new entry into this [`TxnMapLock`] at `txn_id`.
@@ -368,8 +425,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
         let range = Range::One(key.clone());
         let _permit = self.semaphore.write(txn_id, range).await?;
 
-        let mut state = self.state();
-        Ok(state.insert(txn_id, key, value))
+        Ok(self.state().insert(txn_id, key, value))
     }
 
     /// Insert a new entry into this [`TxnMapLock`] at `txn_id` synchronously, if possible.
@@ -392,8 +448,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
         let range = Range::One(key.clone());
         let _permit = self.semaphore.write(txn_id, range).await?;
 
-        let mut state = self.state();
-        Ok(state.remove(txn_id, key))
+        Ok(self.state().remove(txn_id, key))
     }
 
     /// Remove and return the value at `key` from this [`TxnMapLock`] at `txn_id`, if present.
@@ -421,5 +476,38 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
 
         self.semaphore.finalize(txn_id, false);
         state.pending.remove(txn_id);
+    }
+}
+
+impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: Clone + fmt::Debug> TxnMapLock<I, K, V> {
+    /// Read a mutable value from this [`TxnMapLock`] at `txn_id`.
+    pub async fn get_mut(
+        &self,
+        txn_id: I,
+        key: Arc<K>,
+    ) -> Result<Option<TxnMapValueWriteGuard<K, V>>> {
+        // before acquiring a permit, check if this version has already been committed
+        self.state().check_pending(&txn_id)?;
+
+        let range = Range::One(key.clone());
+        let permit = self.semaphore.write(txn_id, range).await?;
+
+        Ok(self.state().get_mut(txn_id, key, permit))
+    }
+
+    /// Read a mutable value from this [`TxnMapLock`] at `txn_id`.
+    pub fn try_get_mut(
+        &self,
+        txn_id: I,
+        key: Arc<K>,
+    ) -> Result<Option<TxnMapValueWriteGuard<K, V>>> {
+        let mut state = self.state();
+
+        // before acquiring a permit, check if this version has already been committed
+        state.check_pending(&txn_id)?;
+
+        let permit = self.semaphore.try_write(txn_id, Range::One(key.clone()))?;
+
+        Ok(state.get_mut(txn_id, key, permit))
     }
 }
