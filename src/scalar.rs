@@ -70,7 +70,8 @@ impl Overlaps<Range> for Range {
 #[derive(Debug)]
 pub enum TxnLockReadGuard<T> {
     Committed(Arc<T>),
-    Pending(Permit<Range>, OwnedRwLockReadGuard<T>),
+    PendingRead(Permit<Range>, Arc<T>),
+    PendingWrite(Permit<Range>, OwnedRwLockReadGuard<T>),
 }
 
 impl<T> Deref for TxnLockReadGuard<T> {
@@ -79,7 +80,8 @@ impl<T> Deref for TxnLockReadGuard<T> {
     fn deref(&self) -> &T {
         match self {
             Self::Committed(value) => value.deref(),
-            Self::Pending(_permit, value) => value.deref(),
+            Self::PendingRead(_permit, value) => value.deref(),
+            Self::PendingWrite(_permit, value) => value.deref(),
         }
     }
 }
@@ -119,7 +121,7 @@ struct State<I, T> {
     finalized: Option<I>,
 }
 
-impl<I: Ord, T: Clone> State<I, T> {
+impl<I: Ord, T> State<I, T> {
     fn new(canon: T) -> Self {
         State {
             canon: Arc::new(canon),
@@ -137,19 +139,6 @@ impl<I: Ord, T: Clone> State<I, T> {
             Err(Error::Committed)
         } else {
             Ok(())
-        }
-    }
-
-    #[inline]
-    fn get_or_create_version(&mut self, txn_id: I) -> Arc<RwLock<T>> {
-        if let Some(version) = self.pending.get(&txn_id) {
-            version.clone()
-        } else {
-            let canon = self.read_canon(&txn_id);
-            let value = T::clone(&*canon);
-            let version = Arc::new(RwLock::new(value));
-            self.pending.insert(txn_id, version.clone());
-            version
         }
     }
 
@@ -184,18 +173,35 @@ impl<I: Ord, T: Clone> State<I, T> {
     }
 
     #[inline]
-    fn read_pending(&mut self, txn_id: I, permit: Permit<Range>) -> TxnLockReadGuard<T> {
-        // the permit means it's safe to call try_read_owned().expect()
-        let value = self
-            .get_or_create_version(txn_id)
-            .try_read_owned()
-            .expect("version");
+    fn read_pending(&mut self, txn_id: &I, permit: Permit<Range>) -> TxnLockReadGuard<T> {
+        if let Some(version) = self.pending.get(txn_id) {
+            // the permit means it's safe to call try_read_owned().expect()
+            let value = version.clone().try_read_owned().expect("version");
+            TxnLockReadGuard::PendingWrite(permit, value)
+        } else {
+            let value = self.read_canon(txn_id).clone();
+            TxnLockReadGuard::PendingRead(permit, value)
+        }
+    }
+}
 
-        return TxnLockReadGuard::Pending(permit, value);
+impl<I: Ord, T: Clone> State<I, T> {
+    #[inline]
+    fn get_or_create_version(&mut self, txn_id: I) -> Arc<RwLock<T>> {
+        if let Some(version) = self.pending.get(&txn_id) {
+            version.clone()
+        } else {
+            let canon = self.read_canon(&txn_id);
+            let value = T::clone(&*canon);
+            let version = Arc::new(RwLock::new(value));
+            self.pending.insert(txn_id, version.clone());
+            version
+        }
     }
 
     #[inline]
     fn write(&mut self, txn_id: I, permit: Permit<Range>) -> Result<TxnLockWriteGuard<T>> {
+        // the permit means it's safe to call try_write_owned().expect()
         let value = self
             .get_or_create_version(txn_id)
             .try_write_owned()
@@ -212,6 +218,7 @@ impl<I: Ord, T: Clone> State<I, T> {
 /// or implementing a custom lock type using [`Semaphore`].
 ///
 /// The type `T` to lock must implement [`Clone`] in order to support versioning.
+/// [`T::clone`] is called once when [`TxnLock::write`] is called with a valid new `txn_id`.
 pub struct TxnLock<I, T> {
     state: Arc<Mutex<State<I, T>>>,
     semaphore: Semaphore<I, Range>,
@@ -233,7 +240,7 @@ impl<I, T> TxnLock<I, T> {
     }
 }
 
-impl<I: Copy + Ord, T: Clone + fmt::Debug> TxnLock<I, T> {
+impl<I: Copy + Ord, T: fmt::Debug> TxnLock<I, T> {
     /// Construct a new [`TxnLock`].
     pub fn new(canon: T) -> Self {
         Self {
@@ -250,7 +257,7 @@ impl<I: Copy + Ord, T: Clone + fmt::Debug> TxnLock<I, T> {
         }
 
         let permit = self.semaphore.read(txn_id, Range).await?;
-        Ok(self.state().read_pending(txn_id, permit))
+        Ok(self.state().read_pending(&txn_id, permit))
     }
 
     /// Acquire a read lock for this value at `txn_id` synchronously, if possible.
@@ -261,9 +268,11 @@ impl<I: Copy + Ord, T: Clone + fmt::Debug> TxnLock<I, T> {
         }
 
         let permit = self.semaphore.try_read(txn_id, Range)?;
-        Ok(self.state().read_pending(txn_id, permit))
+        Ok(self.state().read_pending(&txn_id, permit))
     }
+}
 
+impl<I: Copy + Ord, T: Clone + fmt::Debug> TxnLock<I, T> {
     /// Acquire a write lock for this value at `txn_id`.
     pub async fn write(&self, txn_id: I) -> Result<TxnLockWriteGuard<T>> {
         // before acquiring a permit, check if this version has already been committed
