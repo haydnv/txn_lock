@@ -52,7 +52,10 @@ use super::guard::{TxnReadGuard, TxnWriteGuard};
 use super::semaphore::{Overlap, Overlaps, Permit, Semaphore};
 use super::{Error, Result};
 
+/// A read guard on a [`TxnLock`]
 pub type TxnLockReadGuard<T> = TxnReadGuard<Range, T>;
+
+/// A write guard on a [`TxnLock`]
 pub type TxnLockWriteGuard<T> = TxnWriteGuard<Range, T>;
 
 /// A range used to reserve a [`Permit`] to guard access to a [`TxnLock`]
@@ -162,14 +165,13 @@ impl<I: Ord, T: Clone> State<I, T> {
     }
 }
 
-/// A futures-aware read-write lock on a scalar value which supports transactional versioning,
-/// where "scalar" means that the lock uses a single global range.
+/// A futures-aware read-write lock on a scalar value which supports transactional versioning.
 ///
 /// For non-scalar data types (e.g. a list, set, map, etc) consider using an alternate lock type,
 /// or implementing a custom lock type using [`Semaphore`].
 ///
 /// The type `T` to lock must implement [`Clone`] in order to support versioning.
-/// [`T::clone`] is called once when [`TxnLock::write`] is called with a valid new `txn_id`.
+/// [`Clone::clone`] is called once when [`TxnLock::write`] is called with a valid new `txn_id`.
 // TODO: handle the case where a write permit is acquired and then dropped without committing
 pub struct TxnLock<I, T> {
     state: Arc<Mutex<State<I, T>>>,
@@ -227,7 +229,7 @@ impl<I: Copy + Ord + fmt::Display, T: fmt::Debug> TxnLock<I, T> {
         }
     }
 
-    /// Finalize the state of this [`TxnSetLock`] at `txn_id`.
+    /// Finalize the state of this [`TxnLock`] at `txn_id`.
     /// This will merge in deltas and prevent further reads of versions earlier than `txn_id`.
     pub fn finalize(&self, txn_id: I) {
         let mut state = self.state();

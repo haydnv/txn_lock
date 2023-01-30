@@ -20,9 +20,16 @@ use std::fmt;
 /// An error which may occur when attempting to acquire a transactional lock
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub enum Error {
+    /// Cannot acquire a write lock because the transaction is already committed
     Committed,
+
+    /// Cannot write to the requested range because it's already been locked in the future
     Conflict,
+
+    /// Cannot read or write to the requested range because it's already been finalized
     Outdated,
+
+    /// Unable to acquire a transactional lock synchronously
     WouldBlock,
 }
 

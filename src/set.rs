@@ -234,7 +234,7 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
         Ok(self.state().insert(txn_id, key))
     }
 
-    /// Roll back the state of this [`TxnLock`] at `txn_id`.
+    /// Roll back the state of this [`TxnSetLock`] at `txn_id`.
     pub fn rollback(&self, txn_id: &I) {
         let mut state = self.state();
 
