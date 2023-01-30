@@ -19,6 +19,7 @@
 //! assert_eq!(set.try_insert(2, one.clone()).unwrap_err(), Error::WouldBlock);
 //! set.commit(1);
 //! assert!(set.try_contains(2, &one).expect("contains"));
+//! assert_eq!(block_on(set.iter(2)).expect("iter").collect::<Vec<Arc<String>>>(), vec![one.clone()]);
 //! assert!(block_on(set.remove(2, one.clone())).expect("remove"));
 //! assert!(!set.try_contains(2, &one).expect("contains"));
 //! assert!(!set.try_remove(2, one.clone()).expect("remove"));
@@ -39,7 +40,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
 use std::{fmt, iter};
 
-use super::semaphore::Semaphore;
+use super::semaphore::{Permit, Semaphore};
 use super::{Error, Result};
 
 pub use super::range::Range;
@@ -57,6 +58,7 @@ impl KeyState {
 }
 
 type Version<T> = BTreeMap<Arc<T>, KeyState>;
+type Canon<T> = BTreeSet<Arc<T>>;
 type Committed<I, T> = BTreeMap<I, Option<Version<T>>>;
 
 struct State<I, T> {
@@ -244,12 +246,7 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
         while let Some(version_id) = state.committed.keys().next().copied() {
             if version_id <= txn_id {
                 if let Some(version) = state.committed.remove(&version_id).expect("version") {
-                    for (key, key_state) in version {
-                        match key_state {
-                            KeyState::Present => state.canon.insert(key),
-                            KeyState::Absent => state.canon.remove(&key),
-                        };
-                    }
+                    merge_owned::<I, T>(&mut state.canon, version);
                 }
             } else {
                 break;
@@ -292,10 +289,43 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
             return result;
         }
 
-        println!("not committed: {}", txn_id);
-
         let _permit = self.semaphore.try_read(txn_id, Range::One(key.clone()))?;
         Ok(self.state().contains_pending(&txn_id, key))
+    }
+
+    /// Construct an iterator over the keys in this [`TxnSetLock`] at `txn_id`.
+    pub async fn iter(&self, txn_id: I) -> Result<Iter<T>> {
+        let (mut set, committed) = {
+            let state = self.state();
+
+            let mut canon = state.canon.clone();
+            for (_, version) in state.committed.iter().take_while(|(id, _)| *id <= &txn_id) {
+                if let Some(version) = version {
+                    merge(&mut canon, version);
+                }
+            }
+
+            (canon, state.committed.contains_key(&txn_id))
+        };
+
+        if committed {
+            return Ok(Iter {
+                permit: None,
+                iter: set.into_iter(),
+            });
+        }
+
+        let permit = self.semaphore.read(txn_id, Range::All).await?;
+
+        let state = self.state();
+        if let Some(version) = state.pending.get(&txn_id) {
+            merge(&mut set, version);
+        }
+
+        return Ok(Iter {
+            permit: Some(permit),
+            iter: set.into_iter(),
+        });
     }
 
     /// Insert a new `key` into this [`TxnSetLock`] at `txn_id`.
@@ -353,5 +383,40 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
 
         self.semaphore.finalize(txn_id, false);
         state.pending.remove(txn_id);
+    }
+}
+
+/// An iterator over the values of a [`TxnSetLock`] as of a specific transactional version
+pub struct Iter<T> {
+    #[allow(unused)]
+    permit: Option<Permit<Range<T>>>,
+    iter: <BTreeSet<Arc<T>> as IntoIterator>::IntoIter,
+}
+
+impl<T> Iterator for Iter<T> {
+    type Item = Arc<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next()
+    }
+}
+
+#[inline]
+fn merge_owned<I: Ord, T: Ord>(canon: &mut Canon<T>, version: Version<T>) {
+    for (key, key_state) in version {
+        match key_state {
+            KeyState::Present => canon.insert(key),
+            KeyState::Absent => canon.remove(&key),
+        };
+    }
+}
+
+#[inline]
+fn merge<T: Ord>(canon: &mut Canon<T>, version: &Version<T>) {
+    for (key, key_state) in version {
+        match key_state {
+            KeyState::Present => canon.insert(key.clone()),
+            KeyState::Absent => canon.remove(key),
+        };
     }
 }
