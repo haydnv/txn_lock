@@ -20,6 +20,11 @@
 //!
 //! let value = block_on(map.get(2, one.clone())).expect("read");
 //! assert_eq!(*(value.expect("guard")), 1.0);
+//!
+//! map.finalize(2);
+//!
+//! let value = block_on(map.get(3, one.clone())).expect("read");
+//! assert_eq!(*(value.expect("guard")), 1.0);
 //! ```
 
 use std::cmp::Ordering;
@@ -237,6 +242,26 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
         }
     }
 
+    /// Finalize the state of this [`TxnMapLock`] at the given `txn_id`.
+    /// This will merge in deltas and prevent further reads of versions earlier than `txn_id`.
+    pub fn finalize(&self, txn_id: I) {
+        let mut state = self.state.lock().expect("lock state");
+
+        while let Some(version_id) = state.committed.keys().next().copied() {
+            if version_id <= txn_id {
+                let version = state.committed.remove(&version_id).expect("version");
+                for (key, value) in version {
+                    state.canon.insert(key, value);
+                }
+            } else {
+                break;
+            }
+        }
+
+        self.semaphore.finalize(&txn_id, true);
+        state.finalized = Some(txn_id);
+    }
+
     /// Read a value from this [`TxnMapLock`] at the given `txn_id`.
     pub async fn get(&self, txn_id: I, key: Arc<K>) -> Result<Option<ValueReadGuard<K, V>>> {
         {
@@ -247,7 +272,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
             } else if state.committed.contains_key(&txn_id) {
                 assert!(!state.pending.contains_key(&txn_id));
                 let canon = state.get_canon(&txn_id, &key);
-                return Ok(canon.map(ValueReadGuard::Committed))
+                return Ok(canon.map(ValueReadGuard::Committed));
             }
         }
 
@@ -257,13 +282,14 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
 
         if let Some(version) = state.pending.get(&txn_id) {
             if let Some(value) = version.get(&key) {
-                let guard = value.clone().read_owned().await;
+                // it's safe to call try_read after acquiring the semaphore permit
+                let guard = value.clone().try_read_owned().expect("read guard");
                 return Ok(Some(ValueReadGuard::Pending(permit, guard)));
             }
         }
 
         let canon = state.get_canon(&txn_id, &key);
-        return Ok(canon.map(ValueReadGuard::Committed))
+        return Ok(canon.map(ValueReadGuard::Committed));
     }
 
     /// Insert a new entry into this [`TxnMapLock`] at the given `txn_id`.
