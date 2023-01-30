@@ -57,6 +57,7 @@ impl KeyState {
 }
 
 type Version<T> = BTreeMap<Arc<T>, KeyState>;
+type Committed<I, T> = BTreeMap<I, Option<Version<T>>>;
 
 struct State<I, T> {
     canon: BTreeSet<Arc<T>>,
@@ -65,7 +66,7 @@ struct State<I, T> {
     finalized: Option<I>,
 }
 
-impl<I: Ord, T: Ord> State<I, T> {
+impl<I: Copy + Ord, T: Ord> State<I, T> {
     fn new(txn_id: I, version: BTreeSet<Arc<T>>) -> Self {
         let version = version
             .into_iter()
@@ -93,22 +94,7 @@ impl<I: Ord, T: Ord> State<I, T> {
 
     #[inline]
     fn contains_canon(&self, txn_id: &I, key: &T) -> bool {
-        let committed = self
-            .committed
-            .iter()
-            .rev()
-            .skip_while(|(id, _)| *id > txn_id)
-            .map(|(_, version)| version);
-
-        for version in committed {
-            if let Some(version) = version {
-                if let Some(key_state) = version.get(key) {
-                    return key_state.is_present();
-                }
-            }
-        }
-
-        self.canon.contains(key)
+        contains_canon(&self.canon, &self.committed, txn_id, key)
     }
 
     #[inline]
@@ -149,19 +135,49 @@ impl<I: Ord, T: Ord> State<I, T> {
 
     #[inline]
     fn remove(&mut self, txn_id: I, key: Arc<T>) -> bool {
-        let present = self.contains_canon(&txn_id, &key);
+        match self.pending.entry(txn_id) {
+            Entry::Occupied(mut pending) => match pending.get_mut().entry(key) {
+                Entry::Occupied(mut entry) => entry.insert(KeyState::Absent).is_present(),
+                Entry::Vacant(entry) => {
+                    let present =
+                        contains_canon(&self.canon, &self.committed, &txn_id, entry.key());
 
-        if let Some(version) = self.pending.get_mut(&txn_id) {
-            if let Some(prior_state) = version.insert(key, KeyState::Absent) {
-                return prior_state.is_present();
+                    entry.insert(KeyState::Absent);
+                    present
+                }
+            },
+            Entry::Vacant(pending) => {
+                let present = contains_canon(&self.canon, &self.committed, pending.key(), &key);
+                let version = iter::once((key, KeyState::Absent)).collect();
+                pending.insert(version);
+                present
             }
-        } else {
-            let version = iter::once((key, KeyState::Absent)).collect();
-            self.pending.insert(txn_id, version);
         }
-
-        present
     }
+}
+
+#[inline]
+fn contains_canon<I: Ord, T: Ord>(
+    canon: &BTreeSet<Arc<T>>,
+    committed: &Committed<I, T>,
+    txn_id: &I,
+    key: &T,
+) -> bool {
+    let committed = committed
+        .iter()
+        .rev()
+        .skip_while(|(id, _)| *id > txn_id)
+        .map(|(_, version)| version);
+
+    for version in committed {
+        if let Some(version) = version {
+            if let Some(key_state) = version.get(key) {
+                return key_state.is_present();
+            }
+        }
+    }
+
+    canon.contains(key)
 }
 
 /// A futures-aware read-write lock on a [`BTreeSet`] which supports transactional versioning.
@@ -294,11 +310,13 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
 
     /// Insert a new `key` into this [`TxnSetLock`] at `txn_id` synchronously, if possible.
     pub fn try_insert(&self, txn_id: I, key: Arc<T>) -> Result<()> {
+        let mut state = self.state();
+
         // before acquiring a permit, check if this version has already been committed
-        self.state().check_pending(&txn_id)?;
+        state.check_pending(&txn_id)?;
 
         let _permit = self.semaphore.try_write(txn_id, Range::One(key.clone()))?;
-        Ok(self.state().insert(txn_id, key))
+        Ok(state.insert(txn_id, key))
     }
 
     /// Remove a `key` into this [`TxnSetLock`] at `txn_id` and return `true` if it was present.
@@ -313,12 +331,14 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
 
     /// Remove a `key` into this [`TxnSetLock`] at `txn_id` and return `true` if it was present.
     pub fn try_remove(&self, txn_id: I, key: Arc<T>) -> Result<bool> {
+        let mut state = self.state();
+
         // before acquiring a permit, check if this version has already been committed
-        self.state().check_pending(&txn_id)?;
+        state.check_pending(&txn_id)?;
 
         let range = Range::One(key.clone());
         let _permit = self.semaphore.try_write(txn_id, range)?;
-        Ok(self.state().remove(txn_id, key))
+        Ok(state.remove(txn_id, key))
     }
 
     /// Roll back the state of this [`TxnSetLock`] at `txn_id`.

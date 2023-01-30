@@ -65,16 +65,18 @@ pub use super::range::Range;
 /// A read guard on a value in a [`TxnMapLock`]
 pub type TxnMapValueReadGuard<K, V> = TxnReadGuard<Range<K>, V>;
 
+type Canon<K, V> = BTreeMap<Arc<K>, Arc<V>>;
+type Committed<I, K, V> = BTreeMap<I, Option<BTreeMap<Arc<K>, Option<Arc<V>>>>>;
 type Version<K, V> = BTreeMap<Arc<K>, Option<Arc<RwLock<V>>>>;
 
 struct State<I, K, V> {
-    canon: BTreeMap<Arc<K>, Arc<V>>,
-    committed: BTreeMap<I, Option<BTreeMap<Arc<K>, Option<Arc<V>>>>>,
+    canon: Canon<K, V>,
+    committed: Committed<I, K, V>,
     pending: BTreeMap<I, Version<K, V>>,
     finalized: Option<I>,
 }
 
-impl<I: Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
+impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
     #[inline]
     fn new(txn_id: I, version: Version<K, V>) -> Self {
         Self {
@@ -98,22 +100,7 @@ impl<I: Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
 
     #[inline]
     fn get_canon(&self, txn_id: &I, key: &K) -> Option<Arc<V>> {
-        let committed = self
-            .committed
-            .iter()
-            .rev()
-            .skip_while(|(id, _)| *id > txn_id)
-            .map(|(_, version)| version);
-
-        for version in committed {
-            if let Some(version) = version {
-                if let Some(delta) = version.get(key) {
-                    return delta.clone();
-                }
-            }
-        }
-
-        self.canon.get(key).cloned()
+        get_canon(&self.canon, &self.committed, txn_id, key)
     }
 
     #[inline]
@@ -187,25 +174,54 @@ impl<I: Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
 
     #[inline]
     fn remove(&mut self, txn_id: I, key: Arc<K>) -> Option<Arc<V>> {
-        let canon = self.get_canon(&txn_id, &key);
-
-        if let Some(version) = self.pending.get_mut(&txn_id) {
-            if let Some(prior_value) = version.insert(key, None) {
-                return match prior_value {
-                    Some(lock) => {
+        match self.pending.entry(txn_id) {
+            Entry::Occupied(mut pending) => match pending.get_mut().entry(key) {
+                Entry::Occupied(mut entry) => {
+                    if let Some(lock) = entry.insert(None) {
                         let lock = Arc::try_unwrap(lock).expect("removed value");
                         Some(Arc::new(lock.into_inner()))
+                    } else {
+                        None
                     }
-                    None => None,
-                };
+                }
+                Entry::Vacant(entry) => {
+                    let prior = get_canon(&self.canon, &self.committed, &txn_id, entry.key());
+                    entry.insert(None);
+                    prior
+                }
+            },
+            Entry::Vacant(pending) => {
+                let prior_value = get_canon(&self.canon, &self.committed, &txn_id, &key);
+                let version = iter::once((key, None)).collect();
+                pending.insert(version);
+                prior_value
             }
-        } else {
-            let version = iter::once((key, None)).collect();
-            self.pending.insert(txn_id, version);
         }
-
-        canon
     }
+}
+
+#[inline]
+fn get_canon<I: Ord, K: Ord, V>(
+    canon: &Canon<K, V>,
+    committed: &Committed<I, K, V>,
+    txn_id: &I,
+    key: &K,
+) -> Option<Arc<V>> {
+    let committed = committed
+        .iter()
+        .rev()
+        .skip_while(|(id, _)| *id > txn_id)
+        .map(|(_, version)| version);
+
+    for version in committed {
+        if let Some(version) = version {
+            if let Some(delta) = version.get(key) {
+                return delta.clone();
+            }
+        }
+    }
+
+    canon.get(key).cloned()
 }
 
 /// A futures-aware read-write lock on a [`BTreeMap`] which supports transactional versioning
@@ -358,12 +374,13 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
 
     /// Insert a new entry into this [`TxnMapLock`] at `txn_id` synchronously, if possible.
     pub fn try_insert(&self, txn_id: I, key: Arc<K>, value: V) -> Result<()> {
+        let mut state = self.state();
+
         // before acquiring a permit, check if this version has already been committed
-        self.state().check_pending(&txn_id)?;
+        state.check_pending(&txn_id)?;
 
         let _permit = self.semaphore.try_write(txn_id, Range::One(key.clone()))?;
 
-        let mut state = self.state();
         Ok(state.insert(txn_id, key, value))
     }
 
@@ -381,13 +398,14 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
 
     /// Remove and return the value at `key` from this [`TxnMapLock`] at `txn_id`, if present.
     pub fn try_remove(&self, txn_id: I, key: Arc<K>) -> Result<Option<Arc<V>>> {
+        let mut state = self.state();
+
         // before acquiring a permit, check if this version has already been committed
-        self.state().check_pending(&txn_id)?;
+        state.check_pending(&txn_id)?;
 
         let range = Range::One(key.clone());
         let _permit = self.semaphore.try_write(txn_id, range)?;
 
-        let mut state = self.state();
         Ok(state.remove(txn_id, key))
     }
 
