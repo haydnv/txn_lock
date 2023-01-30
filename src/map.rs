@@ -15,6 +15,11 @@
 //!
 //! let value = block_on(map.get(1, one.clone())).expect("read");
 //! assert_eq!(*(value.expect("guard")), 1.0);
+//!
+//! map.commit(1);
+//!
+//! let value = block_on(map.get(2, one.clone())).expect("read");
+//! assert_eq!(*(value.expect("guard")), 1.0);
 //! ```
 
 use std::cmp::Ordering;
@@ -133,6 +138,25 @@ impl<I: Copy, K, V> State<I, K, V> {
     }
 }
 
+impl<I: Ord, K: Ord, V> State<I, K, V> {
+    fn get_canon(&self, txn_id: &I, key: &K) -> Option<Arc<V>> {
+        let committed = self
+            .committed
+            .iter()
+            .rev()
+            .skip_while(|(id, _)| *id > txn_id)
+            .map(|(_, version)| version);
+
+        for version in committed {
+            if let Some(value) = version.get(key) {
+                return Some(value.clone());
+            }
+        }
+
+        self.canon.get(key).cloned()
+    }
+}
+
 /// A futures-aware read-write lock on a [`BTreeMap`] which supports transactional versioning
 pub struct TxnMapLock<I, K, V> {
     state: Arc<Mutex<State<I, K, V>>>,
@@ -148,13 +172,7 @@ impl<I, K, V> Clone for TxnMapLock<I, K, V> {
     }
 }
 
-enum ReadCommitted<V> {
-    Committed(Option<Arc<V>>),
-    Finalized,
-    Pending,
-}
-
-impl<I: Ord + Copy, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
+impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLock<I, K, V> {
     /// Construct a new [`TxnMapLock`].
     pub fn new() -> Self {
         Self {
@@ -188,46 +206,54 @@ impl<I: Ord + Copy, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
         }
     }
 
-    fn get_committed(&self, txn_id: I, key: &K) -> ReadCommitted<V> {
-        let state = self.state.lock().expect("lock state");
-        if state.finalized > Some(txn_id) {
-            return ReadCommitted::Finalized;
-        } else if !state.committed.contains_key(&txn_id) {
-            return ReadCommitted::Pending;
-        }
+    /// Commit the state of this [`TxnMapLock`] at the given `txn_id`.
+    pub fn commit(&self, txn_id: I) {
+        let mut state = self.state.lock().expect("lock state");
 
-        let committed = state
-            .committed
-            .iter()
-            .rev()
-            .skip_while(|(id, _)| *id > &txn_id)
-            .map(|(_, version)| version);
+        self.semaphore.finalize(&txn_id, false);
 
-        for version in committed {
-            if let Some(value) = version.get(key) {
-                return ReadCommitted::Committed(Some(value.clone()));
+        let version = if let Some(pending) = state.pending.remove(&txn_id) {
+            pending
+                .into_iter()
+                .map(|(key, value)| {
+                    let value = Arc::try_unwrap(value).expect("value");
+                    let value = value.into_inner();
+                    (key, Arc::new(value))
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+
+        match state.committed.entry(txn_id) {
+            Entry::Occupied(_) => {
+                assert!(version.is_empty());
+                #[cfg(feature = "logging")]
+                log::warn!("duplicate commit at {}", txn_id);
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(version);
             }
         }
-
-        ReadCommitted::Committed(state.canon.get(key).cloned())
     }
 
     /// Read a value from this [`TxnMapLock`] at the given `txn_id`.
     pub async fn get(&self, txn_id: I, key: Arc<K>) -> Result<Option<ValueReadGuard<K, V>>> {
-        match self.get_committed(txn_id, &key) {
-            ReadCommitted::Committed(value) => return Ok(value.map(ValueReadGuard::Committed)),
-            ReadCommitted::Finalized => return Err(Error::Outdated),
-            ReadCommitted::Pending => {}
+        {
+            // before acquiring a permit, check if this version has already been committed
+            let state = self.state.lock().expect("lock state");
+            if state.finalized.as_ref() > Some(&txn_id) {
+                return Err(Error::Outdated);
+            } else if state.committed.contains_key(&txn_id) {
+                assert!(!state.pending.contains_key(&txn_id));
+                let canon = state.get_canon(&txn_id, &key);
+                return Ok(canon.map(ValueReadGuard::Committed))
+            }
         }
 
         let permit = self.semaphore.read(txn_id, Range::One(key.clone())).await?;
 
         let state = self.state.lock().expect("lock state");
-        if state.finalized >= Some(txn_id) {
-            // in this case a new permit has been created at a finalized txn_id
-            // it will have to wait until the next call to finalize to be cleaned up
-            return Err(Error::Outdated);
-        }
 
         if let Some(version) = state.pending.get(&txn_id) {
             if let Some(value) = version.get(&key) {
@@ -236,7 +262,8 @@ impl<I: Ord + Copy, K: Ord + fmt::Debug, V> TxnMapLock<I, K, V> {
             }
         }
 
-        Ok(None)
+        let canon = state.get_canon(&txn_id, &key);
+        return Ok(canon.map(ValueReadGuard::Committed))
     }
 
     /// Insert a new entry into this [`TxnMapLock`] at the given `txn_id`.
