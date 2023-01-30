@@ -350,7 +350,7 @@ impl<R> Version<R> {
     }
 }
 
-impl<R: Overlaps<R> + fmt::Debug> Version<R> {
+impl<R: Overlaps<R>> Version<R> {
     /// Create a new `range` semaphore and return its root [`RangeLock`]
     pub fn insert(&mut self, range: Arc<R>, write: bool) -> RangeLock<R> {
         let insert_at = bisect_left(&self.roots, &range);
@@ -416,7 +416,7 @@ impl<R: Overlaps<R> + fmt::Debug> Version<R> {
 
 fn bisect_left<'a, R>(roots: &'a [RangeLock<R>], range: &'a R) -> usize
 where
-    R: Overlaps<R> + fmt::Debug + 'a,
+    R: Overlaps<R> + 'a,
 {
     let mut start = 0;
     let mut end = roots.len();
@@ -437,7 +437,7 @@ where
 
 fn bisect_right<'a, R>(roots: &'a [RangeLock<R>], range: &'a R) -> usize
 where
-    R: Overlaps<R> + fmt::Debug + 'a,
+    R: Overlaps<R> + 'a,
 {
     let mut start = 0;
     let mut end = roots.len();
