@@ -153,12 +153,6 @@ struct State<I, K, V> {
     finalized: Option<I>,
 }
 
-impl<I: Copy, K, V> State<I, K, V> {
-    fn last_commit(&self) -> Option<I> {
-        self.committed.keys().last().copied()
-    }
-}
-
 impl<I: Ord, K: Ord, V> State<I, K, V> {
     #[inline]
     fn check_pending(&self, txn_id: &I) -> Result<()> {
@@ -171,6 +165,7 @@ impl<I: Ord, K: Ord, V> State<I, K, V> {
         }
     }
 
+    #[inline]
     fn get_canon(&self, txn_id: &I, key: &K) -> Option<Arc<V>> {
         let committed = self
             .committed
@@ -190,6 +185,7 @@ impl<I: Ord, K: Ord, V> State<I, K, V> {
         self.canon.get(key).cloned()
     }
 
+    #[inline]
     fn get_committed(&self, txn_id: &I, key: &K) -> Poll<Result<Option<ValueReadGuard<K, V>>>> {
         if self.finalized.as_ref() > Some(&txn_id) {
             Poll::Ready(Err(Error::Outdated))
@@ -202,6 +198,7 @@ impl<I: Ord, K: Ord, V> State<I, K, V> {
         }
     }
 
+    #[inline]
     fn get_pending(
         &self,
         txn_id: &I,
@@ -220,7 +217,9 @@ impl<I: Ord, K: Ord, V> State<I, K, V> {
         Ok(canon.map(ValueReadGuard::Committed))
     }
 
+    #[inline]
     fn insert(&mut self, txn_id: I, key: Arc<K>, value: V) {
+        #[inline]
         fn version_entry<K: Ord, V>(
             version: &mut Version<K, V>,
             key: Arc<K>,
@@ -249,6 +248,7 @@ impl<I: Ord, K: Ord, V> State<I, K, V> {
 }
 
 /// A futures-aware read-write lock on a [`BTreeMap`] which supports transactional versioning
+// TODO: handle the case where a write permit is acquired and then dropped without committing
 pub struct TxnMapLock<I, K, V> {
     state: Arc<Mutex<State<I, K, V>>>,
     semaphore: Semaphore<I, Range<K>>,
@@ -388,8 +388,6 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
         self.state().check_pending(&txn_id)?;
 
         let range = Range::One(key.clone());
-        debug_assert_eq!(range.overlaps(&range), Overlap::Equal);
-
         let _permit = self.semaphore.write(txn_id, range).await?;
 
         let mut state = self.state();

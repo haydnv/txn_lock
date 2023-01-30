@@ -85,6 +85,7 @@ impl<R> RangeLock<R> {
         }
     }
 
+    #[inline]
     fn reserve(&self, write: bool) {
         let mut flag = self.write.lock().expect("write flag");
         *flag = *flag || write;
@@ -94,6 +95,7 @@ impl<R> RangeLock<R> {
         Box::pin(async move {
             let permit = self.semaphore.clone().acquire_owned().await?;
 
+            #[inline]
             fn child_lock<R>(
                 node: Option<&Box<RangeLock<R>>>,
             ) -> Pin<Box<dyn Future<Output = Result<Option<Box<NodePermit>>>> + '_>> {
@@ -120,6 +122,7 @@ impl<R> RangeLock<R> {
     fn try_acquire(&self) -> Result<NodePermit> {
         let permit = self.semaphore.clone().try_acquire_owned()?;
 
+        #[inline]
         fn child_lock<R>(node: Option<&Box<RangeLock<R>>>) -> Result<Option<Box<NodePermit>>> {
             if let Some(node) = node {
                 node.try_acquire().map(Box::new).map(Some)
@@ -142,6 +145,7 @@ impl<R> RangeLock<R> {
         Box::pin(async move {
             let permit = self.semaphore.clone().acquire_many_owned(permits).await?;
 
+            #[inline]
             fn child_lock<R>(
                 node: Option<&Box<RangeLock<R>>>,
                 permits: u32,
@@ -169,6 +173,7 @@ impl<R> RangeLock<R> {
     fn try_acquire_many(&self, permits: u32) -> Result<NodePermit> {
         let permit = self.semaphore.clone().try_acquire_many_owned(permits)?;
 
+        #[inline]
         fn child_lock<R>(
             node: Option<&Box<RangeLock<R>>>,
             permits: u32,
@@ -214,6 +219,7 @@ impl<R: Overlaps<R>> RangeLock<R> {
         }
     }
 
+    #[inline]
     fn is_pending_write(&self) -> bool {
         if *self.write.lock().expect("write bit") {
             return true;
@@ -414,6 +420,7 @@ impl<R: Overlaps<R>> Version<R> {
     }
 }
 
+#[inline]
 fn bisect_left<'a, R>(roots: &'a [RangeLock<R>], range: &'a R) -> usize
 where
     R: Overlaps<R> + 'a,
@@ -435,6 +442,7 @@ where
     start
 }
 
+#[inline]
 fn bisect_right<'a, R>(roots: &'a [RangeLock<R>], range: &'a R) -> usize
 where
     R: Overlaps<R> + 'a,

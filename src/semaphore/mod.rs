@@ -97,6 +97,7 @@ pub enum Overlap {
 /// A range supported by a transactional [`Semaphore`]
 pub trait Overlaps<T> {
     /// Check whether `other` lies entirely within `self`.
+    #[inline]
     fn contains(&self, other: &T) -> bool {
         match self.overlaps(other) {
             Overlap::Wide | Overlap::Equal => true,
@@ -105,6 +106,7 @@ pub trait Overlaps<T> {
     }
 
     /// Check whether `other` lies at least partially within `self`.
+    #[inline]
     fn contains_partial(&self, other: &T) -> bool {
         match self.overlaps(other) {
             Overlap::Narrow | Overlap::Equal => true,
