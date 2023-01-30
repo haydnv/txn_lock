@@ -142,15 +142,15 @@ impl<I: Ord, K: Ord, V> State<I, K, V> {
         txn_id: &I,
         key: &K,
         permit: Permit<Range<K>>,
-    ) -> Result<Option<ValueReadGuard<K, V>>> {
+    ) -> Option<ValueReadGuard<K, V>> {
         if let Some(version) = self.pending.get(&txn_id) {
             if let Some(value) = version.get(key) {
-                return Ok(Some(ValueReadGuard::Pending(permit, value.clone())));
+                return Some(ValueReadGuard::Pending(permit, value.clone()));
             }
         }
 
         let canon = self.get_canon(&txn_id, key);
-        Ok(canon.map(ValueReadGuard::Committed))
+        canon.map(ValueReadGuard::Committed)
     }
 
     #[inline]
@@ -273,8 +273,8 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
         }
 
         let permit = self.semaphore.read(txn_id, Range::One(key.clone())).await?;
-        let state = self.state.lock().expect("lock state");
-        state.get_pending(&txn_id, key, permit)
+        let state = self.state();
+        Ok(state.get_pending(&txn_id, key, permit))
     }
 
     /// Read a value from this [`TxnMapLock`] at `txn_id` synchronously, if possible.
@@ -285,8 +285,8 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
         }
 
         let permit = self.semaphore.try_read(txn_id, Range::One(key.clone()))?;
-        let state = self.state.lock().expect("lock state");
-        state.get_pending(&txn_id, key, permit)
+        let state = self.state();
+        Ok(state.get_pending(&txn_id, key, permit))
     }
 
     /// Insert a new entry into this [`TxnMapLock`] at `txn_id`.

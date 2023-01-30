@@ -11,6 +11,7 @@
 //! let set = TxnSetLock::<u64, String>::new(0);
 //!
 //! let one = Arc::new("one".to_string());
+//! assert!(!block_on(set.contains(1, &one)).expect("contains"));
 //! // block_on(set.insert(1, one.clone())).expect("insert");
 //! // assert!(block_on(set.contains_key(&one)).expect("contains"));
 //! // assert_eq!(set.try_insert(2, one.clone()).unwrap_err(), Error::WouldBlock);
@@ -21,10 +22,12 @@
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::Poll;
 use std::{fmt, iter};
 
-use super::semaphore::Semaphore;
+use super::semaphore::{Permit, Semaphore};
+use super::{Error, Result};
 
 pub use super::range::Range;
 
@@ -44,12 +47,67 @@ impl<I: Ord, T: Ord> State<I, T> {
             finalized: None,
         }
     }
+
+    #[inline]
+    fn contains_canon(&self, txn_id: &I, key: &T) -> bool {
+        let committed = self
+            .committed
+            .iter()
+            .rev()
+            .skip_while(|(id, _)| *id > txn_id)
+            .map(|(_, version)| version);
+
+        for version in committed {
+            if let Some(version) = version {
+                return version.contains(key);
+            }
+        }
+
+        self.canon.contains(key)
+    }
+
+    #[inline]
+    fn contains_committed(&self, txn_id: &I, key: &T) -> Poll<Result<bool>> {
+        if self.finalized.as_ref() > Some(&txn_id) {
+            Poll::Ready(Err(Error::Outdated))
+        } else if self.committed.contains_key(&txn_id) {
+            assert!(!self.pending.contains_key(&txn_id));
+            Poll::Ready(Ok(self.contains_canon(&txn_id, &key)))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    #[inline]
+    fn contains_pending(&self, txn_id: &I, key: &T, _permit: Permit<Range<T>>) -> bool {
+        if let Some(version) = self.pending.get(&txn_id) {
+            return version.contains(key);
+        }
+
+        self.contains_canon(txn_id, key)
+    }
 }
 
 /// A futures-aware read-write lock on a [`BTreeSet`] which supports transactional versioning.
 pub struct TxnSetLock<I, T> {
     state: Arc<Mutex<State<I, T>>>,
     semaphore: Semaphore<I, Range<T>>,
+}
+
+impl<I, T> Clone for TxnSetLock<I, T> {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            semaphore: self.semaphore.clone(),
+        }
+    }
+}
+
+impl<I, T> TxnSetLock<I, T> {
+    #[inline]
+    fn state(&self) -> MutexGuard<State<I, T>> {
+        self.state.lock().expect("lock state")
+    }
 }
 
 impl<I: Copy + Ord, T: Ord + fmt::Debug> TxnSetLock<I, T> {
@@ -69,5 +127,17 @@ impl<I: Copy + Ord, T: Ord + fmt::Debug> TxnSetLock<I, T> {
             state: Arc::new(Mutex::new(State::new(txn_id, version))),
             semaphore: Semaphore::with_reservation(txn_id, Range::All),
         }
+    }
+
+    /// Check whether the given `key` is present in this [`TxnSetLock`] at `txn_id`.
+    pub async fn contains(&self, txn_id: I, key: &Arc<T>) -> Result<bool> {
+        // before acquiring a permit, check if this version has already been committed
+        if let Poll::Ready(result) = self.state().contains_committed(&txn_id, key) {
+            return result;
+        }
+
+        let permit = self.semaphore.read(txn_id, Range::One(key.clone())).await?;
+        let state = self.state();
+        Ok(state.contains_pending(&txn_id, key, permit))
     }
 }
