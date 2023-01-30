@@ -13,8 +13,8 @@
 //! let one = Arc::new("one".to_string());
 //! assert!(!block_on(set.contains(1, &one)).expect("contains"));
 //! block_on(set.insert(1, one.clone())).expect("insert");
-//! assert!(block_on(set.contains(1, &one)).expect("contains"));
-//! // assert_eq!(set.try_insert(2, one.clone()).unwrap_err(), Error::WouldBlock);
+//! assert!(set.try_contains(1, &one).expect("contains"));
+//! assert_eq!(set.try_insert(2, one.clone()).unwrap_err(), Error::WouldBlock);
 //! // set.commit(1);
 //! // assert!(set.try_contains_key(2, &one).expect("contains"));
 //! // set.finalize(2);
@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
 use std::{fmt, iter};
 
-use super::semaphore::{Permit, Semaphore};
+use super::semaphore::Semaphore;
 use super::{Error, Result};
 
 pub use super::range::Range;
@@ -91,7 +91,7 @@ impl<I: Ord, T: Ord> State<I, T> {
     }
 
     #[inline]
-    fn contains_pending(&self, txn_id: &I, key: &T, _permit: Permit<Range<T>>) -> bool {
+    fn contains_pending(&self, txn_id: &I, key: &T) -> bool {
         if let Some(version) = self.pending.get(&txn_id) {
             return version.contains(key);
         }
@@ -160,9 +160,19 @@ impl<I: Copy + Ord, T: Ord + fmt::Debug> TxnSetLock<I, T> {
             return result;
         }
 
-        let permit = self.semaphore.read(txn_id, Range::One(key.clone())).await?;
-        let state = self.state();
-        Ok(state.contains_pending(&txn_id, key, permit))
+        let _permit = self.semaphore.read(txn_id, Range::One(key.clone())).await?;
+        Ok(self.state().contains_pending(&txn_id, key))
+    }
+
+    /// Synchronously check whether the given `key` is present in this [`TxnSetLock`], if possible.
+    pub fn try_contains(&self, txn_id: I, key: &Arc<T>) -> Result<bool> {
+        // before acquiring a permit, check if this version has already been committed
+        if let Poll::Ready(result) = self.state().contains_committed(&txn_id, key) {
+            return result;
+        }
+
+        let _permit = self.semaphore.try_read(txn_id, Range::One(key.clone()))?;
+        Ok(self.state().contains_pending(&txn_id, key))
     }
 
     /// Insert a new entry into this [`TxnMapLock`] at `txn_id`.
@@ -172,8 +182,15 @@ impl<I: Copy + Ord, T: Ord + fmt::Debug> TxnSetLock<I, T> {
 
         let range = Range::One(key.clone());
         let _permit = self.semaphore.write(txn_id, range).await?;
+        Ok(self.state().insert(txn_id, key))
+    }
 
-        let mut state = self.state();
-        Ok(state.insert(txn_id, key))
+    /// Insert a new entry into this [`TxnMapLock`] at `txn_id` synchronously, if possible.
+    pub fn try_insert(&self, txn_id: I, key: Arc<T>) -> Result<()> {
+        // before acquiring a permit, check if this version has already been committed
+        self.state().check_pending(&txn_id)?;
+
+        let _permit = self.semaphore.try_write(txn_id, Range::One(key.clone()))?;
+        Ok(self.state().insert(txn_id, key))
     }
 }
