@@ -47,7 +47,7 @@ impl<R: fmt::Debug> fmt::Debug for Permit<R> {
 }
 
 /// A node in a 3-ary tree of overlapping ranges
-pub struct Node<R> {
+pub struct RangeLock<R> {
     range: Arc<R>,
     semaphore: Arc<Semaphore>,
     write: Arc<Mutex<bool>>,
@@ -57,7 +57,7 @@ pub struct Node<R> {
     right: Option<Box<Self>>,
 }
 
-impl<R> Clone for Node<R> {
+impl<R> Clone for RangeLock<R> {
     fn clone(&self) -> Self {
         Self {
             range: self.range.clone(),
@@ -71,7 +71,7 @@ impl<R> Clone for Node<R> {
     }
 }
 
-impl<R> Node<R> {
+impl<R> RangeLock<R> {
     fn new(range: Arc<R>, write: bool) -> Self {
         let semaphore = Arc::new(Semaphore::new(PERMITS as usize));
 
@@ -85,12 +85,17 @@ impl<R> Node<R> {
         }
     }
 
+    fn reserve(&self, write: bool) {
+        let mut flag = self.write.lock().expect("write flag");
+        *flag = *flag || write;
+    }
+
     fn acquire(&self) -> Pin<Box<dyn Future<Output = Result<NodePermit>> + '_>> {
         Box::pin(async move {
             let permit = self.semaphore.clone().acquire_owned().await?;
 
             fn child_lock<R>(
-                node: Option<&Box<Node<R>>>,
+                node: Option<&Box<RangeLock<R>>>,
             ) -> Pin<Box<dyn Future<Output = Result<Option<Box<NodePermit>>>> + '_>> {
                 if let Some(node) = node {
                     Box::pin(node.acquire().map_ok(Box::new).map_ok(Some))
@@ -115,7 +120,7 @@ impl<R> Node<R> {
     fn try_acquire(&self) -> Result<NodePermit> {
         let permit = self.semaphore.clone().try_acquire_owned()?;
 
-        fn child_lock<R>(node: Option<&Box<Node<R>>>) -> Result<Option<Box<NodePermit>>> {
+        fn child_lock<R>(node: Option<&Box<RangeLock<R>>>) -> Result<Option<Box<NodePermit>>> {
             if let Some(node) = node {
                 node.try_acquire().map(Box::new).map(Some)
             } else {
@@ -138,7 +143,7 @@ impl<R> Node<R> {
             let permit = self.semaphore.clone().acquire_many_owned(permits).await?;
 
             fn child_lock<R>(
-                node: Option<&Box<Node<R>>>,
+                node: Option<&Box<RangeLock<R>>>,
                 permits: u32,
             ) -> Pin<Box<dyn Future<Output = Result<Option<Box<NodePermit>>>> + '_>> {
                 if let Some(node) = node {
@@ -165,7 +170,7 @@ impl<R> Node<R> {
         let permit = self.semaphore.clone().try_acquire_many_owned(permits)?;
 
         fn child_lock<R>(
-            node: Option<&Box<Node<R>>>,
+            node: Option<&Box<RangeLock<R>>>,
             permits: u32,
         ) -> Result<Option<Box<NodePermit>>> {
             if let Some(node) = node {
@@ -186,13 +191,13 @@ impl<R> Node<R> {
     }
 }
 
-impl<R: Overlaps<R>> Node<R> {
+impl<R: Overlaps<R>> RangeLock<R> {
     fn insert(&mut self, node: Self) -> &Self {
         #[inline]
         fn insert_node<R: Overlaps<R>>(
-            extant: &mut Option<Box<Node<R>>>,
-            new_node: Node<R>,
-        ) -> &Node<R> {
+            extant: &mut Option<Box<RangeLock<R>>>,
+            new_node: RangeLock<R>,
+        ) -> &RangeLock<R> {
             if let Some(extant) = extant {
                 extant.insert(new_node)
             } else {
@@ -220,7 +225,7 @@ impl<R: Overlaps<R>> Node<R> {
             .any(|node| node.is_pending_write())
     }
 
-    /// Acquire a read lock on this [`Node`] and its children.
+    /// Acquire a read lock on this [`RangeLock`] and its children.
     pub fn read<'a>(
         &'a self,
         target: &'a R,
@@ -233,7 +238,7 @@ impl<R: Overlaps<R>> Node<R> {
                     .acquire()
                     .map_ok(|permit| Permit {
                         range: self.range.clone(),
-                        permit: permit,
+                        permit,
                     })
                     .await;
             }
@@ -244,19 +249,13 @@ impl<R: Overlaps<R>> Node<R> {
             match overlap {
                 Overlap::WideGreater => self.left.as_ref().expect("left").read(target).await,
                 Overlap::Wide => self.center.as_ref().expect("center").read(target).await,
-                Overlap::WideLess => {
-                    self.right
-                        .as_ref()
-                        .expect("branch right")
-                        .read(target)
-                        .await
-                }
+                Overlap::WideLess => self.right.as_ref().expect("right").read(target).await,
                 _ => unreachable!(),
             }
         })
     }
 
-    /// Acquire a read lock on this [`Node`] and its children synchronously, if possible.
+    /// Acquire a read lock on this [`RangeLock`] and its children synchronously, if possible.
     pub fn try_read(&self, target: &R) -> Result<Permit<R>> {
         let overlap = self.range.overlaps(target);
 
@@ -278,7 +277,7 @@ impl<R: Overlaps<R>> Node<R> {
         }
     }
 
-    /// Acquire a write lock on this [`Node`] and its children.
+    /// Acquire a write lock on this [`RangeLock`] and its children.
     pub fn write<'a>(
         &'a self,
         target: &'a R,
@@ -308,7 +307,7 @@ impl<R: Overlaps<R>> Node<R> {
         })
     }
 
-    /// Acquire a write lock on this [`Node`] and its children synchronously, if possible.
+    /// Acquire a write lock on this [`RangeLock`] and its children synchronously, if possible.
     pub fn try_write(&self, target: &R) -> Result<Permit<R>> {
         let overlap = self.range.overlaps(target);
 
@@ -331,7 +330,7 @@ impl<R: Overlaps<R>> Node<R> {
     }
 }
 
-impl<R: fmt::Debug> fmt::Debug for Node<R> {
+impl<R: fmt::Debug> fmt::Debug for RangeLock<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "node {:?}", self.range)
     }
@@ -339,7 +338,7 @@ impl<R: fmt::Debug> fmt::Debug for Node<R> {
 
 /// Semaphores for ranges within a single transactional version
 pub struct Version<R> {
-    roots: Vec<Node<R>>,
+    roots: Vec<RangeLock<R>>,
 }
 
 impl<R> Version<R> {
@@ -352,32 +351,32 @@ impl<R> Version<R> {
 }
 
 impl<R: Overlaps<R> + fmt::Debug> Version<R> {
-    /// Create a new `range` semaphore and return its root [`Node`]
-    pub fn insert(&mut self, range: Arc<R>, write: bool) -> Node<R> {
+    /// Create a new `range` semaphore and return its root [`RangeLock`]
+    pub fn insert(&mut self, range: Arc<R>, write: bool) -> RangeLock<R> {
         let insert_at = bisect_left(&self.roots, &range);
         let take_until = bisect_right(&self.roots, &range);
         assert!(take_until >= insert_at);
 
         if insert_at == take_until {
-            let root = Node::new(range, write);
+            let root = RangeLock::new(range, write);
             self.roots.insert(insert_at, root);
         } else if take_until - insert_at == 1 {
             match self.roots[insert_at].range.overlaps(&range) {
-                Overlap::Equal => {}
+                Overlap::Equal => self.roots[insert_at].reserve(write),
                 Overlap::WideLess | Overlap::Wide | Overlap::WideGreater => {
-                    let node = Node::new(range, write);
+                    let node = RangeLock::new(range, write);
                     self.roots[insert_at].insert(node);
                 }
                 Overlap::Narrow => {
                     let node = self.roots.remove(insert_at);
-                    let mut root = Node::new(range, write);
+                    let mut root = RangeLock::new(range, write);
                     root.insert(node);
                     self.roots.insert(insert_at, root);
                 }
                 _ => unreachable!(),
             }
         } else {
-            let mut root = Node::new(range, write);
+            let mut root = RangeLock::new(range, write);
 
             for _ in insert_at..take_until {
                 let node = self.roots.remove(insert_at);
@@ -415,7 +414,7 @@ impl<R: Overlaps<R> + fmt::Debug> Version<R> {
     }
 }
 
-fn bisect_left<'a, R>(roots: &'a [Node<R>], range: &'a R) -> usize
+fn bisect_left<'a, R>(roots: &'a [RangeLock<R>], range: &'a R) -> usize
 where
     R: Overlaps<R> + fmt::Debug + 'a,
 {
@@ -436,7 +435,7 @@ where
     start
 }
 
-fn bisect_right<'a, R>(roots: &'a [Node<R>], range: &'a R) -> usize
+fn bisect_right<'a, R>(roots: &'a [RangeLock<R>], range: &'a R) -> usize
 where
     R: Overlaps<R> + fmt::Debug + 'a,
 {

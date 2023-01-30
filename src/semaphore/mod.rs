@@ -66,7 +66,7 @@ use tokio::sync::Notify;
 
 use super::{Error, Result};
 
-use version::{Node, Permit as VersionPermit, Version};
+use version::{Permit as VersionPermit, RangeLock, Version};
 
 /// An [`Overlap`] is the result of a comparison between two ranges,
 /// the equivalent of [`Ordering`] for hierarchical data.
@@ -176,7 +176,7 @@ impl<R> Drop for Permit<R> {
 }
 
 enum VersionRead<I, R> {
-    Version(Arc<R>, Node<R>),
+    Version(Arc<R>, RangeLock<R>),
     Pending(Arc<R>, I),
 }
 
