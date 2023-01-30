@@ -30,49 +30,21 @@
 //! assert_eq!(*(value.expect("guard")), 1.0);
 //! ```
 
-use std::cmp::Ordering;
 use std::collections::btree_map::{BTreeMap, Entry};
-use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
 use std::{fmt, iter};
 
-use tokio::sync::{OwnedRwLockReadGuard, RwLock};
+use tokio::sync::RwLock;
 
+use super::guard::TxnReadGuard;
 use super::semaphore::*;
 use super::{Error, Result};
 
 pub use super::range::Range;
 
 /// A read guard on a value in a [`TxnMapLock`]
-#[derive(Debug)]
-pub enum TxnMapValueReadGuard<K, V> {
-    Committed(Arc<V>),
-    Pending(Permit<Range<K>>, OwnedRwLockReadGuard<V>),
-}
-
-impl<K, V> Deref for TxnMapValueReadGuard<K, V> {
-    type Target = V;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Committed(value) => value.deref(),
-            Self::Pending(_permit, value) => value.deref(),
-        }
-    }
-}
-
-impl<K, V: PartialOrd> PartialOrd<V> for TxnMapValueReadGuard<K, V> {
-    fn partial_cmp(&self, other: &V) -> Option<Ordering> {
-        self.deref().partial_cmp(other)
-    }
-}
-
-impl<K, V: PartialEq> PartialEq<V> for TxnMapValueReadGuard<K, V> {
-    fn eq(&self, other: &V) -> bool {
-        self.deref().eq(other)
-    }
-}
+pub type TxnMapValueReadGuard<K, V> = TxnReadGuard<Range<K>, V>;
 
 type Version<K, V> = BTreeMap<Arc<K>, Arc<RwLock<V>>>;
 
@@ -153,12 +125,12 @@ impl<I: Ord, K: Ord, V> State<I, K, V> {
             if let Some(value) = version.get(key) {
                 // the permit means it's safe to call try_read_owned().expect()
                 let guard = value.clone().try_read_owned().expect("read version");
-                return Some(TxnMapValueReadGuard::Pending(permit, guard));
+                return Some(TxnMapValueReadGuard::pending_write(permit, guard));
             }
         }
 
-        let canon = self.get_canon(&txn_id, key);
-        canon.map(TxnMapValueReadGuard::Committed)
+        self.get_canon(&txn_id, key)
+            .map(|value| TxnMapValueReadGuard::pending_read(permit, value))
     }
 
     #[inline]
@@ -341,7 +313,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
         Ok(state.insert(txn_id, key, value))
     }
 
-    /// Roll back the state of this [`TxnLock`] at `txn_id`.
+    /// Roll back the state of this [`TxnMapLock`] at `txn_id`.
     pub fn rollback(&self, txn_id: &I) {
         let mut state = self.state();
 
