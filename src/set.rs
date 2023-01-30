@@ -32,6 +32,8 @@
 //! assert!(set.try_remove(3, one.clone()).expect("remove"));
 //! assert!(!set.try_remove(3, one).expect("remove"));
 //! assert!(!set.try_remove(3, two).expect("remove"));
+//! set.commit(3);
+//! assert_eq!(set.try_iter(4).expect("iter").collect::<Vec<Arc<String>>>(), vec![]);
 //! ```
 
 use std::collections::btree_map::Entry;
@@ -81,6 +83,18 @@ impl<I: Copy + Ord, T: Ord> State<I, T> {
             pending: BTreeMap::from_iter(iter::once((txn_id, version))),
             finalized: None,
         }
+    }
+
+    #[inline]
+    fn canon(&self, txn_id: &I) -> (Canon<T>, bool) {
+        let mut canon = self.canon.clone();
+        for (_, version) in self.committed.iter().take_while(|(id, _)| *id <= &txn_id) {
+            if let Some(version) = version {
+                merge(&mut canon, version);
+            }
+        }
+
+        (canon, self.committed.contains_key(&txn_id))
     }
 
     #[inline]
@@ -293,26 +307,12 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
         Ok(self.state().contains_pending(&txn_id, key))
     }
 
-    /// Construct an iterator over the keys in this [`TxnSetLock`] at `txn_id`.
+    /// Construct an iterator over this [`TxnSetLock`] at `txn_id`.
     pub async fn iter(&self, txn_id: I) -> Result<Iter<T>> {
-        let (mut set, committed) = {
-            let state = self.state();
-
-            let mut canon = state.canon.clone();
-            for (_, version) in state.committed.iter().take_while(|(id, _)| *id <= &txn_id) {
-                if let Some(version) = version {
-                    merge(&mut canon, version);
-                }
-            }
-
-            (canon, state.committed.contains_key(&txn_id))
-        };
+        let (mut set, committed) = self.state().canon(&txn_id);
 
         if committed {
-            return Ok(Iter {
-                permit: None,
-                iter: set.into_iter(),
-            });
+            return Ok(Iter::new(None, set));
         }
 
         let permit = self.semaphore.read(txn_id, Range::All).await?;
@@ -322,10 +322,25 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
             merge(&mut set, version);
         }
 
-        return Ok(Iter {
-            permit: Some(permit),
-            iter: set.into_iter(),
-        });
+        return Ok(Iter::new(Some(permit), set));
+    }
+
+    /// Construct an iterator over this [`TxnSetLock`] at `txn_id` synchronously, if possible.
+    pub fn try_iter(&self, txn_id: I) -> Result<Iter<T>> {
+        let state = self.state();
+        let (mut set, committed) = state.canon(&txn_id);
+
+        if committed {
+            return Ok(Iter::new(None, set));
+        }
+
+        let permit = self.semaphore.try_read(txn_id, Range::All)?;
+
+        if let Some(version) = state.pending.get(&txn_id) {
+            merge(&mut set, version);
+        }
+
+        return Ok(Iter::new(Some(permit), set));
     }
 
     /// Insert a new `key` into this [`TxnSetLock`] at `txn_id`.
@@ -391,6 +406,15 @@ pub struct Iter<T> {
     #[allow(unused)]
     permit: Option<Permit<Range<T>>>,
     iter: <BTreeSet<Arc<T>> as IntoIterator>::IntoIter,
+}
+
+impl<T> Iter<T> {
+    fn new(permit: Option<Permit<Range<T>>>, set: BTreeSet<Arc<T>>) -> Self {
+        Self {
+            permit,
+            iter: set.into_iter(),
+        }
+    }
 }
 
 impl<T> Iterator for Iter<T> {
