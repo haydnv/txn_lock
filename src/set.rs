@@ -12,8 +12,8 @@
 //!
 //! let one = Arc::new("one".to_string());
 //! assert!(!block_on(set.contains(1, &one)).expect("contains"));
-//! // block_on(set.insert(1, one.clone())).expect("insert");
-//! // assert!(block_on(set.contains_key(&one)).expect("contains"));
+//! block_on(set.insert(1, one.clone())).expect("insert");
+//! assert!(block_on(set.contains(1, &one)).expect("contains"));
 //! // assert_eq!(set.try_insert(2, one.clone()).unwrap_err(), Error::WouldBlock);
 //! // set.commit(1);
 //! // assert!(set.try_contains_key(2, &one).expect("contains"));
@@ -21,6 +21,7 @@
 //! // assert!(set.try_contains_key(3, &one).expect("contains"));
 //! ```
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
@@ -45,6 +46,17 @@ impl<I: Ord, T: Ord> State<I, T> {
             committed: BTreeMap::new(),
             pending: BTreeMap::from_iter(iter::once((txn_id, version))),
             finalized: None,
+        }
+    }
+
+    #[inline]
+    fn check_pending(&self, txn_id: &I) -> Result<()> {
+        if self.finalized.as_ref() >= Some(txn_id) {
+            Err(Error::Outdated)
+        } else if self.committed.contains_key(txn_id) {
+            Err(Error::Committed)
+        } else {
+            Ok(())
         }
     }
 
@@ -85,6 +97,18 @@ impl<I: Ord, T: Ord> State<I, T> {
         }
 
         self.contains_canon(txn_id, key)
+    }
+
+    #[inline]
+    fn insert(&mut self, txn_id: I, key: Arc<T>) {
+        match self.pending.entry(txn_id) {
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().insert(key);
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(BTreeSet::from_iter(iter::once(key)));
+            }
+        }
     }
 }
 
@@ -139,5 +163,17 @@ impl<I: Copy + Ord, T: Ord + fmt::Debug> TxnSetLock<I, T> {
         let permit = self.semaphore.read(txn_id, Range::One(key.clone())).await?;
         let state = self.state();
         Ok(state.contains_pending(&txn_id, key, permit))
+    }
+
+    /// Insert a new entry into this [`TxnMapLock`] at `txn_id`.
+    pub async fn insert(&self, txn_id: I, key: Arc<T>) -> Result<()> {
+        // before acquiring a permit, check if this version has already been committed
+        self.state().check_pending(&txn_id)?;
+
+        let range = Range::One(key.clone());
+        let _permit = self.semaphore.write(txn_id, range).await?;
+
+        let mut state = self.state();
+        Ok(state.insert(txn_id, key))
     }
 }
