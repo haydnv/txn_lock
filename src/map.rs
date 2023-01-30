@@ -148,7 +148,7 @@ type Version<K, V> = BTreeMap<Arc<K>, Arc<RwLock<V>>>;
 
 struct State<I, K, V> {
     canon: BTreeMap<Arc<K>, Arc<V>>,
-    committed: BTreeMap<I, BTreeMap<Arc<K>, Arc<V>>>,
+    committed: BTreeMap<I, Option<BTreeMap<Arc<K>, Arc<V>>>>,
     pending: BTreeMap<I, Version<K, V>>,
     finalized: Option<I>,
 }
@@ -180,8 +180,10 @@ impl<I: Ord, K: Ord, V> State<I, K, V> {
             .map(|(_, version)| version);
 
         for version in committed {
-            if let Some(value) = version.get(key) {
-                return Some(value.clone());
+            if let Some(version) = version {
+                if let Some(value) = version.get(key) {
+                    return Some(value.clone());
+                }
             }
         }
 
@@ -308,7 +310,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
 
         self.semaphore.finalize(&txn_id, false);
 
-        let version = if let Some(pending) = state.pending.remove(&txn_id) {
+        let version = state.pending.remove(&txn_id).map(|pending| {
             pending
                 .into_iter()
                 .map(|(key, value)| {
@@ -321,13 +323,11 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
                     (key, Arc::new(value))
                 })
                 .collect()
-        } else {
-            BTreeMap::new()
-        };
+        });
 
         match state.committed.entry(txn_id) {
             Entry::Occupied(_) => {
-                assert!(version.is_empty());
+                assert!(version.is_none());
                 #[cfg(feature = "logging")]
                 log::warn!("duplicate commit at {}", txn_id);
             }
@@ -344,9 +344,10 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
 
         while let Some(version_id) = state.committed.keys().next().copied() {
             if version_id <= txn_id {
-                let version = state.committed.remove(&version_id).expect("version");
-                for (key, value) in version {
-                    state.canon.insert(key, value);
+                if let Some(version) = state.committed.remove(&version_id).expect("version") {
+                    for (key, value) in version {
+                        state.canon.insert(key, value);
+                    }
                 }
             } else {
                 break;
