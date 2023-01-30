@@ -11,14 +11,26 @@
 //! let set = TxnSetLock::<u64, String>::new(0);
 //!
 //! let one = Arc::new("one".to_string());
+//! let two = Arc::new("two".to_string());
+//!
 //! assert!(!block_on(set.contains(1, &one)).expect("contains"));
 //! block_on(set.insert(1, one.clone())).expect("insert");
 //! assert!(set.try_contains(1, &one).expect("contains"));
 //! assert_eq!(set.try_insert(2, one.clone()).unwrap_err(), Error::WouldBlock);
 //! set.commit(1);
 //! assert!(set.try_contains(2, &one).expect("contains"));
+//! assert!(block_on(set.remove(2, one.clone())).expect("remove"));
+//! assert!(!set.try_contains(2, &one).expect("contains"));
+//! assert!(!set.try_remove(2, one.clone()).expect("remove"));
+//! assert!(!set.try_contains(2, &one).expect("contains"));
+//! assert!(!set.try_remove(2, two.clone()).expect("remove"));
+//! set.try_insert(2, two.clone()).expect("insert");
 //! set.finalize(2);
+//! assert_eq!(set.try_contains(1, &one).unwrap_err(), Error::Outdated);
 //! assert!(set.try_contains(3, &one).expect("contains"));
+//! assert!(set.try_remove(3, one.clone()).expect("remove"));
+//! assert!(!set.try_remove(3, one).expect("remove"));
+//! assert!(!set.try_remove(3, two).expect("remove"));
 //! ```
 
 use std::collections::btree_map::Entry;
@@ -32,15 +44,34 @@ use super::{Error, Result};
 
 pub use super::range::Range;
 
+#[derive(Debug, Eq, PartialEq)]
+enum KeyState {
+    Present,
+    Absent,
+}
+
+impl KeyState {
+    fn is_present(&self) -> bool {
+        self == &KeyState::Present
+    }
+}
+
+type Version<T> = BTreeMap<Arc<T>, KeyState>;
+
 struct State<I, T> {
     canon: BTreeSet<Arc<T>>,
-    committed: BTreeMap<I, Option<BTreeSet<Arc<T>>>>,
-    pending: BTreeMap<I, BTreeSet<Arc<T>>>,
+    committed: BTreeMap<I, Option<Version<T>>>,
+    pending: BTreeMap<I, Version<T>>,
     finalized: Option<I>,
 }
 
 impl<I: Ord, T: Ord> State<I, T> {
     fn new(txn_id: I, version: BTreeSet<Arc<T>>) -> Self {
+        let version = version
+            .into_iter()
+            .map(|key| (key, KeyState::Present))
+            .collect();
+
         State {
             canon: BTreeSet::new(),
             committed: BTreeMap::new(),
@@ -71,7 +102,9 @@ impl<I: Ord, T: Ord> State<I, T> {
 
         for version in committed {
             if let Some(version) = version {
-                return version.contains(key);
+                if let Some(key_state) = version.get(key) {
+                    return key_state.is_present();
+                }
             }
         }
 
@@ -93,7 +126,9 @@ impl<I: Ord, T: Ord> State<I, T> {
     #[inline]
     fn contains_pending(&self, txn_id: &I, key: &T) -> bool {
         if let Some(version) = self.pending.get(&txn_id) {
-            return version.contains(key);
+            if let Some(key_state) = version.get(key) {
+                return key_state.is_present();
+            }
         }
 
         self.contains_canon(txn_id, key)
@@ -103,12 +138,29 @@ impl<I: Ord, T: Ord> State<I, T> {
     fn insert(&mut self, txn_id: I, key: Arc<T>) {
         match self.pending.entry(txn_id) {
             Entry::Occupied(mut entry) => {
-                entry.get_mut().insert(key);
+                entry.get_mut().insert(key, KeyState::Present);
             }
             Entry::Vacant(entry) => {
-                entry.insert(BTreeSet::from_iter(iter::once(key)));
+                let version = iter::once((key, KeyState::Present)).collect();
+                entry.insert(version);
             }
         }
+    }
+
+    #[inline]
+    fn remove(&mut self, txn_id: I, key: Arc<T>) -> bool {
+        let present = self.contains_canon(&txn_id, &key);
+
+        if let Some(version) = self.pending.get_mut(&txn_id) {
+            if let Some(prior_state) = version.insert(key, KeyState::Absent) {
+                return prior_state.is_present();
+            }
+        } else {
+            let version = iter::once((key, KeyState::Absent)).collect();
+            self.pending.insert(txn_id, version);
+        }
+
+        present
     }
 }
 
@@ -159,7 +211,11 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
                 log::warn!("duplicate commit at {}", txn_id);
             }
             Entry::Vacant(entry) => {
-                entry.insert(version);
+                if let Some(version) = version {
+                    entry.insert(Some(version));
+                } else {
+                    entry.insert(None);
+                }
             }
         }
     }
@@ -172,11 +228,20 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
         while let Some(version_id) = state.committed.keys().next().copied() {
             if version_id <= txn_id {
                 if let Some(version) = state.committed.remove(&version_id).expect("version") {
-                    state.canon.extend(version);
+                    for (key, key_state) in version {
+                        match key_state {
+                            KeyState::Present => state.canon.insert(key),
+                            KeyState::Absent => state.canon.remove(&key),
+                        };
+                    }
                 }
             } else {
                 break;
             }
+        }
+
+        if let Some(next_commit) = state.committed.keys().next() {
+            assert!(next_commit > &txn_id);
         }
 
         self.semaphore.finalize(&txn_id, true);
@@ -211,11 +276,13 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
             return result;
         }
 
+        println!("not committed: {}", txn_id);
+
         let _permit = self.semaphore.try_read(txn_id, Range::One(key.clone()))?;
         Ok(self.state().contains_pending(&txn_id, key))
     }
 
-    /// Insert a new entry into this [`TxnSetLock`] at `txn_id`.
+    /// Insert a new `key` into this [`TxnSetLock`] at `txn_id`.
     pub async fn insert(&self, txn_id: I, key: Arc<T>) -> Result<()> {
         // before acquiring a permit, check if this version has already been committed
         self.state().check_pending(&txn_id)?;
@@ -225,13 +292,33 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
         Ok(self.state().insert(txn_id, key))
     }
 
-    /// Insert a new entry into this [`TxnSetLock`] at `txn_id` synchronously, if possible.
+    /// Insert a new `key` into this [`TxnSetLock`] at `txn_id` synchronously, if possible.
     pub fn try_insert(&self, txn_id: I, key: Arc<T>) -> Result<()> {
         // before acquiring a permit, check if this version has already been committed
         self.state().check_pending(&txn_id)?;
 
         let _permit = self.semaphore.try_write(txn_id, Range::One(key.clone()))?;
         Ok(self.state().insert(txn_id, key))
+    }
+
+    /// Remove a `key` into this [`TxnSetLock`] at `txn_id` and return `true` if it was present.
+    pub async fn remove(&self, txn_id: I, key: Arc<T>) -> Result<bool> {
+        // before acquiring a permit, check if this version has already been committed
+        self.state().check_pending(&txn_id)?;
+
+        let range = Range::One(key.clone());
+        let _permit = self.semaphore.try_write(txn_id, range)?;
+        Ok(self.state().remove(txn_id, key))
+    }
+
+    /// Remove a `key` into this [`TxnSetLock`] at `txn_id` and return `true` if it was present.
+    pub fn try_remove(&self, txn_id: I, key: Arc<T>) -> Result<bool> {
+        // before acquiring a permit, check if this version has already been committed
+        self.state().check_pending(&txn_id)?;
+
+        let range = Range::One(key.clone());
+        let _permit = self.semaphore.try_write(txn_id, range)?;
+        Ok(self.state().remove(txn_id, key))
     }
 
     /// Roll back the state of this [`TxnSetLock`] at `txn_id`.
