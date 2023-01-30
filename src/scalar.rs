@@ -13,41 +13,38 @@
 //! assert_eq!(lock.try_write(1).unwrap_err(), Error::WouldBlock);
 //! assert_eq!(*lock.try_read(1).expect("read"), "zero");
 //!
-//! {
-//!     // let commit = block_on(lock.commit(0)).expect("commit guard");
-//!     // assert_eq!(*commit, "zero");
-//!     // this commit guard will block future commits until dropped
-//! }
+//! lock.commit(1);
 //!
 //! {
-//!     // let mut guard = lock.try_write(1).expect("write lock");
-//!     // *guard = "one";
+//!     let mut guard = lock.try_write(2).expect("write lock");
+//!     *guard = "two";
 //! }
 //!
-//! // assert_eq!(*lock.try_read(0).expect("read past version"), "zero");
-//! // assert_eq!(*lock.try_read(1).expect("read current version"), "one");
+//! assert_eq!(*lock.try_read(0).expect("read past version"), "zero");
+//! assert_eq!(*lock.try_read(2).expect("read current version"), "two");
 //!
-//! // block_on(lock.commit(1));
+//! lock.commit(2);
 //!
-//! // assert_eq!(*lock.try_read_exclusive(2).expect("new value"), "one");
+//! assert_eq!(*lock.try_read(3).expect("new value"), "two");
 //!
-//! // lock.rollback(&2);
+//! // lock.rollback(&3);
 //!
 //! {
 //!     // let mut guard = lock.try_write(3).expect("write lock");
 //!     // *guard = "three";
 //! }
 //!
-//! // assert_eq!(*block_on(lock.finalize(&1)).expect("finalized version"), "one");
+//! lock.finalize(1);
 //!
-//! // assert_eq!(lock.try_read(0).unwrap_err(), Error::Outdated);
-//! // assert_eq!(*lock.try_read(3).expect("current value"), "three");
+//! assert_eq!(lock.try_read(0).unwrap_err(), Error::Outdated);
+//! assert_eq!(*lock.try_read(3).expect("current value"), "two");
 //! ```
 
 use std::cmp::Ordering;
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
 
@@ -99,6 +96,12 @@ impl<T> Deref for TxnLockWriteGuard<T> {
 
     fn deref(&self) -> &T {
         self.value.deref()
+    }
+}
+
+impl<T> DerefMut for TxnLockWriteGuard<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
     }
 }
 
@@ -240,13 +243,58 @@ impl<I, T> TxnLock<I, T> {
     }
 }
 
-impl<I: Copy + Ord, T: fmt::Debug> TxnLock<I, T> {
+impl<I: Copy + Ord + fmt::Display, T: fmt::Debug> TxnLock<I, T> {
     /// Construct a new [`TxnLock`].
     pub fn new(canon: T) -> Self {
         Self {
             state: Arc::new(Mutex::new(State::new(canon))),
             semaphore: Semaphore::new(),
         }
+    }
+
+    /// Commit the state of this [`TxnLock`] at `txn_id`.
+    pub fn commit(&self, txn_id: I) {
+        let mut state = self.state();
+
+        self.semaphore.finalize(&txn_id, false);
+
+        let version = state.pending.remove(&txn_id).map(|version| {
+            if let Ok(lock) = Arc::try_unwrap(version) {
+                Arc::new(lock.into_inner())
+            } else {
+                panic!("value to commit at {} is still locked!", txn_id);
+            }
+        });
+
+        match state.committed.entry(txn_id) {
+            Entry::Occupied(_) => {
+                assert!(version.is_none());
+                #[cfg(feature = "logging")]
+                log::warn!("duplicate commit at {}", txn_id);
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(version);
+            }
+        }
+    }
+
+    /// Finalize the state of this [`TxnSetLock`] at `txn_id`.
+    /// This will merge in deltas and prevent further reads of versions earlier than `txn_id`.
+    pub fn finalize(&self, txn_id: I) {
+        let mut state = self.state();
+
+        while let Some(version_id) = state.committed.keys().next().copied() {
+            if version_id <= txn_id {
+                if let Some(version) = state.committed.remove(&version_id).expect("version") {
+                    state.canon = version;
+                }
+            } else {
+                break;
+            }
+        }
+
+        self.semaphore.finalize(&txn_id, true);
+        state.finalized = Some(txn_id);
     }
 
     /// Acquire a read lock for this value at `txn_id`.
