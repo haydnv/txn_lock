@@ -27,17 +27,17 @@
 //!
 //! assert_eq!(*lock.try_read(3).expect("new value"), "two");
 //!
-//! // lock.rollback(&3);
+//! lock.rollback(&3);
 //!
 //! {
-//!     // let mut guard = lock.try_write(3).expect("write lock");
-//!     // *guard = "three";
+//!     let mut guard = lock.try_write(3).expect("write lock");
+//!     *guard = "three";
 //! }
 //!
 //! lock.finalize(1);
 //!
 //! assert_eq!(lock.try_read(0).unwrap_err(), Error::Outdated);
-//! assert_eq!(*lock.try_read(3).expect("current value"), "two");
+//! assert_eq!(*lock.try_read(3).expect("current value"), "three");
 //! ```
 
 use std::cmp::Ordering;
@@ -317,6 +317,20 @@ impl<I: Copy + Ord + fmt::Display, T: fmt::Debug> TxnLock<I, T> {
 
         let permit = self.semaphore.try_read(txn_id, Range)?;
         Ok(self.state().read_pending(&txn_id, permit))
+    }
+
+    /// Roll back the state of this [`TxnLock`] at `txn_id`.
+    pub fn rollback(&self, txn_id: &I) {
+        let mut state = self.state();
+
+        assert!(
+            !state.committed.contains_key(&txn_id),
+            "cannot roll back committed transaction {}",
+            txn_id
+        );
+
+        self.semaphore.finalize(txn_id, false);
+        state.pending.remove(txn_id);
     }
 }
 

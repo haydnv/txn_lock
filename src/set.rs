@@ -232,4 +232,18 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
         let _permit = self.semaphore.try_write(txn_id, Range::One(key.clone()))?;
         Ok(self.state().insert(txn_id, key))
     }
+
+    /// Roll back the state of this [`TxnLock`] at `txn_id`.
+    pub fn rollback(&self, txn_id: &I) {
+        let mut state = self.state();
+
+        assert!(
+            !state.committed.contains_key(&txn_id),
+            "cannot roll back committed transaction {}",
+            txn_id
+        );
+
+        self.semaphore.finalize(txn_id, false);
+        state.pending.remove(txn_id);
+    }
 }

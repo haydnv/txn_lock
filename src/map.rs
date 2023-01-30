@@ -313,4 +313,18 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
         let mut state = self.state();
         Ok(state.insert(txn_id, key, value))
     }
+
+    /// Roll back the state of this [`TxnLock`] at `txn_id`.
+    pub fn rollback(&self, txn_id: &I) {
+        let mut state = self.state();
+
+        assert!(
+            !state.committed.contains_key(&txn_id),
+            "cannot roll back committed transaction {}",
+            txn_id
+        );
+
+        self.semaphore.finalize(txn_id, false);
+        state.pending.remove(txn_id);
+    }
 }
