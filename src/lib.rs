@@ -12,6 +12,7 @@ pub mod scalar;
 pub mod semaphore;
 pub mod set;
 
+mod guard;
 mod range;
 
 use std::fmt;

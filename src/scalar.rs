@@ -40,18 +40,20 @@
 //! assert_eq!(*lock.try_read(3).expect("current value"), "three");
 //! ```
 
-use std::cmp::Ordering;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
 
-use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+use tokio::sync::RwLock;
 
+use super::guard::{TxnReadGuard, TxnWriteGuard};
 use super::semaphore::{Overlap, Overlaps, Permit, Semaphore};
 use super::{Error, Result};
+
+pub type TxnLockReadGuard<T> = TxnReadGuard<Range, T>;
+pub type TxnLockWriteGuard<T> = TxnWriteGuard<Range, T>;
 
 /// A range used to reserve a [`Permit`] to guard access to a [`TxnLock`]
 #[derive(Debug)]
@@ -60,60 +62,6 @@ pub struct Range;
 impl Overlaps<Range> for Range {
     fn overlaps(&self, _other: &Range) -> Overlap {
         Overlap::Equal
-    }
-}
-
-/// A read guard on a transactional value
-#[derive(Debug)]
-pub enum TxnLockReadGuard<T> {
-    Committed(Arc<T>),
-    PendingRead(Permit<Range>, Arc<T>),
-    PendingWrite(Permit<Range>, OwnedRwLockReadGuard<T>),
-}
-
-impl<T> Deref for TxnLockReadGuard<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        match self {
-            Self::Committed(value) => value.deref(),
-            Self::PendingRead(_permit, value) => value.deref(),
-            Self::PendingWrite(_permit, value) => value.deref(),
-        }
-    }
-}
-
-/// A read guard on a transactional value
-#[derive(Debug)]
-pub struct TxnLockWriteGuard<T> {
-    #[allow(unused)]
-    permit: Permit<Range>,
-    value: OwnedRwLockWriteGuard<T>,
-}
-
-impl<T> Deref for TxnLockWriteGuard<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        self.value.deref()
-    }
-}
-
-impl<T> DerefMut for TxnLockWriteGuard<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.value
-    }
-}
-
-impl<T: PartialEq> PartialEq<T> for TxnLockWriteGuard<T> {
-    fn eq(&self, other: &T) -> bool {
-        self.deref().eq(other)
-    }
-}
-
-impl<T: PartialOrd> PartialOrd<T> for TxnLockWriteGuard<T> {
-    fn partial_cmp(&self, other: &T) -> Option<Ordering> {
-        self.deref().partial_cmp(other)
     }
 }
 
@@ -180,10 +128,10 @@ impl<I: Ord, T> State<I, T> {
         if let Some(version) = self.pending.get(txn_id) {
             // the permit means it's safe to call try_read_owned().expect()
             let value = version.clone().try_read_owned().expect("version");
-            TxnLockReadGuard::PendingWrite(permit, value)
+            TxnLockReadGuard::pending_write(permit, value)
         } else {
             let value = self.read_canon(txn_id).clone();
-            TxnLockReadGuard::PendingRead(permit, value)
+            TxnLockReadGuard::pending_read(permit, value)
         }
     }
 }
@@ -210,7 +158,7 @@ impl<I: Ord, T: Clone> State<I, T> {
             .try_write_owned()
             .expect("version");
 
-        Ok(TxnLockWriteGuard { permit, value })
+        Ok(TxnLockWriteGuard::new(permit, value))
     }
 }
 
