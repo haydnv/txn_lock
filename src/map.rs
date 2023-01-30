@@ -8,12 +8,12 @@
 //! use txn_lock::map::*;
 //! use txn_lock::Error;
 //!
-//! let map = TxnMapLock::<u64, String, f32>::new();
+//! let map = TxnMapLock::<u64, String, f32>::new(1);
 //!
 //! let one = Arc::new("one".to_string());
 //! block_on(map.insert(1, one.clone(), 1.0)).expect("insert");
 //!
-//! let value = block_on(map.get(1, &one.clone())).expect("read").expect("value");
+//! let value = block_on(map.get(1, &one)).expect("read").expect("value");
 //! assert_eq!(value, 1.0);
 //!
 //! assert_eq!(map.try_insert(1, one.clone(), 2.0).unwrap_err(), Error::WouldBlock);
@@ -21,84 +21,32 @@
 //! std::mem::drop(value);  // commit will panic if any updated value is still locked
 //! map.commit(1);
 //!
-//! let value = map.try_get(2, &one.clone()).expect("read");
+//! let value = map.try_get(2, &one).expect("read");
 //! assert_eq!(*(value.expect("guard")), 1.0);
 //!
 //! map.finalize(2);
 //!
-//! let value = map.try_get(3, &one.clone()).expect("read");
+//! let value = map.try_get(3, &one).expect("read");
 //! assert_eq!(*(value.expect("guard")), 1.0);
 //! ```
 
 use std::cmp::Ordering;
 use std::collections::btree_map::{BTreeMap, Entry};
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
 use std::{fmt, iter};
-use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use super::semaphore::*;
 use super::{Error, Result};
 
-/// A range used to reserve [`Semaphore`] permits in a [`TxnMapLock`]
-#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum Range<K> {
-    One(Arc<K>),
-    All,
-}
-
-impl<K> Clone for Range<K> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::One(k) => Self::One(k.clone()),
-            Self::All => Self::All,
-        }
-    }
-}
-
-impl<K: PartialEq> PartialEq<K> for Range<K> {
-    fn eq(&self, other: &K) -> bool {
-        match self {
-            Self::One(key) => &**key == other,
-            Self::All => false,
-        }
-    }
-}
-
-impl<K: Eq + Ord> Overlaps<Self> for Range<K> {
-    fn overlaps(&self, other: &Self) -> Overlap {
-        match self {
-            Self::All => match other {
-                Self::All => Overlap::Equal,
-                _ => Overlap::Wide,
-            },
-            this => match other {
-                Self::All => Overlap::Narrow,
-                Self::One(that) => this.overlaps(&**that),
-            },
-        }
-    }
-}
-
-impl<K: Eq + Ord> Overlaps<K> for Range<K> {
-    fn overlaps(&self, other: &K) -> Overlap {
-        match self {
-            Self::All => Overlap::Wide,
-            Self::One(this) => match (&**this).cmp(other) {
-                Ordering::Less => Overlap::Less,
-                Ordering::Equal => Overlap::Equal,
-                Ordering::Greater => Overlap::Greater,
-            },
-        }
-    }
-}
+pub use super::range::Range;
 
 /// A read guard on a value in a [`TxnMapLock`]
 #[derive(Debug)]
 pub enum ValueReadGuard<K, V> {
     Committed(Arc<V>),
-    Pending(Permit<Range<K>>, OwnedRwLockReadGuard<V>),
+    Pending(Permit<Range<K>>, Arc<V>),
 }
 
 impl<K, V> Deref for ValueReadGuard<K, V> {
@@ -124,27 +72,7 @@ impl<K, V: PartialEq> PartialEq<V> for ValueReadGuard<K, V> {
     }
 }
 
-/// A write lock on a value in a [`TxnMapLock`]
-pub struct ValueWrite<K, V> {
-    _permit: Permit<Range<K>>,
-    value: OwnedRwLockWriteGuard<V>,
-}
-
-impl<K, V> Deref for ValueWrite<K, V> {
-    type Target = V;
-
-    fn deref(&self) -> &Self::Target {
-        self.value.deref()
-    }
-}
-
-impl<K, V> DerefMut for ValueWrite<K, V> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.value.deref_mut()
-    }
-}
-
-type Version<K, V> = BTreeMap<Arc<K>, Arc<RwLock<V>>>;
+type Version<K, V> = BTreeMap<Arc<K>, Arc<V>>;
 
 struct State<I, K, V> {
     canon: BTreeMap<Arc<K>, Arc<V>>,
@@ -154,6 +82,16 @@ struct State<I, K, V> {
 }
 
 impl<I: Ord, K: Ord, V> State<I, K, V> {
+    #[inline]
+    fn new(txn_id: I, version: Version<K, V>) -> Self {
+        Self {
+            canon: BTreeMap::new(),
+            committed: BTreeMap::new(),
+            pending: BTreeMap::from_iter(iter::once((txn_id, version))),
+            finalized: None,
+        }
+    }
+
     #[inline]
     fn check_pending(&self, txn_id: &I) -> Result<()> {
         if self.finalized.as_ref() >= Some(txn_id) {
@@ -207,9 +145,7 @@ impl<I: Ord, K: Ord, V> State<I, K, V> {
     ) -> Result<Option<ValueReadGuard<K, V>>> {
         if let Some(version) = self.pending.get(&txn_id) {
             if let Some(value) = version.get(key) {
-                // it's safe to call try_read after acquiring the semaphore permit
-                let guard = value.clone().try_read_owned().expect("read guard");
-                return Ok(Some(ValueReadGuard::Pending(permit, guard)));
+                return Ok(Some(ValueReadGuard::Pending(permit, value.clone())));
             }
         }
 
@@ -220,11 +156,7 @@ impl<I: Ord, K: Ord, V> State<I, K, V> {
     #[inline]
     fn insert(&mut self, txn_id: I, key: Arc<K>, value: V) {
         #[inline]
-        fn version_entry<K: Ord, V>(
-            version: &mut Version<K, V>,
-            key: Arc<K>,
-            value: Arc<RwLock<V>>,
-        ) {
+        fn version_entry<K: Ord, V>(version: &mut Version<K, V>, key: Arc<K>, value: Arc<V>) {
             match version.entry(key) {
                 Entry::Occupied(mut entry) => {
                     let existing_delta = entry.get_mut();
@@ -236,7 +168,7 @@ impl<I: Ord, K: Ord, V> State<I, K, V> {
             }
         }
 
-        let value = Arc::new(RwLock::new(value));
+        let value = Arc::new(value);
         match self.pending.entry(txn_id) {
             Entry::Occupied(mut entry) => version_entry(entry.get_mut(), key, value),
             Entry::Vacant(entry) => {
@@ -272,14 +204,9 @@ impl<I, K, V> TxnMapLock<I, K, V> {
 
 impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLock<I, K, V> {
     /// Construct a new [`TxnMapLock`].
-    pub fn new() -> Self {
+    pub fn new(txn_id: I) -> Self {
         Self {
-            state: Arc::new(Mutex::new(State {
-                canon: BTreeMap::new(),
-                committed: BTreeMap::new(),
-                pending: BTreeMap::new(),
-                finalized: None,
-            })),
+            state: Arc::new(Mutex::new(State::new(txn_id, Version::new()))),
             semaphore: Semaphore::new(),
         }
     }
@@ -288,18 +215,11 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
     pub fn with_contents<C: IntoIterator<Item = (K, V)>>(txn_id: I, contents: C) -> Self {
         let version = contents
             .into_iter()
-            .map(|(key, value)| (Arc::new(key), Arc::new(RwLock::new(value))))
+            .map(|(key, value)| (Arc::new(key), Arc::new(value)))
             .collect();
 
-        let state = State {
-            canon: BTreeMap::new(),
-            committed: BTreeMap::new(),
-            pending: BTreeMap::from_iter(iter::once((txn_id, version))),
-            finalized: None,
-        };
-
         Self {
-            state: Arc::new(Mutex::new(state)),
+            state: Arc::new(Mutex::new(State::new(txn_id, version))),
             semaphore: Semaphore::with_reservation(txn_id, Range::All),
         }
     }
@@ -310,20 +230,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
 
         self.semaphore.finalize(&txn_id, false);
 
-        let version = state.pending.remove(&txn_id).map(|pending| {
-            pending
-                .into_iter()
-                .map(|(key, value)| {
-                    let value = if let Ok(value_lock) = Arc::try_unwrap(value) {
-                        value_lock.into_inner()
-                    } else {
-                        panic!("cannot commit locked value for key {:?}", key);
-                    };
-
-                    (key, Arc::new(value))
-                })
-                .collect()
-        });
+        let version = state.pending.remove(&txn_id);
 
         match state.committed.entry(txn_id) {
             Entry::Occupied(_) => {

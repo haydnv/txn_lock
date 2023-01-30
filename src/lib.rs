@@ -45,6 +45,9 @@
 pub mod lock;
 pub mod map;
 pub mod semaphore;
+pub mod set;
+
+mod range;
 
 use std::fmt;
 
