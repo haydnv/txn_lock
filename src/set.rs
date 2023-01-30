@@ -15,10 +15,10 @@
 //! block_on(set.insert(1, one.clone())).expect("insert");
 //! assert!(set.try_contains(1, &one).expect("contains"));
 //! assert_eq!(set.try_insert(2, one.clone()).unwrap_err(), Error::WouldBlock);
-//! // set.commit(1);
-//! // assert!(set.try_contains_key(2, &one).expect("contains"));
-//! // set.finalize(2);
-//! // assert!(set.try_contains_key(3, &one).expect("contains"));
+//! set.commit(1);
+//! assert!(set.try_contains(2, &one).expect("contains"));
+//! set.finalize(2);
+//! assert!(set.try_contains(3, &one).expect("contains"));
 //! ```
 
 use std::collections::btree_map::Entry;
@@ -134,13 +134,52 @@ impl<I, T> TxnSetLock<I, T> {
     }
 }
 
-impl<I: Copy + Ord, T: Ord + fmt::Debug> TxnSetLock<I, T> {
+impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
     /// Construct a new, empty [`TxnSetLock`].
     pub fn new(txn_id: I) -> Self {
         Self {
             state: Arc::new(Mutex::new(State::new(txn_id, BTreeSet::new()))),
             semaphore: Semaphore::new(),
         }
+    }
+
+    /// Commit the state of this [`TxnSetLock`] at `txn_id`.
+    pub fn commit(&self, txn_id: I) {
+        let mut state = self.state();
+
+        self.semaphore.finalize(&txn_id, false);
+
+        let version = state.pending.remove(&txn_id);
+
+        match state.committed.entry(txn_id) {
+            Entry::Occupied(_) => {
+                assert!(version.is_none());
+                #[cfg(feature = "logging")]
+                log::warn!("duplicate commit at {}", txn_id);
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(version);
+            }
+        }
+    }
+
+    /// Finalize the state of this [`TxnMapLock`] at `txn_id`.
+    /// This will merge in deltas and prevent further reads of versions earlier than `txn_id`.
+    pub fn finalize(&self, txn_id: I) {
+        let mut state = self.state();
+
+        while let Some(version_id) = state.committed.keys().next().copied() {
+            if version_id <= txn_id {
+                if let Some(version) = state.committed.remove(&version_id).expect("version") {
+                    state.canon.extend(version);
+                }
+            } else {
+                break;
+            }
+        }
+
+        self.semaphore.finalize(&txn_id, true);
+        state.finalized = Some(txn_id);
     }
 
     /// Construct a new [`TxnSetLock`] with the given `contents`.

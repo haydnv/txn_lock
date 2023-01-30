@@ -252,9 +252,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
         while let Some(version_id) = state.committed.keys().next().copied() {
             if version_id <= txn_id {
                 if let Some(version) = state.committed.remove(&version_id).expect("version") {
-                    for (key, value) in version {
-                        state.canon.insert(key, value);
-                    }
+                    state.canon.extend(version);
                 }
             } else {
                 break;
