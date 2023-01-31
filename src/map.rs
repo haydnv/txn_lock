@@ -61,7 +61,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
 use std::{fmt, iter};
 
-use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use super::guard::{TxnReadGuard, TxnWriteGuard};
 use super::semaphore::*;
@@ -79,6 +79,12 @@ type Canon<K, V> = BTreeMap<Arc<K>, Arc<V>>;
 type Committed<I, K, V> = BTreeMap<I, Option<BTreeMap<Arc<K>, Option<Arc<V>>>>>;
 type Version<K, V> = BTreeMap<Arc<K>, Option<Arc<RwLock<V>>>>;
 
+#[derive(Debug)]
+enum PendingValue<V> {
+    Committed(Arc<V>),
+    Pending(OwnedRwLockReadGuard<V>),
+}
+
 struct State<I, K, V> {
     canon: Canon<K, V>,
     committed: Committed<I, K, V>,
@@ -94,6 +100,17 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
             committed: BTreeMap::new(),
             pending: BTreeMap::from_iter(iter::once((txn_id, version))),
             finalized: None,
+        }
+    }
+
+    #[inline]
+    fn check_committed(&self, txn_id: &I) -> Result<bool> {
+        if self.finalized.as_ref() >= Some(txn_id) {
+            Err(Error::Outdated)
+        } else if self.committed.contains_key(txn_id) {
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 
@@ -145,26 +162,21 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
             Poll::Ready(Err(Error::Outdated))
         } else if self.committed.contains_key(&txn_id) {
             assert!(!self.pending.contains_key(&txn_id));
-            let canon = self.get_canon(&txn_id, &key);
-            Poll::Ready(Ok(canon.map(TxnMapValueReadGuard::Committed)))
+            let value = self.get_canon(&txn_id, key);
+            Poll::Ready(Ok(value.map(TxnMapValueReadGuard::committed)))
         } else {
             Poll::Pending
         }
     }
 
     #[inline]
-    fn get_pending(
-        &self,
-        txn_id: &I,
-        key: &K,
-        permit: Permit<Range<K>>,
-    ) -> Option<TxnMapValueReadGuard<K, V>> {
+    fn get_pending(&self, txn_id: &I, key: &K) -> Option<PendingValue<V>> {
         if let Some(version) = self.pending.get(&txn_id) {
             if let Some(delta) = version.get(key) {
                 return if let Some(value) = delta {
                     // the permit means it's safe to call try_read_owned().expect()
                     let guard = value.clone().try_read_owned().expect("read version");
-                    Some(TxnMapValueReadGuard::pending_write(permit, guard))
+                    Some(PendingValue::Pending(guard))
                 } else {
                     None
                 };
@@ -172,7 +184,7 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
         }
 
         self.get_canon(&txn_id, key)
-            .map(|value| TxnMapValueReadGuard::pending_read(permit, value))
+            .map(|value| PendingValue::Committed(value))
     }
 
     #[inline]
@@ -496,18 +508,65 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
         }
 
         let permit = self.semaphore.read(txn_id, Range::One(key.clone())).await?;
-        Ok(self.state().get_pending(&txn_id, key, permit))
+        let value = self
+            .state()
+            .get_pending(&txn_id, key)
+            .map(|value| match value {
+                PendingValue::Committed(value) => TxnMapValueReadGuard::committed(value),
+                PendingValue::Pending(value) => TxnMapValueReadGuard::pending_write(permit, value),
+            });
+
+        Ok(value)
     }
 
     /// Read a value from this [`TxnMapLock`] at `txn_id` synchronously, if possible.
     pub fn try_get(&self, txn_id: I, key: &Arc<K>) -> Result<Option<TxnMapValueReadGuard<K, V>>> {
+        let state = self.state();
+
         // before acquiring a permit, check if this version has already been committed
-        if let Poll::Ready(result) = self.state().get_committed(&txn_id, key) {
+        if let Poll::Ready(result) = state.get_committed(&txn_id, key) {
             return result;
         }
 
         let permit = self.semaphore.try_read(txn_id, Range::One(key.clone()))?;
-        Ok(self.state().get_pending(&txn_id, key, permit))
+        let value = state.get_pending(&txn_id, key).map(|value| match value {
+            PendingValue::Committed(value) => TxnMapValueReadGuard::committed(value),
+            PendingValue::Pending(value) => TxnMapValueReadGuard::pending_write(permit, value),
+        });
+
+        Ok(value)
+    }
+
+    /// Construct an iterator over the entries in this [`TxnMapLock`] at `txn_id`.
+    pub async fn iter(&self, txn_id: I) -> Result<Iter<I, K, V>> {
+        {
+            let state = self.state();
+
+            // before acquiring a permit, check if this version has already been committed
+            if state.check_committed(&txn_id)? {
+                let keys = state.keys_committed(&txn_id);
+                return Ok(Iter::new(self.state.clone(), txn_id, None, keys));
+            }
+        }
+
+        let permit = self.semaphore.write(txn_id, Range::All).await?;
+        let keys = self.state().keys_pending(txn_id);
+        return Ok(Iter::new(self.state.clone(), txn_id, Some(permit), keys));
+    }
+
+    /// Construct an iterator over the entries in this [`TxnMapLock`] at `txn_id` synchronously.
+    pub fn try_iter(&self, txn_id: I) -> Result<Iter<I, K, V>> {
+        let state = self.state();
+
+        // before acquiring a permit, check if this version has already been committed
+        if state.check_committed(&txn_id)? {
+            let keys = state.keys_committed(&txn_id);
+            return Ok(Iter::new(self.state.clone(), txn_id, None, keys));
+        }
+
+        let permit = self.semaphore.try_write(txn_id, Range::All)?;
+        let keys = state.keys_pending(txn_id);
+        return Ok(Iter::new(self.state.clone(), txn_id, Some(permit), keys));
     }
 
     /// Insert a new entry into this [`TxnMapLock`] at `txn_id`.
@@ -639,6 +698,88 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: Clone + fmt::Debug> T
         let permit = self.semaphore.try_write(txn_id, Range::All)?;
         let keys = state.keys_pending(txn_id);
         Ok(IterMut::new(txn_id, permit, self.state.clone(), keys))
+    }
+}
+
+/// A guard on a value in an [`Iter`]
+#[derive(Debug)]
+pub struct TxnMapIterGuard<V> {
+    value: PendingValue<V>,
+}
+
+impl<V> From<PendingValue<V>> for TxnMapIterGuard<V> {
+    fn from(value: PendingValue<V>) -> Self {
+        Self { value }
+    }
+}
+
+impl<V> Deref for TxnMapIterGuard<V> {
+    type Target = V;
+
+    fn deref(&self) -> &Self::Target {
+        match &self.value {
+            PendingValue::Committed(value) => value.deref(),
+            PendingValue::Pending(value) => value.deref(),
+        }
+    }
+}
+
+impl<V: PartialEq> PartialEq<V> for TxnMapIterGuard<V> {
+    fn eq(&self, other: &V) -> bool {
+        self.deref().eq(other)
+    }
+}
+
+impl<V: PartialOrd> PartialOrd<V> for TxnMapIterGuard<V> {
+    fn partial_cmp(&self, other: &V) -> Option<Ordering> {
+        self.deref().partial_cmp(other)
+    }
+}
+
+/// An iterator over the entries in a [`TxnMapLock`] as of a specific transaction
+pub struct Iter<I, K, V> {
+    lock_state: Arc<Mutex<State<I, K, V>>>,
+    txn_id: I,
+    permit: Option<Permit<Range<K>>>,
+    keys: <BTreeSet<Arc<K>> as IntoIterator>::IntoIter,
+}
+
+impl<I, K, V> Iter<I, K, V> {
+    fn new(
+        lock_state: Arc<Mutex<State<I, K, V>>>,
+        txn_id: I,
+        permit: Option<Permit<Range<K>>>,
+        keys: BTreeSet<Arc<K>>,
+    ) -> Self {
+        Self {
+            lock_state,
+            txn_id,
+            permit,
+            keys: keys.into_iter(),
+        }
+    }
+}
+
+impl<I: Copy + Ord, K: Ord, V: fmt::Debug> Iterator for Iter<I, K, V> {
+    type Item = (Arc<K>, TxnMapIterGuard<V>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let state = self.lock_state.lock().expect("lock state");
+
+        loop {
+            let key = self.keys.next()?;
+            let value = if self.permit.is_some() {
+                state.get_pending(&self.txn_id, &key)
+            } else {
+                state
+                    .get_canon(&self.txn_id, &key)
+                    .map(PendingValue::Committed)
+            };
+
+            if let Some(value) = value {
+                return Some((key, value.into()));
+            }
+        }
     }
 }
 
