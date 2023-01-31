@@ -51,6 +51,43 @@
 //!
 //! let value = map.try_get(3, &one).expect("read");
 //! assert_eq!(*(value.expect("guard")), 1.0);
+//!
+//! map.commit(3);
+//!
+//! let extension = [
+//!     ("one".to_string(), 1.0),
+//!     ("two".to_string(), 2.0),
+//!     ("three".to_string(), 3.0),
+//!     ("four".to_string(), 4.0),
+//!     ("five".to_string(), 5.0),
+//! ];
+//!
+//! map.try_extend(4, extension).expect("extend");
+//!
+//! for (key, mut value) in map.try_iter_mut(4).expect("iter") {
+//!     *value *= 2.;
+//! }
+//!
+//! // note: alphabetical order
+//! let expected = [
+//!     ("two".to_string(), 4.0),
+//!     ("three".to_string(), 6.0),
+//!     ("one".to_string(), 2.0),
+//!     ("four".to_string(), 8.0),
+//!     ("five".to_string(), 10.0),
+//! ];
+//!
+//! let actual = map.try_iter(4).expect("iter").rev().collect::<Vec<_>>();
+//! assert_eq!(actual.len(), expected.len());
+//!
+//! for ((lk, lv), (rk, rv)) in actual.into_iter().zip(&expected) {
+//!     assert_eq!(&*lk, rk);
+//!     assert_eq!(&*lv, rv);
+//! }
+//!
+//! let actual = map.try_clear(4).expect("clear");
+//! assert_eq!(actual, expected.into_iter().map(|(k, v)| (k.into(), v.into())).collect());
+//!
 //! ```
 
 use std::cmp::Ordering;
