@@ -126,6 +126,42 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
     }
 
     #[inline]
+    fn clear(&mut self, txn_id: I) -> BTreeMap<Arc<K>, Arc<V>> {
+        let mut map = self.canon.clone();
+
+        let committed =
+            self.committed
+                .iter()
+                .filter_map(|(id, version)| if id < &txn_id { version.as_ref() } else { None });
+
+        for version in committed {
+            for (key, delta) in version {
+                if let Some(value) = delta {
+                    map.insert(key.clone(), value.clone());
+                } else {
+                    map.remove(key);
+                }
+            }
+        }
+
+        if let Some(version) = self.pending.remove(&txn_id) {
+            for (key, delta) in version {
+                if let Some(value) = delta {
+                    let value = Arc::try_unwrap(value).expect("value");
+                    map.insert(key, Arc::new(value.into_inner()));
+                } else {
+                    map.remove(&key);
+                }
+            }
+        }
+
+        let version = map.keys().cloned().map(|key| (key, None)).collect();
+        self.pending.insert(txn_id, version);
+
+        map
+    }
+
+    #[inline]
     fn extend<Q, E>(&mut self, txn_id: I, other: E)
     where
         Q: Into<Arc<K>>,
@@ -473,6 +509,28 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
 
         self.semaphore.finalize(&txn_id, true);
         state.finalized = Some(txn_id);
+    }
+
+    /// Remove and return all entries from this [`TxnMapLock`] at `txn_id`.
+    pub async fn clear(&self, txn_id: I) -> Result<BTreeMap<Arc<K>, Arc<V>>> {
+        // before acquiring a permit, check if this version has already been committed
+        self.state().check_pending(&txn_id)?;
+
+        let _permit = self.semaphore.write(txn_id, Range::All).await?;
+
+        Ok(self.state_mut().clear(txn_id))
+    }
+
+    /// Remove and return all entries from this [`TxnMapLock`] at `txn_id`.
+    pub fn try_clear(&self, txn_id: I) -> Result<BTreeMap<Arc<K>, Arc<V>>> {
+        let mut state = self.state_mut();
+
+        // before acquiring a permit, check if this version has already been committed
+        state.check_pending(&txn_id)?;
+
+        let _permit = self.semaphore.try_write(txn_id, Range::All)?;
+
+        Ok(state.clear(txn_id))
     }
 
     /// Insert the entries from `other` [`TxnMapLock`] at `txn_id`.
