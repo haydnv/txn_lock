@@ -831,18 +831,43 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> Iterator for Iter<I, K, V> {
 
         loop {
             let key = self.keys.next()?;
-            let value = if self.permit.is_some() {
-                state.get_pending(&self.txn_id, &key)
-            } else {
-                state
-                    .get_canon(&self.txn_id, &key)
-                    .map(PendingValue::Committed)
-            };
-
+            let value = get_key(&state, &self.txn_id, &key, self.permit.is_none());
             if let Some(value) = value {
                 return Some((key, value.into()));
             }
         }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.keys.size_hint()
+    }
+}
+
+impl<I: Copy + Ord, K: Ord, V: fmt::Debug> DoubleEndedIterator for Iter<I, K, V> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let state = self.lock_state.read().expect("lock state");
+
+        loop {
+            let key = self.keys.next_back()?;
+            let value = get_key(&state, &self.txn_id, &key, self.permit.is_none());
+            if let Some(value) = value {
+                return Some((key, value.into()));
+            }
+        }
+    }
+}
+
+#[inline]
+fn get_key<I: Copy + Ord, K: Ord, V: fmt::Debug>(
+    state: &State<I, K, V>,
+    txn_id: &I,
+    key: &K,
+    committed: bool,
+) -> Option<PendingValue<V>> {
+    if committed {
+        state.get_canon(txn_id, &key).map(PendingValue::Committed)
+    } else {
+        state.get_pending(txn_id, &key)
     }
 }
 
@@ -918,6 +943,23 @@ impl<I: Copy + Ord, K: Ord, V: Clone + fmt::Debug> Iterator for IterMut<I, K, V>
 
         loop {
             let key = self.keys.next()?;
+            if let Some(guard) = state.get_mut(self.txn_id, key.clone()) {
+                return Some((key, TxnMapIterMutGuard::from(guard)));
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.keys.size_hint()
+    }
+}
+
+impl<I: Copy + Ord, K: Ord, V: Clone + fmt::Debug> DoubleEndedIterator for IterMut<I, K, V> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let mut state = self.lock_state.write().expect("lock state");
+
+        loop {
+            let key = self.keys.next_back()?;
             if let Some(guard) = state.get_mut(self.txn_id, key.clone()) {
                 return Some((key, TxnMapIterMutGuard::from(guard)));
             }

@@ -525,6 +525,16 @@ impl<T> Iterator for Iter<T> {
     fn next(&mut self) -> Option<Self::Item> {
         self.iter.next()
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
+}
+
+impl<T> DoubleEndedIterator for Iter<T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.iter.next_back()
+    }
 }
 
 #[inline]
