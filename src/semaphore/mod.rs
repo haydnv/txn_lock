@@ -158,12 +158,12 @@ impl<Idx: PartialOrd<Idx>> Overlaps<Range<Idx>> for Range<Idx> {
 
 /// A permit to read a specific section of a transactional resource
 #[derive(Debug)]
-pub struct Permit<R> {
+pub struct PermitRead<R> {
     permit: VersionPermit<R>,
     notify: Arc<Notify>,
 }
 
-impl<R> Deref for Permit<R> {
+impl<R> Deref for PermitRead<R> {
     type Target = R;
 
     fn deref(&self) -> &Self::Target {
@@ -171,7 +171,28 @@ impl<R> Deref for Permit<R> {
     }
 }
 
-impl<R> Drop for Permit<R> {
+impl<R> Drop for PermitRead<R> {
+    fn drop(&mut self) {
+        self.notify.notify_waiters()
+    }
+}
+
+/// A permit to write to a specific section of a transactional resource
+#[derive(Debug)]
+pub struct PermitWrite<R> {
+    permit: VersionPermit<R>,
+    notify: Arc<Notify>,
+}
+
+impl<R> Deref for PermitWrite<R> {
+    type Target = R;
+
+    fn deref(&self) -> &Self::Target {
+        self.permit.deref()
+    }
+}
+
+impl<R> Drop for PermitWrite<R> {
     fn drop(&mut self) {
         self.notify.notify_waiters()
     }
@@ -248,7 +269,7 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
     }
 
     /// Acquire a permit to read a section of a transactional resource, if possible.
-    pub async fn read(&self, mut txn_id: I, range: R) -> Result<Permit<R>> {
+    pub async fn read(&self, mut txn_id: I, range: R) -> Result<PermitRead<R>> {
         let mut range = Arc::new(range);
 
         loop {
@@ -258,7 +279,7 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
                     range = r;
                 }
                 VersionRead::Version(range, root) => {
-                    return Ok(Permit {
+                    return Ok(PermitRead {
                         permit: root.read(&range).await?,
                         notify: self.notify.clone(),
                     })
@@ -270,14 +291,14 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
     }
 
     /// Synchronously acquire a permit to read a section of transactional resource, if possible.
-    pub fn try_read(&self, txn_id: I, range: R) -> Result<Permit<R>> {
+    pub fn try_read(&self, txn_id: I, range: R) -> Result<PermitRead<R>> {
         let range = Arc::new(range);
 
         match self.read_inner(txn_id, range) {
             VersionRead::Pending(_, _) => Err(Error::WouldBlock),
             VersionRead::Version(range, root) => root
                 .try_read(&range)
-                .map(|permit| Permit {
+                .map(|permit| PermitRead {
                     permit,
                     notify: self.notify.clone(),
                 })
@@ -326,7 +347,7 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
     }
 
     /// Acquire a permit to write to a section of transactional resource, if possible.
-    pub async fn write(&self, mut txn_id: I, range: R) -> Result<Permit<R>> {
+    pub async fn write(&self, mut txn_id: I, range: R) -> Result<PermitWrite<R>> {
         let mut range = Arc::new(range);
 
         loop {
@@ -338,7 +359,7 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
                 VersionRead::Version(range, root) => {
                     let permit = root.write(&range).await?;
 
-                    return Ok(Permit {
+                    return Ok(PermitWrite {
                         permit,
                         notify: self.notify.clone(),
                     });
@@ -350,14 +371,14 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
     }
 
     /// Synchronously acquire a permit to write to a section of transactional resource, if possible.
-    pub fn try_write(&self, txn_id: I, range: R) -> Result<Permit<R>> {
+    pub fn try_write(&self, txn_id: I, range: R) -> Result<PermitWrite<R>> {
         let range = Arc::new(range);
 
         match self.write_inner(txn_id, range)? {
             VersionRead::Pending(_, _) => Err(Error::WouldBlock),
             VersionRead::Version(range, root) => root
                 .try_write(&range)
-                .map(|permit| Permit {
+                .map(|permit| PermitWrite {
                     permit,
                     notify: self.notify.clone(),
                 })

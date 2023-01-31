@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard};
 
-use super::semaphore::Permit;
+use super::semaphore::{PermitRead, PermitWrite};
 
 /// A permit to read a value in a pending read transaction
 #[derive(Debug)]
 pub struct PendingRead<R, T> {
     #[allow(unused)]
-    permit: Permit<R>,
+    permit: PermitRead<R>,
     value: Arc<T>,
 }
 
@@ -26,7 +26,7 @@ impl<R, T> Deref for PendingRead<R, T> {
 #[derive(Debug)]
 pub struct PendingWrite<R, T> {
     #[allow(unused)]
-    permit: Permit<R>,
+    permit: PermitRead<R>,
     value: OwnedRwLockReadGuard<T>,
 }
 
@@ -53,12 +53,12 @@ impl<R, T> TxnReadGuard<R, T> {
     }
 
     /// Construct a new [`TxnReadGuard`] for a value read as part of a pending transaction.
-    pub fn pending_read(permit: Permit<R>, value: Arc<T>) -> Self {
+    pub fn pending_read(permit: PermitRead<R>, value: Arc<T>) -> Self {
         Self::PendingRead(PendingRead { permit, value })
     }
 
     /// Construct a new [`TxnReadGuard`] for a value mutated as part of a pending transaction.
-    pub fn pending_write(permit: Permit<R>, value: OwnedRwLockReadGuard<T>) -> Self {
+    pub fn pending_write(permit: PermitRead<R>, value: OwnedRwLockReadGuard<T>) -> Self {
         Self::PendingWrite(PendingWrite { permit, value })
     }
 }
@@ -91,13 +91,13 @@ impl<R, T: PartialOrd> PartialOrd<T> for TxnReadGuard<R, T> {
 #[derive(Debug)]
 pub struct TxnWriteGuard<R, T> {
     #[allow(unused)]
-    permit: Permit<R>,
+    permit: PermitWrite<R>,
     value: OwnedRwLockWriteGuard<T>,
 }
 
 impl<R, T> TxnWriteGuard<R, T> {
     /// Construct a guard for a mutable value as part of a pending transaction.
-    pub fn new(permit: Permit<R>, value: OwnedRwLockWriteGuard<T>) -> Self {
+    pub fn new(permit: PermitWrite<R>, value: OwnedRwLockWriteGuard<T>) -> Self {
         Self { permit, value }
     }
 }

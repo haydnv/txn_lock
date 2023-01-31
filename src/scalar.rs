@@ -50,7 +50,7 @@ use std::task::Poll;
 use tokio::sync::RwLock;
 
 use super::guard::{TxnReadGuard, TxnWriteGuard};
-use super::semaphore::{Overlap, Overlaps, Permit, Semaphore};
+use super::semaphore::{Overlap, Overlaps, PermitRead, PermitWrite, Semaphore};
 use super::{Error, Result};
 
 /// A read guard on a [`TxnLock`]
@@ -59,7 +59,7 @@ pub type TxnLockReadGuard<T> = TxnReadGuard<Range, T>;
 /// A write guard on a [`TxnLock`]
 pub type TxnLockWriteGuard<T> = TxnWriteGuard<Range, T>;
 
-/// A range used to reserve a [`Permit`] to guard access to a [`TxnLock`]
+/// A range used to reserve a permit to guard access to a [`TxnLock`]
 #[derive(Debug)]
 pub struct Range;
 
@@ -128,7 +128,7 @@ impl<I: Ord, T> State<I, T> {
     }
 
     #[inline]
-    fn read_pending(&mut self, txn_id: &I, permit: Permit<Range>) -> TxnLockReadGuard<T> {
+    fn read_pending(&mut self, txn_id: &I, permit: PermitRead<Range>) -> TxnLockReadGuard<T> {
         if let Some(version) = self.pending.get(txn_id) {
             // the permit means it's safe to call try_read_owned().expect()
             let value = version.clone().try_read_owned().expect("version");
@@ -155,7 +155,7 @@ impl<I: Ord, T: Clone> State<I, T> {
     }
 
     #[inline]
-    fn write(&mut self, txn_id: I, permit: Permit<Range>) -> Result<TxnLockWriteGuard<T>> {
+    fn write(&mut self, txn_id: I, permit: PermitWrite<Range>) -> Result<TxnLockWriteGuard<T>> {
         // the permit means it's safe to call try_write_owned().expect()
         let value = self
             .get_or_create_version(txn_id)

@@ -54,7 +54,7 @@ use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
 use std::{fmt, iter};
 
-use super::semaphore::{Permit, Semaphore};
+use super::semaphore::{PermitRead, Semaphore};
 use super::{Error, Result};
 
 pub use super::range::Range;
@@ -506,12 +506,12 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
 /// An iterator over the values of a [`TxnSetLock`] as of a specific transactional version
 pub struct Iter<T> {
     #[allow(unused)]
-    permit: Option<Permit<Range<T>>>,
+    permit: Option<PermitRead<Range<T>>>,
     iter: <BTreeSet<Arc<T>> as IntoIterator>::IntoIter,
 }
 
 impl<T> Iter<T> {
-    fn new(permit: Option<Permit<Range<T>>>, set: BTreeSet<Arc<T>>) -> Self {
+    fn new(permit: Option<PermitRead<Range<T>>>, set: BTreeSet<Arc<T>>) -> Self {
         Self {
             permit,
             iter: set.into_iter(),

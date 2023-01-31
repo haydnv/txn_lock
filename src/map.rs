@@ -554,7 +554,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
             }
         }
 
-        let permit = self.semaphore.write(txn_id, Range::All).await?;
+        let permit = self.semaphore.read(txn_id, Range::All).await?;
         let keys = self.state().keys_pending(txn_id);
         return Ok(Iter::new(self.state.clone(), txn_id, Some(permit), keys));
     }
@@ -569,7 +569,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
             return Ok(Iter::new(self.state.clone(), txn_id, None, keys));
         }
 
-        let permit = self.semaphore.try_write(txn_id, Range::All)?;
+        let permit = self.semaphore.try_read(txn_id, Range::All)?;
         let keys = state.keys_pending(txn_id);
         return Ok(Iter::new(self.state.clone(), txn_id, Some(permit), keys));
     }
@@ -745,7 +745,7 @@ impl<V: PartialOrd> PartialOrd<V> for TxnMapIterGuard<V> {
 pub struct Iter<I, K, V> {
     lock_state: Arc<RwLockInner<State<I, K, V>>>,
     txn_id: I,
-    permit: Option<Permit<Range<K>>>,
+    permit: Option<PermitRead<Range<K>>>,
     keys: <BTreeSet<Arc<K>> as IntoIterator>::IntoIter,
 }
 
@@ -753,7 +753,7 @@ impl<I, K, V> Iter<I, K, V> {
     fn new(
         lock_state: Arc<RwLockInner<State<I, K, V>>>,
         txn_id: I,
-        permit: Option<Permit<Range<K>>>,
+        permit: Option<PermitRead<Range<K>>>,
         keys: BTreeSet<Arc<K>>,
     ) -> Self {
         Self {
@@ -832,7 +832,7 @@ pub struct IterMut<I, K, V> {
     txn_id: I,
 
     #[allow(unused)]
-    permit: Permit<Range<K>>,
+    permit: PermitWrite<Range<K>>,
     keys: <BTreeSet<Arc<K>> as IntoIterator>::IntoIter,
 }
 
@@ -840,7 +840,7 @@ impl<I, K, V> IterMut<I, K, V> {
     fn new(
         lock_state: Arc<RwLockInner<State<I, K, V>>>,
         txn_id: I,
-        permit: Permit<Range<K>>,
+        permit: PermitWrite<Range<K>>,
         keys: BTreeSet<Arc<K>>,
     ) -> Self {
         Self {
