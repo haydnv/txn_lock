@@ -57,7 +57,7 @@ use std::cmp::Ordering;
 use std::collections::btree_map::{BTreeMap, Entry};
 use std::collections::BTreeSet;
 use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
 use std::{fmt, iter};
 
@@ -361,7 +361,7 @@ fn merge_keys<K: Ord, V>(keys: &mut BTreeSet<Arc<K>>, version: &BTreeMap<Arc<K>,
 /// in order to support multiple transactions with different versions.
 // TODO: handle the case where a write permit is acquired and then dropped without committing
 pub struct TxnMapLock<I, K, V> {
-    state: Arc<Mutex<State<I, K, V>>>,
+    state: Arc<RwLockInner<State<I, K, V>>>,
     semaphore: Semaphore<I, Range<K>>,
 }
 
@@ -376,8 +376,13 @@ impl<I, K, V> Clone for TxnMapLock<I, K, V> {
 
 impl<I, K, V> TxnMapLock<I, K, V> {
     #[inline]
-    fn state(&self) -> MutexGuard<State<I, K, V>> {
-        self.state.lock().expect("lock state")
+    fn state(&self) -> impl Deref<Target = State<I, K, V>> + '_ {
+        self.state.read().expect("lock state")
+    }
+
+    #[inline]
+    fn state_mut(&self) -> impl DerefMut<Target = State<I, K, V>> + '_ {
+        self.state.write().expect("lock state")
     }
 }
 
@@ -385,7 +390,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
     /// Construct a new [`TxnMapLock`].
     pub fn new(txn_id: I) -> Self {
         Self {
-            state: Arc::new(Mutex::new(State::new(txn_id, Version::new()))),
+            state: Arc::new(RwLockInner::new(State::new(txn_id, Version::new()))),
             semaphore: Semaphore::new(),
         }
     }
@@ -398,7 +403,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
             .collect();
 
         Self {
-            state: Arc::new(Mutex::new(State::new(txn_id, version))),
+            state: Arc::new(RwLockInner::new(State::new(txn_id, version))),
             semaphore: Semaphore::with_reservation(txn_id, Range::All),
         }
     }
@@ -407,7 +412,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
     /// Panics:
     ///  - if any new value to commit is still locked (for reading or writing)
     pub fn commit(&self, txn_id: I) {
-        let mut state = self.state();
+        let mut state = self.state_mut();
 
         self.semaphore.finalize(&txn_id, false);
 
@@ -449,7 +454,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
     /// Finalize the state of this [`TxnMapLock`] at `txn_id`.
     /// This will merge in deltas and prevent further reads of versions earlier than `txn_id`.
     pub fn finalize(&self, txn_id: I) {
-        let mut state = self.state();
+        let mut state = self.state_mut();
 
         while let Some(version_id) = state.committed.keys().next().copied() {
             if version_id <= txn_id {
@@ -481,7 +486,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
 
         let _permit = self.semaphore.write(txn_id, Range::All).await?;
 
-        Ok(self.state().extend(txn_id, other))
+        Ok(self.state_mut().extend(txn_id, other))
     }
 
     /// Insert the entries from `other` [`TxnMapLock`] at `txn_id` synchronously, if possible.
@@ -490,7 +495,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
         Q: Into<Arc<K>>,
         E: IntoIterator<Item = (Q, V)>,
     {
-        let mut state = self.state();
+        let mut state = self.state_mut();
 
         // before acquiring a permit, check if this version has already been committed
         state.check_pending(&txn_id)?;
@@ -578,12 +583,12 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
         let range = Range::One(key.clone());
         let _permit = self.semaphore.write(txn_id, range).await?;
 
-        Ok(self.state().insert(txn_id, key, value))
+        Ok(self.state_mut().insert(txn_id, key, value))
     }
 
     /// Insert a new entry into this [`TxnMapLock`] at `txn_id` synchronously, if possible.
     pub fn try_insert<Q: Into<Arc<K>>>(&self, txn_id: I, key: Q, value: V) -> Result<()> {
-        let mut state = self.state();
+        let mut state = self.state_mut();
 
         // before acquiring a permit, check if this version has already been committed
         state.check_pending(&txn_id)?;
@@ -603,12 +608,12 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
         let range = Range::One(key.clone());
         let _permit = self.semaphore.write(txn_id, range).await?;
 
-        Ok(self.state().remove(txn_id, key))
+        Ok(self.state_mut().remove(txn_id, key))
     }
 
     /// Remove and return the value at `key` from this [`TxnMapLock`] at `txn_id`, if present.
     pub fn try_remove<Q: Into<Arc<K>>>(&self, txn_id: I, key: Q) -> Result<Option<Arc<V>>> {
-        let mut state = self.state();
+        let mut state = self.state_mut();
 
         // before acquiring a permit, check if this version has already been committed
         state.check_pending(&txn_id)?;
@@ -622,7 +627,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
 
     /// Roll back the state of this [`TxnMapLock`] at `txn_id`.
     pub fn rollback(&self, txn_id: &I) {
-        let mut state = self.state();
+        let mut state = self.state_mut();
 
         assert!(
             !state.committed.contains_key(&txn_id),
@@ -649,7 +654,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: Clone + fmt::Debug> T
         let range = Range::One(key.clone());
         let permit = self.semaphore.write(txn_id, range).await?;
 
-        if let Some(value) = self.state().get_mut(txn_id, key) {
+        if let Some(value) = self.state_mut().get_mut(txn_id, key) {
             Ok(Some(TxnMapValueWriteGuard::new(permit, value)))
         } else {
             Ok(None)
@@ -662,7 +667,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: Clone + fmt::Debug> T
         txn_id: I,
         key: Q,
     ) -> Result<Option<TxnMapValueWriteGuard<K, V>>> {
-        let mut state = self.state();
+        let mut state = self.state_mut();
 
         // before acquiring a permit, check if this version has already been committed
         state.check_pending(&txn_id)?;
@@ -684,7 +689,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: Clone + fmt::Debug> T
 
         let permit = self.semaphore.write(txn_id, Range::All).await?;
         let keys = self.state().keys_pending(txn_id);
-        Ok(IterMut::new(txn_id, permit, self.state.clone(), keys))
+        Ok(IterMut::new(self.state.clone(), txn_id, permit, keys))
     }
 
     /// Construct a mutable iterator over the entries in this [`TxnMapLock`] at `txn_id`,
@@ -697,7 +702,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: Clone + fmt::Debug> T
 
         let permit = self.semaphore.try_write(txn_id, Range::All)?;
         let keys = state.keys_pending(txn_id);
-        Ok(IterMut::new(txn_id, permit, self.state.clone(), keys))
+        Ok(IterMut::new(self.state.clone(), txn_id, permit, keys))
     }
 }
 
@@ -738,7 +743,7 @@ impl<V: PartialOrd> PartialOrd<V> for TxnMapIterGuard<V> {
 
 /// An iterator over the entries in a [`TxnMapLock`] as of a specific transaction
 pub struct Iter<I, K, V> {
-    lock_state: Arc<Mutex<State<I, K, V>>>,
+    lock_state: Arc<RwLockInner<State<I, K, V>>>,
     txn_id: I,
     permit: Option<Permit<Range<K>>>,
     keys: <BTreeSet<Arc<K>> as IntoIterator>::IntoIter,
@@ -746,7 +751,7 @@ pub struct Iter<I, K, V> {
 
 impl<I, K, V> Iter<I, K, V> {
     fn new(
-        lock_state: Arc<Mutex<State<I, K, V>>>,
+        lock_state: Arc<RwLockInner<State<I, K, V>>>,
         txn_id: I,
         permit: Option<Permit<Range<K>>>,
         keys: BTreeSet<Arc<K>>,
@@ -764,7 +769,7 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> Iterator for Iter<I, K, V> {
     type Item = (Arc<K>, TxnMapIterGuard<V>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let state = self.lock_state.lock().expect("lock state");
+        let state = self.lock_state.read().expect("lock state");
 
         loop {
             let key = self.keys.next()?;
@@ -823,25 +828,25 @@ impl<V> From<OwnedRwLockWriteGuard<V>> for TxnMapIterMutGuard<V> {
 
 /// An iterator over the keys and mutable values in a [`TxnMapLock`]
 pub struct IterMut<I, K, V> {
+    lock_state: Arc<RwLockInner<State<I, K, V>>>,
     txn_id: I,
 
     #[allow(unused)]
     permit: Permit<Range<K>>,
-    lock_state: Arc<Mutex<State<I, K, V>>>,
     keys: <BTreeSet<Arc<K>> as IntoIterator>::IntoIter,
 }
 
 impl<I, K, V> IterMut<I, K, V> {
     fn new(
+        lock_state: Arc<RwLockInner<State<I, K, V>>>,
         txn_id: I,
         permit: Permit<Range<K>>,
-        lock_state: Arc<Mutex<State<I, K, V>>>,
         keys: BTreeSet<Arc<K>>,
     ) -> Self {
         Self {
+            lock_state,
             txn_id,
             permit,
-            lock_state,
             keys: keys.into_iter(),
         }
     }
@@ -851,7 +856,7 @@ impl<I: Copy + Ord, K: Ord, V: Clone + fmt::Debug> Iterator for IterMut<I, K, V>
     type Item = (Arc<K>, TxnMapIterMutGuard<V>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut state = self.lock_state.lock().expect("lock state");
+        let mut state = self.lock_state.write().expect("lock state");
 
         loop {
             let key = self.keys.next()?;

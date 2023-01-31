@@ -49,7 +49,8 @@
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
 use std::{fmt, iter};
 
@@ -210,7 +211,7 @@ fn contains_canon<I: Ord, T: Ord>(
 /// A futures-aware read-write lock on a [`BTreeSet`] which supports transactional versioning.
 // TODO: handle the case where a write permit is acquired and then dropped without committing
 pub struct TxnSetLock<I, T> {
-    state: Arc<Mutex<State<I, T>>>,
+    state: Arc<RwLockInner<State<I, T>>>,
     semaphore: Semaphore<I, Range<T>>,
 }
 
@@ -225,8 +226,13 @@ impl<I, T> Clone for TxnSetLock<I, T> {
 
 impl<I, T> TxnSetLock<I, T> {
     #[inline]
-    fn state(&self) -> MutexGuard<State<I, T>> {
-        self.state.lock().expect("lock state")
+    fn state(&self) -> impl Deref<Target = State<I, T>> + '_ {
+        self.state.read().expect("lock state")
+    }
+
+    #[inline]
+    fn state_mut(&self) -> impl DerefMut<Target = State<I, T>> + '_ {
+        self.state.write().expect("lock state")
     }
 }
 
@@ -234,14 +240,14 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
     /// Construct a new, empty [`TxnSetLock`].
     pub fn new(txn_id: I) -> Self {
         Self {
-            state: Arc::new(Mutex::new(State::new(txn_id, BTreeSet::new()))),
+            state: Arc::new(RwLockInner::new(State::new(txn_id, BTreeSet::new()))),
             semaphore: Semaphore::new(),
         }
     }
 
     /// Commit the state of this [`TxnSetLock`] at `txn_id`.
     pub fn commit(&self, txn_id: I) {
-        let mut state = self.state();
+        let mut state = self.state_mut();
 
         self.semaphore.finalize(&txn_id, false);
 
@@ -266,7 +272,7 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
     /// Finalize the state of this [`TxnSetLock`] at `txn_id`.
     /// This will merge in deltas and prevent further reads of versions earlier than `txn_id`.
     pub fn finalize(&self, txn_id: I) {
-        let mut state = self.state();
+        let mut state = self.state_mut();
 
         while let Some(version_id) = state.committed.keys().next().copied() {
             if version_id <= txn_id {
@@ -291,7 +297,7 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
         let version = contents.into_iter().map(Arc::new).collect();
 
         Self {
-            state: Arc::new(Mutex::new(State::new(txn_id, version))),
+            state: Arc::new(RwLockInner::new(State::new(txn_id, version))),
             semaphore: Semaphore::with_reservation(txn_id, Range::All),
         }
     }
@@ -328,7 +334,7 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
 
         let _permit = self.semaphore.write(txn_id, Range::All).await?;
 
-        let mut state = self.state();
+        let mut state = self.state_mut();
         if let Some(version) = state.pending.get(&txn_id) {
             merge(&mut set, version);
         }
@@ -342,7 +348,7 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
 
     /// Remove and return all keys in this [`TxnSetLock`] at `txn_id` synchronously, if possible.
     pub fn try_clear(&self, txn_id: I) -> Result<BTreeSet<Arc<T>>> {
-        let mut state = self.state();
+        let mut state = self.state_mut();
         let (mut set, committed) = state.canon(&txn_id);
 
         if committed {
@@ -372,7 +378,7 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
         self.state().check_pending(&txn_id)?;
 
         let _permit = self.semaphore.write(txn_id, Range::All).await?;
-        let mut state = self.state();
+        let mut state = self.state_mut();
         for key in other {
             state.insert(txn_id, key.into());
         }
@@ -386,7 +392,7 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
         K: Into<Arc<T>>,
         E: IntoIterator<Item = K>,
     {
-        let mut state = self.state();
+        let mut state = self.state_mut();
 
         // before acquiring a permit, check if this version has already been committed
         state.check_pending(&txn_id)?;
@@ -443,12 +449,12 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
         let key = key.into();
         let range = Range::One(key.clone());
         let _permit = self.semaphore.write(txn_id, range).await?;
-        Ok(self.state().insert(txn_id, key))
+        Ok(self.state_mut().insert(txn_id, key))
     }
 
     /// Insert a new `key` into this [`TxnSetLock`] at `txn_id` synchronously, if possible.
     pub fn try_insert<K: Into<Arc<T>>>(&self, txn_id: I, key: K) -> Result<()> {
-        let mut state = self.state();
+        let mut state = self.state_mut();
 
         // before acquiring a permit, check if this version has already been committed
         state.check_pending(&txn_id)?;
@@ -466,12 +472,12 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
         let key = key.into();
         let range = Range::One(key.clone());
         let _permit = self.semaphore.try_write(txn_id, range)?;
-        Ok(self.state().remove(txn_id, key))
+        Ok(self.state_mut().remove(txn_id, key))
     }
 
     /// Remove a `key` into this [`TxnSetLock`] at `txn_id` and return `true` if it was present.
     pub fn try_remove<K: Into<Arc<T>>>(&self, txn_id: I, key: K) -> Result<bool> {
-        let mut state = self.state();
+        let mut state = self.state_mut();
 
         // before acquiring a permit, check if this version has already been committed
         state.check_pending(&txn_id)?;
@@ -484,7 +490,7 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
 
     /// Roll back the state of this [`TxnSetLock`] at `txn_id`.
     pub fn rollback(&self, txn_id: &I) {
-        let mut state = self.state();
+        let mut state = self.state_mut();
 
         assert!(
             !state.committed.contains_key(&txn_id),

@@ -43,7 +43,8 @@
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
 
 use tokio::sync::RwLock;
@@ -174,7 +175,7 @@ impl<I: Ord, T: Clone> State<I, T> {
 /// [`Clone::clone`] is called once when [`TxnLock::write`] is called with a valid new `txn_id`.
 // TODO: handle the case where a write permit is acquired and then dropped without committing
 pub struct TxnLock<I, T> {
-    state: Arc<Mutex<State<I, T>>>,
+    state: Arc<RwLockInner<State<I, T>>>,
     semaphore: Semaphore<I, Range>,
 }
 
@@ -189,8 +190,13 @@ impl<I, T> Clone for TxnLock<I, T> {
 
 impl<I, T> TxnLock<I, T> {
     #[inline]
-    fn state(&self) -> MutexGuard<State<I, T>> {
-        self.state.lock().expect("lock state")
+    fn state(&self) -> impl Deref<Target = State<I, T>> + '_ {
+        self.state.read().expect("read lock state")
+    }
+
+    #[inline]
+    fn state_mut(&self) -> impl DerefMut<Target = State<I, T>> + '_ {
+        self.state.write().expect("write lock state")
     }
 }
 
@@ -198,14 +204,14 @@ impl<I: Copy + Ord + fmt::Display, T: fmt::Debug> TxnLock<I, T> {
     /// Construct a new [`TxnLock`].
     pub fn new(canon: T) -> Self {
         Self {
-            state: Arc::new(Mutex::new(State::new(canon))),
+            state: Arc::new(RwLockInner::new(State::new(canon))),
             semaphore: Semaphore::new(),
         }
     }
 
     /// Commit the state of this [`TxnLock`] at `txn_id`.
     pub fn commit(&self, txn_id: I) {
-        let mut state = self.state();
+        let mut state = self.state_mut();
 
         self.semaphore.finalize(&txn_id, false);
 
@@ -232,7 +238,7 @@ impl<I: Copy + Ord + fmt::Display, T: fmt::Debug> TxnLock<I, T> {
     /// Finalize the state of this [`TxnLock`] at `txn_id`.
     /// This will merge in deltas and prevent further reads of versions earlier than `txn_id`.
     pub fn finalize(&self, txn_id: I) {
-        let mut state = self.state();
+        let mut state = self.state_mut();
 
         while let Some(version_id) = state.committed.keys().next().copied() {
             if version_id <= txn_id {
@@ -256,7 +262,7 @@ impl<I: Copy + Ord + fmt::Display, T: fmt::Debug> TxnLock<I, T> {
         }
 
         let permit = self.semaphore.read(txn_id, Range).await?;
-        Ok(self.state().read_pending(&txn_id, permit))
+        Ok(self.state_mut().read_pending(&txn_id, permit))
     }
 
     /// Acquire a read lock for this value at `txn_id` synchronously, if possible.
@@ -267,12 +273,12 @@ impl<I: Copy + Ord + fmt::Display, T: fmt::Debug> TxnLock<I, T> {
         }
 
         let permit = self.semaphore.try_read(txn_id, Range)?;
-        Ok(self.state().read_pending(&txn_id, permit))
+        Ok(self.state_mut().read_pending(&txn_id, permit))
     }
 
     /// Roll back the state of this [`TxnLock`] at `txn_id`.
     pub fn rollback(&self, txn_id: &I) {
-        let mut state = self.state();
+        let mut state = self.state_mut();
 
         assert!(
             !state.committed.contains_key(&txn_id),
@@ -292,7 +298,7 @@ impl<I: Copy + Ord, T: Clone + fmt::Debug> TxnLock<I, T> {
         self.state().check_pending(&txn_id)?;
 
         let permit = self.semaphore.write(txn_id, Range).await?;
-        self.state().write(txn_id, permit)
+        self.state_mut().write(txn_id, permit)
     }
 
     /// Acquire a write lock for this value at `txn_id` synchronously, if possible.
@@ -301,6 +307,6 @@ impl<I: Copy + Ord, T: Clone + fmt::Debug> TxnLock<I, T> {
         self.state().check_pending(&txn_id)?;
 
         let permit = self.semaphore.try_write(txn_id, Range)?;
-        self.state().write(txn_id, permit)
+        self.state_mut().write(txn_id, permit)
     }
 }
