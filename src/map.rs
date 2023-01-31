@@ -53,7 +53,10 @@
 //! assert_eq!(*(value.expect("guard")), 1.0);
 //! ```
 
+use std::cmp::Ordering;
 use std::collections::btree_map::{BTreeMap, Entry};
+use std::collections::{BTreeSet, VecDeque};
+use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
 use std::{fmt, iter};
@@ -211,12 +214,7 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
 
 impl<I: Copy + Ord, K: Ord, V: Clone + fmt::Debug> State<I, K, V> {
     #[inline]
-    fn get_mut(
-        &mut self,
-        txn_id: I,
-        key: Arc<K>,
-        permit: Permit<Range<K>>,
-    ) -> Option<TxnMapValueWriteGuard<K, V>> {
+    fn get_mut(&mut self, txn_id: I, key: Arc<K>) -> Option<OwnedRwLockWriteGuard<V>> {
         #[inline]
         fn new_value<V: Clone>(canon: &V) -> (Arc<RwLock<V>>, OwnedRwLockWriteGuard<V>) {
             let value = V::clone(canon);
@@ -230,9 +228,11 @@ impl<I: Copy + Ord, K: Ord, V: Clone + fmt::Debug> State<I, K, V> {
                 Entry::Occupied(delta) => {
                     let value = delta.get().as_ref()?;
 
-                    // the permit means it's safe to call try_write_owned().expect()
-                    let guard = value.clone().try_write_owned().expect("write version");
-                    Some(TxnMapValueWriteGuard::new(permit, guard))
+                    value
+                        .clone()
+                        .try_write_owned()
+                        .map(Some)
+                        .expect("write version")
                 }
                 Entry::Vacant(delta) => {
                     let canon = get_canon(&self.canon, &self.committed, &txn_id, delta.key())?;
@@ -240,7 +240,7 @@ impl<I: Copy + Ord, K: Ord, V: Clone + fmt::Debug> State<I, K, V> {
 
                     delta.insert(Some(value));
 
-                    Some(TxnMapValueWriteGuard::new(permit, guard))
+                    Some(guard)
                 }
             },
             Entry::Vacant(pending) => {
@@ -250,9 +250,56 @@ impl<I: Copy + Ord, K: Ord, V: Clone + fmt::Debug> State<I, K, V> {
                 let version = iter::once((key, Some(value))).collect();
                 pending.insert(version);
 
-                Some(TxnMapValueWriteGuard::new(permit, guard))
+                Some(guard)
             }
         }
+    }
+
+    #[inline]
+    fn iter_mut(&mut self, txn_id: I, permit: Permit<Range<K>>) -> IterMut<K, V> {
+        let mut keys: BTreeSet<Arc<K>> = self.canon.keys().cloned().collect();
+
+        let committed = self.committed.iter().filter_map(|(id, version)| {
+            if id <= &txn_id {
+                version.as_ref()
+            } else {
+                None
+            }
+        });
+
+        #[inline]
+        fn merge_keys<K: Ord, V>(
+            keys: &mut BTreeSet<Arc<K>>,
+            version: &BTreeMap<Arc<K>, Option<V>>,
+        ) {
+            for (key, delta) in version {
+                if delta.is_some() {
+                    keys.insert(key.clone());
+                } else {
+                    keys.remove(key);
+                }
+            }
+        }
+
+        for version in committed {
+            merge_keys(&mut keys, version);
+        }
+
+        if let Some(pending) = self.pending.get(&txn_id) {
+            merge_keys(&mut keys, pending);
+        }
+
+        let values = keys
+            .into_iter()
+            .map(|key| {
+                self.get_mut(txn_id, key.clone())
+                    .map(TxnMapIterMutGuard::from)
+                    .map(|guard| (key, guard))
+                    .expect("mutable entry")
+            })
+            .collect();
+
+        IterMut { permit, values }
     }
 }
 
@@ -492,7 +539,11 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: Clone + fmt::Debug> T
         let range = Range::One(key.clone());
         let permit = self.semaphore.write(txn_id, range).await?;
 
-        Ok(self.state().get_mut(txn_id, key, permit))
+        if let Some(value) = self.state().get_mut(txn_id, key) {
+            Ok(Some(TxnMapValueWriteGuard::new(permit, value)))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Read a mutable value from this [`TxnMapLock`] at `txn_id`.
@@ -508,6 +559,85 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: Clone + fmt::Debug> T
 
         let permit = self.semaphore.try_write(txn_id, Range::One(key.clone()))?;
 
-        Ok(state.get_mut(txn_id, key, permit))
+        if let Some(value) = state.get_mut(txn_id, key) {
+            Ok(Some(TxnMapValueWriteGuard::new(permit, value)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Construct a mutable iterator over the entries in this [`TxnMapLock`] at `txn_id`.
+    pub async fn iter_mut(&self, txn_id: I) -> Result<IterMut<K, V>> {
+        // before acquiring a permit, check if this version has already been committed
+        self.state().check_pending(&txn_id)?;
+
+        let permit = self.semaphore.write(txn_id, Range::All).await?;
+        let mut state = self.state();
+        Ok(state.iter_mut(txn_id, permit))
+    }
+
+    /// Construct a mutable iterator over the entries in this [`TxnMapLock`] at `txn_id`,
+    /// synchronously if possible.
+    pub fn try_iter_mut(&self, txn_id: I) -> Result<IterMut<K, V>> {
+        let mut state = self.state();
+
+        // before acquiring a permit, check if this version has already been committed
+        state.check_pending(&txn_id)?;
+
+        let permit = self.semaphore.try_write(txn_id, Range::All)?;
+        Ok(state.iter_mut(txn_id, permit))
+    }
+}
+
+/// A guard on a mutable value in an [`IterMut`]
+#[derive(Debug)]
+pub struct TxnMapIterMutGuard<V> {
+    guard: OwnedRwLockWriteGuard<V>,
+}
+
+impl<V> Deref for TxnMapIterMutGuard<V> {
+    type Target = V;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard.deref()
+    }
+}
+
+impl<V> DerefMut for TxnMapIterMutGuard<V> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard.deref_mut()
+    }
+}
+
+impl<V: PartialEq> PartialEq<V> for TxnMapIterMutGuard<V> {
+    fn eq(&self, other: &V) -> bool {
+        self.deref().eq(other)
+    }
+}
+
+impl<V: PartialOrd> PartialOrd<V> for TxnMapIterMutGuard<V> {
+    fn partial_cmp(&self, other: &V) -> Option<Ordering> {
+        self.deref().partial_cmp(other)
+    }
+}
+
+impl<V> From<OwnedRwLockWriteGuard<V>> for TxnMapIterMutGuard<V> {
+    fn from(guard: OwnedRwLockWriteGuard<V>) -> Self {
+        Self { guard }
+    }
+}
+
+/// An iterator over the keys and mutable values in a [`TxnMapLock`]
+pub struct IterMut<K, V> {
+    #[allow(unused)]
+    permit: Permit<Range<K>>,
+    values: VecDeque<(Arc<K>, TxnMapIterMutGuard<V>)>,
+}
+
+impl<K, V> Iterator for IterMut<K, V> {
+    type Item = (Arc<K>, TxnMapIterMutGuard<V>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.values.pop_front()
     }
 }
