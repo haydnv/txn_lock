@@ -2,7 +2,7 @@
 //!
 //! Example usage:
 //! ```
-//! use std::collections::HashSet;
+//! use std::collections::BTreeSet;
 //! use std::sync::Arc;
 //! use futures::executor::block_on;
 //!
@@ -19,6 +19,7 @@
 //! assert!(set.try_contains(1, &one).expect("contains"));
 //! assert_eq!(set.try_insert(2, one.clone()).unwrap_err(), Error::WouldBlock);
 //! set.commit(1);
+//!
 //! assert!(set.try_contains(2, &one).expect("contains"));
 //! assert_eq!(block_on(set.iter(2)).expect("iter").collect::<Vec<Arc<String>>>(), vec![one.clone()]);
 //! assert!(block_on(set.remove(2, one.clone())).expect("remove"));
@@ -28,6 +29,7 @@
 //! assert!(!set.try_remove(2, two.clone()).expect("remove"));
 //! set.try_insert(2, two.clone()).expect("insert");
 //! set.finalize(2);
+//!
 //! assert_eq!(set.try_contains(1, &one).unwrap_err(), Error::Outdated);
 //! assert!(set.try_contains(3, &one).expect("contains"));
 //! assert!(set.try_remove(3, one.clone()).expect("remove"));
@@ -35,14 +37,14 @@
 //! assert!(!set.try_remove(3, two).expect("remove"));
 //! set.commit(3);
 //!
-//! let new_values: HashSet<Arc<String>> = ["one", "two", "three", "four"]
+//! let new_values: BTreeSet<Arc<String>> = ["one", "two", "three", "four"]
 //!     .into_iter()
 //!     .map(String::from)
 //!     .map(Arc::from)
 //!     .collect();
 //!
 //! set.try_extend(4, new_values.clone()).expect("extend");
-//! assert_eq!(new_values, set.try_iter(4).expect("iter").collect());
+//! assert_eq!(new_values, set.try_clear(4).expect("clear"));
 //! ```
 
 use std::collections::btree_map::Entry;
@@ -316,11 +318,55 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
         Ok(self.state().contains_pending(&txn_id, key))
     }
 
+    /// Remove and return all keys in this [`TxnSetLock`] at `txn_id`.
+    pub async fn clear(&self, txn_id: I) -> Result<BTreeSet<Arc<T>>> {
+        let (mut set, committed) = self.state().canon(&txn_id);
+
+        if committed {
+            return Err(Error::Committed);
+        }
+
+        let _permit = self.semaphore.write(txn_id, Range::All).await?;
+
+        let mut state = self.state();
+        if let Some(version) = state.pending.get(&txn_id) {
+            merge(&mut set, version);
+        }
+
+        for key in set.iter().cloned() {
+            state.remove(txn_id, key);
+        }
+
+        return Ok(set);
+    }
+
+    /// Remove and return all keys in this [`TxnSetLock`] at `txn_id` synchronously, if possible.
+    pub fn try_clear(&self, txn_id: I) -> Result<BTreeSet<Arc<T>>> {
+        let mut state = self.state();
+        let (mut set, committed) = state.canon(&txn_id);
+
+        if committed {
+            return Err(Error::Committed);
+        }
+
+        let _permit = self.semaphore.try_write(txn_id, Range::All)?;
+
+        if let Some(version) = state.pending.get(&txn_id) {
+            merge(&mut set, version);
+        }
+
+        for key in set.iter().cloned() {
+            state.remove(txn_id, key);
+        }
+
+        return Ok(set);
+    }
+
     /// Insert the `other` keys into this [`TxnSetLock`] at `txn_id`.
-    pub async fn extend<O, E>(&self, txn_id: I, other: E) -> Result<()>
+    pub async fn extend<K, E>(&self, txn_id: I, other: E) -> Result<()>
     where
-        O: Into<Arc<T>>,
-        E: IntoIterator<Item = O>,
+        K: Into<Arc<T>>,
+        E: IntoIterator<Item = K>,
     {
         // before acquiring a permit, check if this version has already been committed
         self.state().check_pending(&txn_id)?;
@@ -335,10 +381,10 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
     }
 
     /// Insert the `other` keys into this [`TxnSetLock`] at `txn_id` synchronously, if possible.
-    pub fn try_extend<O, E>(&self, txn_id: I, other: E) -> Result<()>
+    pub fn try_extend<K, E>(&self, txn_id: I, other: E) -> Result<()>
     where
-        O: Into<Arc<T>>,
-        E: IntoIterator<Item = O>,
+        K: Into<Arc<T>>,
+        E: IntoIterator<Item = K>,
     {
         let mut state = self.state();
 
@@ -390,43 +436,47 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
     }
 
     /// Insert a new `key` into this [`TxnSetLock`] at `txn_id`.
-    pub async fn insert(&self, txn_id: I, key: Arc<T>) -> Result<()> {
+    pub async fn insert<K: Into<Arc<T>>>(&self, txn_id: I, key: K) -> Result<()> {
         // before acquiring a permit, check if this version has already been committed
         self.state().check_pending(&txn_id)?;
 
+        let key = key.into();
         let range = Range::One(key.clone());
         let _permit = self.semaphore.write(txn_id, range).await?;
         Ok(self.state().insert(txn_id, key))
     }
 
     /// Insert a new `key` into this [`TxnSetLock`] at `txn_id` synchronously, if possible.
-    pub fn try_insert(&self, txn_id: I, key: Arc<T>) -> Result<()> {
+    pub fn try_insert<K: Into<Arc<T>>>(&self, txn_id: I, key: K) -> Result<()> {
         let mut state = self.state();
 
         // before acquiring a permit, check if this version has already been committed
         state.check_pending(&txn_id)?;
 
+        let key = key.into();
         let _permit = self.semaphore.try_write(txn_id, Range::One(key.clone()))?;
         Ok(state.insert(txn_id, key))
     }
 
     /// Remove a `key` into this [`TxnSetLock`] at `txn_id` and return `true` if it was present.
-    pub async fn remove(&self, txn_id: I, key: Arc<T>) -> Result<bool> {
+    pub async fn remove<K: Into<Arc<T>>>(&self, txn_id: I, key: K) -> Result<bool> {
         // before acquiring a permit, check if this version has already been committed
         self.state().check_pending(&txn_id)?;
 
+        let key = key.into();
         let range = Range::One(key.clone());
         let _permit = self.semaphore.try_write(txn_id, range)?;
         Ok(self.state().remove(txn_id, key))
     }
 
     /// Remove a `key` into this [`TxnSetLock`] at `txn_id` and return `true` if it was present.
-    pub fn try_remove(&self, txn_id: I, key: Arc<T>) -> Result<bool> {
+    pub fn try_remove<K: Into<Arc<T>>>(&self, txn_id: I, key: K) -> Result<bool> {
         let mut state = self.state();
 
         // before acquiring a permit, check if this version has already been committed
         state.check_pending(&txn_id)?;
 
+        let key = key.into();
         let range = Range::One(key.clone());
         let _permit = self.semaphore.try_write(txn_id, range)?;
         Ok(state.remove(txn_id, key))
