@@ -2,6 +2,7 @@
 //!
 //! Example usage:
 //! ```
+//! use std::collections::HashSet;
 //! use std::sync::Arc;
 //! use futures::executor::block_on;
 //!
@@ -33,7 +34,15 @@
 //! assert!(!set.try_remove(3, one).expect("remove"));
 //! assert!(!set.try_remove(3, two).expect("remove"));
 //! set.commit(3);
-//! assert_eq!(set.try_iter(4).expect("iter").collect::<Vec<Arc<String>>>(), vec![]);
+//!
+//! let new_values: HashSet<Arc<String>> = ["one", "two", "three", "four"]
+//!     .into_iter()
+//!     .map(String::from)
+//!     .map(Arc::from)
+//!     .collect();
+//!
+//! set.try_extend(4, new_values.clone()).expect("extend");
+//! assert_eq!(new_values, set.try_iter(4).expect("iter").collect());
 //! ```
 
 use std::collections::btree_map::Entry;
@@ -305,6 +314,43 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
 
         let _permit = self.semaphore.try_read(txn_id, Range::One(key.clone()))?;
         Ok(self.state().contains_pending(&txn_id, key))
+    }
+
+    /// Insert the `other` keys into this [`TxnSetLock`] at `txn_id`.
+    pub async fn extend<O, E>(&self, txn_id: I, other: E) -> Result<()>
+    where
+        O: Into<Arc<T>>,
+        E: IntoIterator<Item = O>,
+    {
+        // before acquiring a permit, check if this version has already been committed
+        self.state().check_pending(&txn_id)?;
+
+        let _permit = self.semaphore.write(txn_id, Range::All).await?;
+        let mut state = self.state();
+        for key in other {
+            state.insert(txn_id, key.into());
+        }
+
+        Ok(())
+    }
+
+    /// Insert the `other` keys into this [`TxnSetLock`] at `txn_id` synchronously, if possible.
+    pub fn try_extend<O, E>(&self, txn_id: I, other: E) -> Result<()>
+    where
+        O: Into<Arc<T>>,
+        E: IntoIterator<Item = O>,
+    {
+        let mut state = self.state();
+
+        // before acquiring a permit, check if this version has already been committed
+        state.check_pending(&txn_id)?;
+
+        let _permit = self.semaphore.try_write(txn_id, Range::All)?;
+        for key in other {
+            state.insert(txn_id, key.into());
+        }
+
+        Ok(())
     }
 
     /// Construct an iterator over this [`TxnSetLock`] at `txn_id`.
