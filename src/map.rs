@@ -113,8 +113,9 @@ pub type TxnMapValueReadGuard<K, V> = TxnReadGuard<Range<K>, V>;
 pub type TxnMapValueWriteGuard<K, V> = TxnWriteGuard<Range<K>, V>;
 
 type Canon<K, V> = BTreeMap<Arc<K>, Arc<V>>;
-type Committed<I, K, V> = BTreeMap<I, Option<BTreeMap<Arc<K>, Option<Arc<V>>>>>;
-type Version<K, V> = BTreeMap<Arc<K>, Option<Arc<RwLock<V>>>>;
+type Delta<K, V> = BTreeMap<Arc<K>, Option<Arc<V>>>;
+type Committed<I, K, V> = BTreeMap<I, Option<Delta<K, V>>>;
+type Pending<K, V> = BTreeMap<Arc<K>, Option<Arc<RwLock<V>>>>;
 
 #[derive(Debug)]
 enum PendingValue<V> {
@@ -125,13 +126,13 @@ enum PendingValue<V> {
 struct State<I, K, V> {
     canon: Canon<K, V>,
     committed: Committed<I, K, V>,
-    pending: BTreeMap<I, Version<K, V>>,
+    pending: BTreeMap<I, Pending<K, V>>,
     finalized: Option<I>,
 }
 
 impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
     #[inline]
-    fn new(txn_id: I, version: Version<K, V>) -> Self {
+    fn new(txn_id: I, version: Pending<K, V>) -> Self {
         Self {
             canon: BTreeMap::new(),
             committed: BTreeMap::new(),
@@ -142,18 +143,16 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
 
     #[inline]
     fn check_committed(&self, txn_id: &I) -> Result<bool> {
-        if self.finalized.as_ref() >= Some(txn_id) {
-            Err(Error::Outdated)
-        } else if self.committed.contains_key(txn_id) {
-            Ok(true)
-        } else {
-            Ok(false)
+        match self.finalized.as_ref().cmp(&Some(txn_id)) {
+            Ordering::Greater => Err(Error::Outdated),
+            Ordering::Equal => Ok(true),
+            Ordering::Less => Ok(self.committed.contains_key(txn_id)),
         }
     }
 
     #[inline]
     fn check_pending(&self, txn_id: &I) -> Result<()> {
-        if self.finalized.as_ref() >= Some(txn_id) {
+        if self.finalized.as_ref() > Some(txn_id) {
             Err(Error::Outdated)
         } else if self.committed.contains_key(txn_id) {
             Err(Error::Committed)
@@ -163,7 +162,7 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
     }
 
     #[inline]
-    fn clear(&mut self, txn_id: I) -> BTreeMap<Arc<K>, Arc<V>> {
+    fn clear(&mut self, txn_id: I) -> Canon<K, V> {
         let mut map = self.canon.clone();
 
         let committed =
@@ -171,8 +170,8 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
                 .iter()
                 .filter_map(|(id, version)| if id < &txn_id { version.as_ref() } else { None });
 
-        for version in committed {
-            for (key, delta) in version {
+        for deltas in committed {
+            for (key, delta) in deltas {
                 if let Some(value) = delta {
                     map.insert(key.clone(), value.clone());
                 } else {
@@ -264,7 +263,7 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
     fn insert(&mut self, txn_id: I, key: Arc<K>, value: V) {
         #[inline]
         fn insert_entry<K: Ord, V>(
-            version: &mut Version<K, V>,
+            version: &mut Pending<K, V>,
             key: Arc<K>,
             value: Arc<RwLock<V>>,
         ) {
@@ -301,8 +300,8 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
             }
         });
 
-        for version in committed {
-            merge_keys(&mut keys, version);
+        for deltas in committed {
+            merge_keys(&mut keys, deltas);
         }
 
         keys
@@ -407,8 +406,8 @@ fn get_canon<'a, I: Ord, K: Ord, V>(
         .map(|(_, version)| version);
 
     for version in committed {
-        if let Some(version) = version {
-            if let Some(delta) = version.get(key) {
+        if let Some(deltas) = version {
+            if let Some(delta) = deltas.get(key) {
                 return delta.as_ref();
             }
         }
@@ -418,8 +417,8 @@ fn get_canon<'a, I: Ord, K: Ord, V>(
 }
 
 #[inline]
-fn merge_keys<K: Ord, V>(keys: &mut BTreeSet<Arc<K>>, version: &BTreeMap<Arc<K>, Option<V>>) {
-    for (key, delta) in version {
+fn merge_keys<K: Ord, V>(keys: &mut BTreeSet<Arc<K>>, deltas: &Delta<K, V>) {
+    for (key, delta) in deltas {
         if delta.is_some() {
             keys.insert(key.clone());
         } else {
@@ -463,7 +462,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
     /// Construct a new [`TxnMapLock`].
     pub fn new(txn_id: I) -> Self {
         Self {
-            state: Arc::new(RwLockInner::new(State::new(txn_id, Version::new()))),
+            state: Arc::new(RwLockInner::new(State::new(txn_id, Pending::new()))),
             semaphore: Semaphore::new(),
         }
     }
@@ -487,10 +486,17 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
     pub fn commit(&self, txn_id: I) {
         let mut state = self.state_mut();
 
+        if state.finalized.as_ref() >= Some(&txn_id) {
+            #[cfg(feature = "logging")]
+            log::warn!("committed already-finalized version {}", txn_id);
+            return;
+        }
+
         self.semaphore.finalize(&txn_id, false);
 
-        let version = if let Some(version) = state.pending.remove(&txn_id) {
-            let version = version
+        let finalize = state.pending.keys().next() == Some(&txn_id);
+        let version = state.pending.remove(&txn_id).map(|version| {
+            version
                 .into_iter()
                 .map(|(key, delta)| {
                     let value = if let Some(present) = delta {
@@ -505,39 +511,32 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
 
                     (key, value)
                 })
-                .collect();
+                .collect()
+        });
 
-            Some(version)
-        } else {
-            None
-        };
-
-        match state.committed.entry(txn_id) {
-            Entry::Occupied(_) => {
-                assert!(version.is_none());
-                #[cfg(feature = "logging")]
-                log::warn!("duplicate commit at {}", txn_id);
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(version);
-            }
+        if finalize {
+            assert!(!state.committed.contains_key(&txn_id));
+            let deltas = version.expect("committed version");
+            merge(&mut state.canon, deltas);
+            state.finalized = Some(txn_id);
+        } else if let Some(deltas) = version {
+            assert!(state.committed.insert(txn_id, Some(deltas)).is_none());
+        } else if let Some(prior_commit) = state.committed.insert(txn_id, None) {
+            assert!(prior_commit.is_none());
+            #[cfg(feature = "logging")]
+            log::warn!("duplicate commit at {}", txn_id);
         }
     }
 
     /// Finalize the state of this [`TxnMapLock`] at `txn_id`.
-    /// This will merge in deltas and prevent further reads of versions earlier than `txn_id`.
+    /// This will finalize commits and prevent further reads of versions earlier than `txn_id`.
     pub fn finalize(&self, txn_id: I) {
         let mut state = self.state_mut();
 
         while let Some(version_id) = state.committed.keys().next().copied() {
             if version_id <= txn_id {
-                if let Some(version) = state.committed.remove(&version_id).expect("version") {
-                    for (key, delta) in version {
-                        match delta {
-                            Some(value) => state.canon.insert(key, value),
-                            None => state.canon.remove(&key),
-                        };
-                    }
+                if let Some(deltas) = state.committed.remove(&version_id).expect("version") {
+                    merge(&mut state.canon, deltas);
                 }
             } else {
                 break;
@@ -549,7 +548,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
     }
 
     /// Remove and return all entries from this [`TxnMapLock`] at `txn_id`.
-    pub async fn clear(&self, txn_id: I) -> Result<BTreeMap<Arc<K>, Arc<V>>> {
+    pub async fn clear(&self, txn_id: I) -> Result<Canon<K, V>> {
         // before acquiring a permit, check if this version has already been committed
         self.state().check_pending(&txn_id)?;
 
@@ -559,7 +558,7 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
     }
 
     /// Remove and return all entries from this [`TxnMapLock`] at `txn_id`.
-    pub fn try_clear(&self, txn_id: I) -> Result<BTreeMap<Arc<K>, Arc<V>>> {
+    pub fn try_clear(&self, txn_id: I) -> Result<Canon<K, V>> {
         let mut state = self.state_mut();
 
         // before acquiring a permit, check if this version has already been committed
@@ -1001,5 +1000,15 @@ impl<I: Copy + Ord, K: Ord, V: Clone + fmt::Debug> DoubleEndedIterator for IterM
                 return Some((key, TxnMapIterMutGuard::from(guard)));
             }
         }
+    }
+}
+
+#[inline]
+fn merge<K: Ord, V>(canon: &mut Canon<K, V>, deltas: Delta<K, V>) {
+    for (key, delta) in deltas {
+        match delta {
+            Some(value) => canon.insert(key, value),
+            None => canon.remove(&key),
+        };
     }
 }

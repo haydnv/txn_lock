@@ -40,7 +40,6 @@
 //! assert_eq!(*lock.try_read(3).expect("current value"), "three");
 //! ```
 
-use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
@@ -88,7 +87,7 @@ impl<I: Ord, T> State<I, T> {
 
     #[inline]
     fn check_pending(&self, txn_id: &I) -> Result<()> {
-        if self.finalized.as_ref() >= Some(txn_id) {
+        if self.finalized.as_ref() > Some(txn_id) {
             Err(Error::Outdated)
         } else if self.committed.contains_key(txn_id) {
             Err(Error::Committed)
@@ -213,9 +212,15 @@ impl<I: Copy + Ord + fmt::Display, T: fmt::Debug> TxnLock<I, T> {
     pub fn commit(&self, txn_id: I) {
         let mut state = self.state_mut();
 
+        if state.finalized.as_ref() >= Some(&txn_id) {
+            #[cfg(feature = "logging")]
+            log::warn!("committed already-finalized version {}", txn_id);
+            return;
+        }
+
         self.semaphore.finalize(&txn_id, false);
 
-        let version = state.pending.remove(&txn_id).map(|version| {
+        let new_value = state.pending.remove(&txn_id).map(|version| {
             if let Ok(lock) = Arc::try_unwrap(version) {
                 Arc::new(lock.into_inner())
             } else {
@@ -223,15 +228,16 @@ impl<I: Copy + Ord + fmt::Display, T: fmt::Debug> TxnLock<I, T> {
             }
         });
 
-        match state.committed.entry(txn_id) {
-            Entry::Occupied(_) => {
-                assert!(version.is_none());
-                #[cfg(feature = "logging")]
-                log::warn!("duplicate commit at {}", txn_id);
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(version);
-            }
+        if state.pending.keys().next() == Some(&txn_id) {
+            assert!(!state.committed.contains_key(&txn_id));
+            state.canon = new_value.expect("committed version");
+            state.finalized = Some(txn_id);
+        } else if let Some(value) = new_value {
+            assert!(state.committed.insert(txn_id, Some(value)).is_none());
+        } else if let Some(prior_commit) = state.committed.insert(txn_id, None) {
+            assert!(prior_commit.is_none());
+            #[cfg(feature = "logging")]
+            log::warn!("duplicate commit at {}", txn_id);
         }
     }
 

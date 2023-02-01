@@ -47,6 +47,7 @@
 //! assert_eq!(new_values, set.try_clear(4).expect("clear"));
 //! ```
 
+use std::cmp::Ordering;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
@@ -59,44 +60,53 @@ use super::{Error, Result};
 
 pub use super::range::Range;
 
-type Version<T> = BTreeMap<Arc<T>, bool>;
+type Delta<T> = BTreeMap<Arc<T>, bool>;
 type Canon<T> = BTreeSet<Arc<T>>;
-type Committed<I, T> = BTreeMap<I, Option<Version<T>>>;
+type Committed<I, T> = BTreeMap<I, Option<Delta<T>>>;
 
 struct State<I, T> {
     canon: BTreeSet<Arc<T>>,
-    committed: BTreeMap<I, Option<Version<T>>>,
-    pending: BTreeMap<I, Version<T>>,
+    committed: BTreeMap<I, Option<Delta<T>>>,
+    pending: BTreeMap<I, Delta<T>>,
     finalized: Option<I>,
 }
 
 impl<I: Copy + Ord, T: Ord> State<I, T> {
-    fn new(txn_id: I, version: BTreeSet<Arc<T>>) -> Self {
-        let version = version.into_iter().map(|key| (key, true)).collect();
+    fn new(txn_id: I, set: BTreeSet<Arc<T>>) -> Self {
+        let delta = set.into_iter().map(|key| (key, true)).collect();
 
         State {
             canon: BTreeSet::new(),
             committed: BTreeMap::new(),
-            pending: BTreeMap::from_iter(iter::once((txn_id, version))),
+            pending: BTreeMap::from_iter(iter::once((txn_id, delta))),
             finalized: None,
         }
     }
 
     #[inline]
-    fn canon(&self, txn_id: &I) -> (Canon<T>, bool) {
+    fn canon(&self, txn_id: &I) -> Canon<T> {
         let mut canon = self.canon.clone();
         for (_, version) in self.committed.iter().take_while(|(id, _)| *id <= &txn_id) {
-            if let Some(version) = version {
-                merge(&mut canon, version);
+            if let Some(delta) = version {
+                merge(&mut canon, delta);
             }
         }
 
-        (canon, self.committed.contains_key(&txn_id))
+        canon
+    }
+
+    #[inline]
+    fn check_committed(&self, txn_id: &I) -> Result<bool> {
+        match self.finalized.as_ref().cmp(&Some(txn_id)) {
+            Ordering::Greater => Err(Error::Outdated),
+            Ordering::Equal => Ok(true),
+            Ordering::Less => Ok(self.committed.contains_key(txn_id)),
+        }
     }
 
     #[inline]
     fn check_pending(&self, txn_id: &I) -> Result<()> {
-        if self.finalized.as_ref() >= Some(txn_id) {
+        if self.finalized.as_ref() > Some(txn_id) {
             Err(Error::Outdated)
         } else if self.committed.contains_key(txn_id) {
             Err(Error::Committed)
@@ -112,20 +122,23 @@ impl<I: Copy + Ord, T: Ord> State<I, T> {
 
     #[inline]
     fn contains_committed(&self, txn_id: &I, key: &T) -> Poll<Result<bool>> {
-        if self.finalized.as_ref() > Some(&txn_id) {
-            Poll::Ready(Err(Error::Outdated))
-        } else if self.committed.contains_key(&txn_id) {
-            assert!(!self.pending.contains_key(&txn_id));
-            Poll::Ready(Ok(self.contains_canon(&txn_id, &key)))
-        } else {
-            Poll::Pending
+        match self.finalized.as_ref().cmp(&Some(txn_id)) {
+            Ordering::Greater => Poll::Ready(Err(Error::Outdated)),
+            Ordering::Equal => Poll::Ready(Ok(self.contains_canon(txn_id, key))),
+            Ordering::Less => {
+                if self.committed.contains_key(txn_id) {
+                    Poll::Ready(Ok(self.contains_canon(txn_id, key)))
+                } else {
+                    Poll::Pending
+                }
+            }
         }
     }
 
     #[inline]
     fn contains_pending(&self, txn_id: &I, key: &T) -> bool {
-        if let Some(version) = self.pending.get(&txn_id) {
-            if let Some(key_state) = version.get(key) {
+        if let Some(delta) = self.pending.get(&txn_id) {
+            if let Some(key_state) = delta.get(key) {
                 return *key_state;
             }
         }
@@ -140,8 +153,8 @@ impl<I: Copy + Ord, T: Ord> State<I, T> {
                 entry.get_mut().insert(key, true);
             }
             Entry::Vacant(entry) => {
-                let version = iter::once((key, true)).collect();
-                entry.insert(version);
+                let delta = iter::once((key, true)).collect();
+                entry.insert(delta);
             }
         }
     }
@@ -161,8 +174,8 @@ impl<I: Copy + Ord, T: Ord> State<I, T> {
             },
             Entry::Vacant(pending) => {
                 let present = contains_canon(&self.canon, &self.committed, pending.key(), &key);
-                let version = iter::once((key, false)).collect();
-                pending.insert(version);
+                let delta = iter::once((key, false)).collect();
+                pending.insert(delta);
                 present
             }
         }
@@ -183,8 +196,8 @@ fn contains_canon<I: Ord, T: Ord>(
         .map(|(_, version)| version);
 
     for version in committed {
-        if let Some(version) = version {
-            if let Some(key_state) = version.get(key) {
+        if let Some(delta) = version {
+            if let Some(key_state) = delta.get(key) {
                 return *key_state;
             }
         }
@@ -234,23 +247,28 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
     pub fn commit(&self, txn_id: I) {
         let mut state = self.state_mut();
 
+        if state.finalized.as_ref() >= Some(&txn_id) {
+            #[cfg(feature = "logging")]
+            log::warn!("committed already-finalized version {}", txn_id);
+            return;
+        }
+
         self.semaphore.finalize(&txn_id, false);
 
+        let finalize = state.pending.keys().next() == Some(&txn_id);
         let version = state.pending.remove(&txn_id);
 
-        match state.committed.entry(txn_id) {
-            Entry::Occupied(_) => {
-                assert!(version.is_none());
-                #[cfg(feature = "logging")]
-                log::warn!("duplicate commit at {}", txn_id);
-            }
-            Entry::Vacant(entry) => {
-                if let Some(version) = version {
-                    entry.insert(Some(version));
-                } else {
-                    entry.insert(None);
-                }
-            }
+        if finalize {
+            assert!(!state.committed.contains_key(&txn_id));
+            let delta = version.expect("committed version");
+            merge_owned::<I, T>(&mut state.canon, delta);
+            state.finalized = Some(txn_id);
+        } else if let Some(delta) = version {
+            assert!(state.committed.insert(txn_id, Some(delta)).is_none());
+        } else if let Some(prior_commit) = state.committed.insert(txn_id, None) {
+            assert!(prior_commit.is_none());
+            #[cfg(feature = "logging")]
+            log::warn!("duplicate commit at {}", txn_id);
         }
     }
 
@@ -261,8 +279,8 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
 
         while let Some(version_id) = state.committed.keys().next().copied() {
             if version_id <= txn_id {
-                if let Some(version) = state.committed.remove(&version_id).expect("version") {
-                    merge_owned::<I, T>(&mut state.canon, version);
+                if let Some(delta) = state.committed.remove(&version_id).expect("version") {
+                    merge_owned::<I, T>(&mut state.canon, delta);
                 }
             } else {
                 break;
@@ -279,10 +297,10 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
 
     /// Construct a new [`TxnSetLock`] with the given `contents`.
     pub fn with_contents<C: IntoIterator<Item = T>>(txn_id: I, contents: C) -> Self {
-        let version = contents.into_iter().map(Arc::new).collect();
+        let set = contents.into_iter().map(Arc::new).collect();
 
         Self {
-            state: Arc::new(RwLockInner::new(State::new(txn_id, version))),
+            state: Arc::new(RwLockInner::new(State::new(txn_id, set))),
             semaphore: Semaphore::with_reservation(txn_id, Range::All),
         }
     }
@@ -311,17 +329,18 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
 
     /// Remove and return all keys in this [`TxnSetLock`] at `txn_id`.
     pub async fn clear(&self, txn_id: I) -> Result<BTreeSet<Arc<T>>> {
-        let (mut set, committed) = self.state().canon(&txn_id);
-
-        if committed {
-            return Err(Error::Committed);
-        }
+        // before acquiring a permit, check if this version has already been committed
+        let mut set = {
+            let state = self.state();
+            state.check_pending(&txn_id)?;
+            state.canon(&txn_id)
+        };
 
         let _permit = self.semaphore.write(txn_id, Range::All).await?;
 
         let mut state = self.state_mut();
-        if let Some(version) = state.pending.get(&txn_id) {
-            merge(&mut set, version);
+        if let Some(deltas) = state.pending.get(&txn_id) {
+            merge(&mut set, deltas);
         }
 
         for key in set.iter().cloned() {
@@ -334,16 +353,17 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
     /// Remove and return all keys in this [`TxnSetLock`] at `txn_id` synchronously, if possible.
     pub fn try_clear(&self, txn_id: I) -> Result<BTreeSet<Arc<T>>> {
         let mut state = self.state_mut();
-        let (mut set, committed) = state.canon(&txn_id);
 
-        if committed {
-            return Err(Error::Committed);
-        }
+        // before acquiring a permit, check if this version has already been committed
+        let mut set = {
+            state.check_pending(&txn_id)?;
+            state.canon(&txn_id)
+        };
 
         let _permit = self.semaphore.try_write(txn_id, Range::All)?;
 
-        if let Some(version) = state.pending.get(&txn_id) {
-            merge(&mut set, version);
+        if let Some(delta) = state.pending.get(&txn_id) {
+            merge(&mut set, delta);
         }
 
         for key in set.iter().cloned() {
@@ -392,17 +412,23 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
 
     /// Construct an iterator over this [`TxnSetLock`] at `txn_id`.
     pub async fn iter(&self, txn_id: I) -> Result<Iter<T>> {
-        let (mut set, committed) = self.state().canon(&txn_id);
+        let mut set = {
+            let state = self.state();
+            let set = state.canon(&txn_id);
 
-        if committed {
-            return Ok(Iter::new(None, set));
-        }
+            // before acquiring a permit, check if this version has already been committed
+            if state.check_committed(&txn_id)? {
+                return Ok(Iter::new(None, set));
+            } else {
+                set
+            }
+        };
 
         let permit = self.semaphore.read(txn_id, Range::All).await?;
 
         let state = self.state();
-        if let Some(version) = state.pending.get(&txn_id) {
-            merge(&mut set, version);
+        if let Some(delta) = state.pending.get(&txn_id) {
+            merge(&mut set, delta);
         }
 
         return Ok(Iter::new(Some(permit), set));
@@ -411,16 +437,17 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
     /// Construct an iterator over this [`TxnSetLock`] at `txn_id` synchronously, if possible.
     pub fn try_iter(&self, txn_id: I) -> Result<Iter<T>> {
         let state = self.state();
-        let (mut set, committed) = state.canon(&txn_id);
+        let mut set = state.canon(&txn_id);
 
-        if committed {
+        // before acquiring a permit, check if this version has already been committed
+        if state.check_committed(&txn_id)? {
             return Ok(Iter::new(None, set));
         }
 
         let permit = self.semaphore.try_read(txn_id, Range::All)?;
 
-        if let Some(version) = state.pending.get(&txn_id) {
-            merge(&mut set, version);
+        if let Some(delta) = state.pending.get(&txn_id) {
+            merge(&mut set, delta);
         }
 
         return Ok(Iter::new(Some(permit), set));
@@ -523,8 +550,8 @@ impl<T> DoubleEndedIterator for Iter<T> {
 }
 
 #[inline]
-fn merge_owned<I: Ord, T: Ord>(canon: &mut Canon<T>, version: Version<T>) {
-    for (key, key_state) in version {
+fn merge_owned<I: Ord, T: Ord>(canon: &mut Canon<T>, delta: Delta<T>) {
+    for (key, key_state) in delta {
         match key_state {
             true => canon.insert(key),
             false => canon.remove(&key),
@@ -533,8 +560,8 @@ fn merge_owned<I: Ord, T: Ord>(canon: &mut Canon<T>, version: Version<T>) {
 }
 
 #[inline]
-fn merge<T: Ord>(canon: &mut Canon<T>, version: &Version<T>) {
-    for (key, key_state) in version {
+fn merge<T: Ord>(canon: &mut Canon<T>, delta: &Delta<T>) {
+    for (key, key_state) in delta {
         match key_state {
             true => canon.insert(key.clone()),
             false => canon.remove(key),
