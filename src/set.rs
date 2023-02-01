@@ -59,19 +59,7 @@ use super::{Error, Result};
 
 pub use super::range::Range;
 
-#[derive(Debug, Eq, PartialEq)]
-enum KeyState {
-    Present,
-    Absent,
-}
-
-impl KeyState {
-    fn is_present(&self) -> bool {
-        self == &KeyState::Present
-    }
-}
-
-type Version<T> = BTreeMap<Arc<T>, KeyState>;
+type Version<T> = BTreeMap<Arc<T>, bool>;
 type Canon<T> = BTreeSet<Arc<T>>;
 type Committed<I, T> = BTreeMap<I, Option<Version<T>>>;
 
@@ -84,10 +72,7 @@ struct State<I, T> {
 
 impl<I: Copy + Ord, T: Ord> State<I, T> {
     fn new(txn_id: I, version: BTreeSet<Arc<T>>) -> Self {
-        let version = version
-            .into_iter()
-            .map(|key| (key, KeyState::Present))
-            .collect();
+        let version = version.into_iter().map(|key| (key, true)).collect();
 
         State {
             canon: BTreeSet::new(),
@@ -141,7 +126,7 @@ impl<I: Copy + Ord, T: Ord> State<I, T> {
     fn contains_pending(&self, txn_id: &I, key: &T) -> bool {
         if let Some(version) = self.pending.get(&txn_id) {
             if let Some(key_state) = version.get(key) {
-                return key_state.is_present();
+                return *key_state;
             }
         }
 
@@ -152,10 +137,10 @@ impl<I: Copy + Ord, T: Ord> State<I, T> {
     fn insert(&mut self, txn_id: I, key: Arc<T>) {
         match self.pending.entry(txn_id) {
             Entry::Occupied(mut entry) => {
-                entry.get_mut().insert(key, KeyState::Present);
+                entry.get_mut().insert(key, true);
             }
             Entry::Vacant(entry) => {
-                let version = iter::once((key, KeyState::Present)).collect();
+                let version = iter::once((key, true)).collect();
                 entry.insert(version);
             }
         }
@@ -165,18 +150,18 @@ impl<I: Copy + Ord, T: Ord> State<I, T> {
     fn remove(&mut self, txn_id: I, key: Arc<T>) -> bool {
         match self.pending.entry(txn_id) {
             Entry::Occupied(mut pending) => match pending.get_mut().entry(key) {
-                Entry::Occupied(mut entry) => entry.insert(KeyState::Absent).is_present(),
+                Entry::Occupied(mut entry) => entry.insert(false),
                 Entry::Vacant(entry) => {
                     let present =
                         contains_canon(&self.canon, &self.committed, &txn_id, entry.key());
 
-                    entry.insert(KeyState::Absent);
+                    entry.insert(false);
                     present
                 }
             },
             Entry::Vacant(pending) => {
                 let present = contains_canon(&self.canon, &self.committed, pending.key(), &key);
-                let version = iter::once((key, KeyState::Absent)).collect();
+                let version = iter::once((key, false)).collect();
                 pending.insert(version);
                 present
             }
@@ -200,7 +185,7 @@ fn contains_canon<I: Ord, T: Ord>(
     for version in committed {
         if let Some(version) = version {
             if let Some(key_state) = version.get(key) {
-                return key_state.is_present();
+                return *key_state;
             }
         }
     }
@@ -541,8 +526,8 @@ impl<T> DoubleEndedIterator for Iter<T> {
 fn merge_owned<I: Ord, T: Ord>(canon: &mut Canon<T>, version: Version<T>) {
     for (key, key_state) in version {
         match key_state {
-            KeyState::Present => canon.insert(key),
-            KeyState::Absent => canon.remove(&key),
+            true => canon.insert(key),
+            false => canon.remove(&key),
         };
     }
 }
@@ -551,8 +536,8 @@ fn merge_owned<I: Ord, T: Ord>(canon: &mut Canon<T>, version: Version<T>) {
 fn merge<T: Ord>(canon: &mut Canon<T>, version: &Version<T>) {
     for (key, key_state) in version {
         match key_state {
-            KeyState::Present => canon.insert(key.clone()),
-            KeyState::Absent => canon.remove(key),
+            true => canon.insert(key.clone()),
+            false => canon.remove(key),
         };
     }
 }
