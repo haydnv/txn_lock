@@ -172,7 +172,6 @@ impl<I: Ord, T: Clone> State<I, T> {
 ///
 /// The type `T` to lock must implement [`Clone`] in order to support versioning.
 /// [`Clone::clone`] is called once when [`TxnLock::write`] is called with a valid new `txn_id`.
-// TODO: handle the case where a write permit is acquired and then dropped without committing
 pub struct TxnLock<I, T> {
     state: Arc<RwLockInner<State<I, T>>>,
     semaphore: Semaphore<I, Range>,

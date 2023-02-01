@@ -210,7 +210,6 @@ fn contains_canon<I: Ord, T: Ord>(
 }
 
 /// A futures-aware read-write lock on a [`BTreeSet`] which supports transactional versioning.
-// TODO: handle the case where a write permit is acquired and then dropped without committing
 pub struct TxnSetLock<I, T> {
     state: Arc<RwLockInner<State<I, T>>>,
     semaphore: Semaphore<I, Range<T>>,

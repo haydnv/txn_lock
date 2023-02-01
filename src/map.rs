@@ -444,7 +444,6 @@ fn merge_keys<K: Ord, V>(keys: &mut BTreeSet<Arc<K>>, deltas: &Delta<K, V>) {
 ///
 /// The `get_mut` and `try_get_mut` methods require the value type `V` to implement [`Clone`]
 /// in order to support multiple transactions with different versions.
-// TODO: handle the case where a write permit is acquired and then dropped without committing
 pub struct TxnMapLock<I, K, V> {
     state: Arc<RwLockInner<State<I, K, V>>>,
     semaphore: Semaphore<I, Range<K>>,
