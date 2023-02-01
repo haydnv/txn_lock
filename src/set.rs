@@ -165,18 +165,21 @@ impl<I: Copy + Ord, T: Ord> State<I, T> {
             Entry::Occupied(mut pending) => match pending.get_mut().entry(key) {
                 Entry::Occupied(mut entry) => entry.insert(false),
                 Entry::Vacant(entry) => {
-                    let present =
-                        contains_canon(&self.canon, &self.committed, &txn_id, entry.key());
-
-                    entry.insert(false);
-                    present
+                    if contains_canon(&self.canon, &self.committed, &txn_id, entry.key()) {
+                        entry.insert(false);
+                        true
+                    } else {
+                        false
+                    }
                 }
             },
             Entry::Vacant(pending) => {
-                let present = contains_canon(&self.canon, &self.committed, pending.key(), &key);
-                let delta = iter::once((key, false)).collect();
-                pending.insert(delta);
-                present
+                if contains_canon(&self.canon, &self.committed, &txn_id, &key) {
+                    pending.insert(iter::once((key, false)).collect());
+                    true
+                } else {
+                    false
+                }
             }
         }
     }

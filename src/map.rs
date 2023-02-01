@@ -331,18 +331,24 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
                     }
                 }
                 Entry::Vacant(entry) => {
-                    let prior =
-                        get_canon(&self.canon, &self.committed, &txn_id, entry.key()).cloned();
-
-                    entry.insert(None);
-                    prior
+                    if let Some(prior) =
+                        get_canon(&self.canon, &self.committed, &txn_id, entry.key()).cloned()
+                    {
+                        entry.insert(None);
+                        Some(prior)
+                    } else {
+                        None
+                    }
                 }
             },
             Entry::Vacant(pending) => {
-                let prior_value = get_canon(&self.canon, &self.committed, &txn_id, &key).cloned();
-                let version = iter::once((key, None)).collect();
-                pending.insert(version);
-                prior_value
+                if let Some(prior) = get_canon(&self.canon, &self.committed, &txn_id, &key).cloned()
+                {
+                    pending.insert(iter::once((key, None)).collect());
+                    Some(prior)
+                } else {
+                    None
+                }
             }
         }
     }
