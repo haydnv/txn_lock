@@ -13,7 +13,7 @@
 //!
 //! let map = TxnMapLock::<u64, String, f32>::new(1);
 //!
-//! block_on(map.insert(1, one.clone(), 1.0)).expect("insert");
+//! assert_eq!(block_on(map.insert(1, one.clone(), 1.0)).expect("insert"), None);
 //!
 //! let value = block_on(map.get(1, &one)).expect("read").expect("value");
 //! assert_eq!(value, 1.0);
@@ -34,9 +34,11 @@
 //! let value = block_on(map.remove(2, one.clone())).expect("remove").expect("value");
 //! assert_eq!(*value, 2.0);
 //!
+//! assert_eq!(map.try_insert(2, two.clone(), 1.0).expect("insert"), None);
+//!
 //! assert!(map.try_remove(2, one.clone()).expect("remove").is_none());
 //!
-//! map.try_insert(2, two.clone(), 2.0).expect("insert");
+//! assert_eq!(map.try_insert(2, two.clone(), 2.0).expect("insert"), Some(1.0.into()));
 //!
 //! map.rollback(&2);
 //!
@@ -260,30 +262,35 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
     }
 
     #[inline]
-    fn insert(&mut self, txn_id: I, key: Arc<K>, value: V) {
-        #[inline]
-        fn insert_entry<K: Ord, V>(
-            version: &mut Pending<K, V>,
-            key: Arc<K>,
-            value: Arc<RwLock<V>>,
-        ) {
-            match version.entry(key) {
-                Entry::Occupied(mut entry) => {
-                    let existing_delta = entry.get_mut();
-                    *existing_delta = Some(value);
-                }
-                Entry::Vacant(entry) => {
-                    entry.insert(Some(value));
+    fn insert(&mut self, txn_id: I, key: Arc<K>, value: V) -> Option<Arc<V>> {
+        let value = Arc::new(RwLock::new(value));
+
+        match self.pending.entry(txn_id) {
+            Entry::Occupied(mut entry) => {
+                let deltas = entry.get_mut();
+                match deltas.entry(key) {
+                    Entry::Occupied(mut delta) => {
+                        if let Some(prior) = delta.insert(Some(value)) {
+                            let lock = Arc::try_unwrap(prior).expect("prior value");
+                            let prior_value = Arc::new(lock.into_inner());
+                            Some(prior_value)
+                        } else {
+                            get_canon(&self.canon, &self.committed, &txn_id, delta.key()).cloned()
+                        }
+                    }
+                    Entry::Vacant(delta) => {
+                        let prior =
+                            get_canon(&self.canon, &self.committed, &txn_id, delta.key()).cloned();
+
+                        delta.insert(Some(value));
+                        prior
+                    }
                 }
             }
-        }
-
-        let value = Arc::new(RwLock::new(value));
-        match self.pending.entry(txn_id) {
-            Entry::Occupied(mut entry) => insert_entry(entry.get_mut(), key, value),
             Entry::Vacant(entry) => {
-                let version = entry.insert(BTreeMap::new());
-                insert_entry(version, key, value)
+                let prior = get_canon(&self.canon, &self.committed, entry.key(), &key).cloned();
+                entry.insert(iter::once((key, Some(value))).collect());
+                prior
             }
         }
     }
@@ -674,8 +681,13 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
         return Ok(Iter::new(self.state.clone(), txn_id, Some(permit), keys));
     }
 
-    /// Insert a new entry into this [`TxnMapLock`] at `txn_id`.
-    pub async fn insert<Q: Into<Arc<K>>>(&self, txn_id: I, key: Q, value: V) -> Result<()> {
+    /// Insert a new entry into this [`TxnMapLock`] at `txn_id` and return the prior value, if any.
+    pub async fn insert<Q: Into<Arc<K>>>(
+        &self,
+        txn_id: I,
+        key: Q,
+        value: V,
+    ) -> Result<Option<Arc<V>>> {
         // before acquiring a permit, check if this version has already been committed
         self.state().check_pending(&txn_id)?;
 
@@ -687,7 +699,12 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
     }
 
     /// Insert a new entry into this [`TxnMapLock`] at `txn_id` synchronously, if possible.
-    pub fn try_insert<Q: Into<Arc<K>>>(&self, txn_id: I, key: Q, value: V) -> Result<()> {
+    pub fn try_insert<Q: Into<Arc<K>>>(
+        &self,
+        txn_id: I,
+        key: Q,
+        value: V,
+    ) -> Result<Option<Arc<V>>> {
         let mut state = self.state_mut();
 
         // before acquiring a permit, check if this version has already been committed
