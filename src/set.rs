@@ -48,38 +48,40 @@
 //! ```
 
 use std::cmp::Ordering;
-use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::hash_map::{self, HashMap};
+use std::collections::HashSet;
 use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
 use std::{fmt, iter};
 
+use ds_ext::LinkedHashMap;
+
 use super::semaphore::{PermitRead, Semaphore};
 use super::{Error, Result};
 
 pub use super::range::Range;
 
-type Delta<T> = BTreeMap<Arc<T>, bool>;
+type Delta<T> = HashMap<Arc<T>, bool>;
 type Canon<T> = HashSet<Arc<T>>;
-type Committed<I, T> = BTreeMap<I, Option<Delta<T>>>;
+type Committed<I, T> = LinkedHashMap<I, Option<Delta<T>>>;
 
 struct State<I, T> {
     canon: Canon<T>,
-    committed: BTreeMap<I, Option<Delta<T>>>,
-    pending: BTreeMap<I, Delta<T>>,
+    committed: LinkedHashMap<I, Option<Delta<T>>>,
+    pending: LinkedHashMap<I, Delta<T>>,
     finalized: Option<I>,
 }
 
-impl<I: Copy + Ord, T: Hash + Ord> State<I, T> {
+impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
     fn new(txn_id: I, set: Canon<T>) -> Self {
         let delta = set.into_iter().map(|key| (key, true)).collect();
 
         State {
             canon: Canon::new(),
-            committed: BTreeMap::new(),
-            pending: BTreeMap::from_iter(iter::once((txn_id, delta))),
+            committed: LinkedHashMap::new(),
+            pending: LinkedHashMap::from_iter(iter::once((txn_id, delta))),
             finalized: None,
         }
     }
@@ -138,7 +140,7 @@ impl<I: Copy + Ord, T: Hash + Ord> State<I, T> {
 
     #[inline]
     fn contains_pending(&self, txn_id: &I, key: &T) -> bool {
-        if let Some(delta) = self.pending.get(&txn_id) {
+        if let Some(delta) = self.pending.get(txn_id) {
             if let Some(key_state) = delta.get(key) {
                 return *key_state;
             }
@@ -149,23 +151,20 @@ impl<I: Copy + Ord, T: Hash + Ord> State<I, T> {
 
     #[inline]
     fn insert(&mut self, txn_id: I, key: Arc<T>) {
-        match self.pending.entry(txn_id) {
-            Entry::Occupied(mut entry) => {
-                entry.get_mut().insert(key, true);
-            }
-            Entry::Vacant(entry) => {
-                let delta = iter::once((key, true)).collect();
-                entry.insert(delta);
-            }
+        if let Some(pending) = self.pending.get_mut(&txn_id) {
+            pending.insert(key, true);
+        } else {
+            let delta = iter::once((key, true)).collect();
+            self.pending.insert(txn_id, delta);
         }
     }
 
     #[inline]
     fn remove(&mut self, txn_id: I, key: Arc<T>) -> bool {
-        match self.pending.entry(txn_id) {
-            Entry::Occupied(mut pending) => match pending.get_mut().entry(key) {
-                Entry::Occupied(mut entry) => entry.insert(false),
-                Entry::Vacant(entry) => {
+        if let Some(pending) = self.pending.get_mut(&txn_id) {
+            match pending.entry(key) {
+                hash_map::Entry::Occupied(mut entry) => entry.insert(false),
+                hash_map::Entry::Vacant(entry) => {
                     if contains_canon(&self.canon, &self.committed, &txn_id, entry.key()) {
                         entry.insert(false);
                         true
@@ -173,26 +172,23 @@ impl<I: Copy + Ord, T: Hash + Ord> State<I, T> {
                         false
                     }
                 }
-            },
-            Entry::Vacant(pending) => {
-                if contains_canon(&self.canon, &self.committed, &txn_id, &key) {
-                    pending.insert(iter::once((key, false)).collect());
-                    true
-                } else {
-                    false
-                }
             }
+        } else if contains_canon(&self.canon, &self.committed, &txn_id, &key) {
+            let deltas = iter::once((key, false)).collect();
+            self.pending.insert(txn_id, deltas);
+            true
+        } else {
+            false
         }
     }
 }
 
 #[inline]
-fn contains_canon<I: Ord, T: Hash + Ord>(
-    canon: &Canon<T>,
-    committed: &Committed<I, T>,
-    txn_id: &I,
-    key: &T,
-) -> bool {
+fn contains_canon<I, T>(canon: &Canon<T>, committed: &Committed<I, T>, txn_id: &I, key: &T) -> bool
+where
+    I: Hash + Ord + fmt::Debug,
+    T: Hash + Ord,
+{
     let committed = committed
         .iter()
         .rev()
@@ -237,7 +233,11 @@ impl<I, T> TxnSetLock<I, T> {
     }
 }
 
-impl<I: Copy + Ord + fmt::Display, T: Hash + Ord + fmt::Debug> TxnSetLock<I, T> {
+impl<I, T> TxnSetLock<I, T>
+where
+    I: Copy + Hash + Ord + fmt::Debug,
+    T: Hash + Ord + fmt::Debug,
+{
     /// Construct a new, empty [`TxnSetLock`].
     pub fn new(txn_id: I) -> Self {
         Self {
@@ -508,8 +508,8 @@ impl<I: Copy + Ord + fmt::Display, T: Hash + Ord + fmt::Debug> TxnSetLock<I, T> 
         let mut state = self.state_mut();
 
         assert!(
-            !state.committed.contains_key(&txn_id),
-            "cannot roll back committed transaction {}",
+            !state.committed.contains_key(txn_id),
+            "cannot roll back committed transaction {:?}",
             txn_id
         );
 
