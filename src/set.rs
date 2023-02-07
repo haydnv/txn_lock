@@ -252,7 +252,7 @@ where
 
         if state.finalized.as_ref() >= Some(&txn_id) {
             #[cfg(feature = "logging")]
-            log::warn!("committed already-finalized version {}", txn_id);
+            log::warn!("committed already-finalized version {:?}", txn_id);
             return;
         }
 
@@ -271,7 +271,7 @@ where
         } else if let Some(prior_commit) = state.committed.insert(txn_id, None) {
             assert!(prior_commit.is_none());
             #[cfg(feature = "logging")]
-            log::warn!("duplicate commit at {}", txn_id);
+            log::warn!("duplicate commit at {:?}", txn_id);
         }
     }
 
