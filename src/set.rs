@@ -56,7 +56,7 @@ use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
 use std::{fmt, iter};
 
-use ds_ext::LinkedHashMap;
+use ds_ext::OrdHashMap;
 
 use super::semaphore::{PermitRead, Semaphore};
 use super::{Error, Result};
@@ -65,12 +65,12 @@ pub use super::range::Range;
 
 type Delta<T> = HashMap<Arc<T>, bool>;
 type Canon<T> = HashSet<Arc<T>>;
-type Committed<I, T> = LinkedHashMap<I, Option<Delta<T>>>;
+type Committed<I, T> = OrdHashMap<I, Option<Delta<T>>>;
 
 struct State<I, T> {
     canon: Canon<T>,
-    committed: LinkedHashMap<I, Option<Delta<T>>>,
-    pending: LinkedHashMap<I, Delta<T>>,
+    committed: OrdHashMap<I, Option<Delta<T>>>,
+    pending: OrdHashMap<I, Delta<T>>,
     finalized: Option<I>,
 }
 
@@ -80,8 +80,8 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
 
         State {
             canon: Canon::new(),
-            committed: LinkedHashMap::new(),
-            pending: LinkedHashMap::from_iter(iter::once((txn_id, delta))),
+            committed: OrdHashMap::new(),
+            pending: OrdHashMap::from_iter(iter::once((txn_id, delta))),
             finalized: None,
         }
     }

@@ -100,7 +100,7 @@ use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
 use std::{fmt, iter};
 
-use ds_ext::LinkedHashMap;
+use ds_ext::OrdHashMap;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use super::guard::{TxnReadGuard, TxnWriteGuard};
@@ -117,7 +117,7 @@ pub type TxnMapValueWriteGuard<K, V> = TxnWriteGuard<Range<K>, V>;
 
 type Canon<K, V> = HashMap<Arc<K>, Arc<V>>;
 type Delta<K, V> = HashMap<Arc<K>, Option<Arc<V>>>;
-type Committed<I, K, V> = LinkedHashMap<I, Option<Delta<K, V>>>;
+type Committed<I, K, V> = OrdHashMap<I, Option<Delta<K, V>>>;
 type Pending<K, V> = HashMap<Arc<K>, Option<Arc<RwLock<V>>>>;
 
 #[derive(Debug)]
@@ -129,7 +129,7 @@ enum PendingValue<V> {
 struct State<I, K, V> {
     canon: Canon<K, V>,
     committed: Committed<I, K, V>,
-    pending: LinkedHashMap<I, Pending<K, V>>,
+    pending: OrdHashMap<I, Pending<K, V>>,
     finalized: Option<I>,
 }
 
@@ -144,7 +144,7 @@ where
         Self {
             canon: Canon::new(),
             committed: Committed::new(),
-            pending: LinkedHashMap::from_iter(iter::once((txn_id, version))),
+            pending: OrdHashMap::from_iter(iter::once((txn_id, version))),
             finalized: None,
         }
     }

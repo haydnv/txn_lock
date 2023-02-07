@@ -46,7 +46,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
 
-use ds_ext::LinkedHashMap;
+use ds_ext::OrdHashMap;
 use tokio::sync::RwLock;
 
 use super::guard::{TxnReadGuard, TxnWriteGuard};
@@ -71,8 +71,8 @@ impl Overlaps<Range> for Range {
 
 struct State<I, T> {
     canon: Arc<T>,
-    committed: LinkedHashMap<I, Option<Arc<T>>>,
-    pending: LinkedHashMap<I, Arc<RwLock<T>>>,
+    committed: OrdHashMap<I, Option<Arc<T>>>,
+    pending: OrdHashMap<I, Arc<RwLock<T>>>,
     finalized: Option<I>,
 }
 
@@ -80,8 +80,8 @@ impl<I: Hash + Ord + fmt::Debug, T: fmt::Debug> State<I, T> {
     fn new(canon: T) -> Self {
         State {
             canon: Arc::new(canon),
-            committed: LinkedHashMap::new(),
-            pending: LinkedHashMap::new(),
+            committed: OrdHashMap::new(),
+            pending: OrdHashMap::new(),
             finalized: None,
         }
     }
