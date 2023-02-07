@@ -2,6 +2,7 @@
 //!
 //! Example usage:
 //! ```
+//! use std::collections::HashMap;
 //! use std::sync::Arc;
 //! use futures::executor::block_on;
 //!
@@ -70,21 +71,19 @@
 //!     *value *= 2.;
 //! }
 //!
-//! // note: alphabetical order
-//! let expected = [
+//! let expected = HashMap::<String, f32>::from_iter([
 //!     ("two".to_string(), 4.0),
 //!     ("three".to_string(), 6.0),
 //!     ("one".to_string(), 2.0),
 //!     ("four".to_string(), 8.0),
 //!     ("five".to_string(), 10.0),
-//! ];
+//! ]);
 //!
-//! let actual = map.try_iter(4).expect("iter").rev().collect::<Vec<_>>();
+//! let actual = map.try_iter(4).expect("iter").collect::<Vec<_>>();
 //! assert_eq!(actual.len(), expected.len());
 //!
-//! for ((lk, lv), (rk, rv)) in actual.into_iter().zip(&expected) {
-//!     assert_eq!(&*lk, rk);
-//!     assert_eq!(&*lv, rv);
+//! for (k, v) in actual {
+//!     assert_eq!(expected.get(&*k), Some(&*v));
 //! }
 //!
 //! let actual = map.try_clear(4).expect("clear");
@@ -93,8 +92,10 @@
 //! ```
 
 use std::cmp::Ordering;
-use std::collections::btree_map::{BTreeMap, Entry};
-use std::collections::BTreeSet;
+use std::collections::btree_map::{self, BTreeMap};
+use std::collections::hash_map::{self, HashMap};
+use std::collections::HashSet;
+use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
@@ -114,10 +115,10 @@ pub type TxnMapValueReadGuard<K, V> = TxnReadGuard<Range<K>, V>;
 /// A write guard on a value in a [`TxnMapLock`]
 pub type TxnMapValueWriteGuard<K, V> = TxnWriteGuard<Range<K>, V>;
 
-type Canon<K, V> = BTreeMap<Arc<K>, Arc<V>>;
-type Delta<K, V> = BTreeMap<Arc<K>, Option<Arc<V>>>;
+type Canon<K, V> = HashMap<Arc<K>, Arc<V>>;
+type Delta<K, V> = HashMap<Arc<K>, Option<Arc<V>>>;
 type Committed<I, K, V> = BTreeMap<I, Option<Delta<K, V>>>;
-type Pending<K, V> = BTreeMap<Arc<K>, Option<Arc<RwLock<V>>>>;
+type Pending<K, V> = HashMap<Arc<K>, Option<Arc<RwLock<V>>>>;
 
 #[derive(Debug)]
 enum PendingValue<V> {
@@ -132,12 +133,12 @@ struct State<I, K, V> {
     finalized: Option<I>,
 }
 
-impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
+impl<I: Copy + Ord, K: Hash + Ord, V: fmt::Debug> State<I, K, V> {
     #[inline]
     fn new(txn_id: I, version: Pending<K, V>) -> Self {
         Self {
-            canon: BTreeMap::new(),
-            committed: BTreeMap::new(),
+            canon: Canon::new(),
+            committed: Committed::new(),
             pending: BTreeMap::from_iter(iter::once((txn_id, version))),
             finalized: None,
         }
@@ -210,12 +211,12 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
             .map(|(key, value)| (key.into(), Some(Arc::new(RwLock::new(value)))));
 
         match self.pending.entry(txn_id) {
-            Entry::Occupied(mut entry) => {
+            btree_map::Entry::Occupied(mut entry) => {
                 let version = entry.get_mut();
                 version.extend(entries);
             }
-            Entry::Vacant(entry) => {
-                let version = entry.insert(BTreeMap::new());
+            btree_map::Entry::Vacant(entry) => {
+                let version = entry.insert(Pending::new());
                 version.extend(entries);
             }
         }
@@ -266,10 +267,10 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
         let value = Arc::new(RwLock::new(value));
 
         match self.pending.entry(txn_id) {
-            Entry::Occupied(mut entry) => {
+            btree_map::Entry::Occupied(mut entry) => {
                 let deltas = entry.get_mut();
                 match deltas.entry(key) {
-                    Entry::Occupied(mut delta) => {
+                    hash_map::Entry::Occupied(mut delta) => {
                         if let Some(prior) = delta.insert(Some(value)) {
                             let lock = Arc::try_unwrap(prior).expect("prior value");
                             let prior_value = Arc::new(lock.into_inner());
@@ -278,7 +279,7 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
                             get_canon(&self.canon, &self.committed, &txn_id, delta.key()).cloned()
                         }
                     }
-                    Entry::Vacant(delta) => {
+                    hash_map::Entry::Vacant(delta) => {
                         let prior =
                             get_canon(&self.canon, &self.committed, &txn_id, delta.key()).cloned();
 
@@ -287,7 +288,7 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
                     }
                 }
             }
-            Entry::Vacant(entry) => {
+            btree_map::Entry::Vacant(entry) => {
                 let prior = get_canon(&self.canon, &self.committed, entry.key(), &key).cloned();
                 entry.insert(iter::once((key, Some(value))).collect());
                 prior
@@ -296,7 +297,7 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
     }
 
     #[inline]
-    fn keys_committed(&self, txn_id: &I) -> BTreeSet<Arc<K>> {
+    fn keys_committed(&self, txn_id: &I) -> HashSet<Arc<K>> {
         let mut keys = self.canon.keys().cloned().collect();
 
         let committed = self.committed.iter().filter_map(|(id, version)| {
@@ -315,7 +316,7 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
     }
 
     #[inline]
-    fn keys_pending(&self, txn_id: I) -> BTreeSet<Arc<K>> {
+    fn keys_pending(&self, txn_id: I) -> HashSet<Arc<K>> {
         let mut keys = self.keys_committed(&txn_id);
 
         if let Some(pending) = self.pending.get(&txn_id) {
@@ -328,8 +329,8 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
     #[inline]
     fn remove(&mut self, txn_id: I, key: Arc<K>) -> Option<Arc<V>> {
         match self.pending.entry(txn_id) {
-            Entry::Occupied(mut pending) => match pending.get_mut().entry(key) {
-                Entry::Occupied(mut entry) => {
+            btree_map::Entry::Occupied(mut pending) => match pending.get_mut().entry(key) {
+                hash_map::Entry::Occupied(mut entry) => {
                     if let Some(lock) = entry.insert(None) {
                         let lock = Arc::try_unwrap(lock).expect("removed value");
                         Some(Arc::new(lock.into_inner()))
@@ -337,7 +338,7 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
                         None
                     }
                 }
-                Entry::Vacant(entry) => {
+                hash_map::Entry::Vacant(entry) => {
                     if let Some(prior) =
                         get_canon(&self.canon, &self.committed, &txn_id, entry.key()).cloned()
                     {
@@ -348,7 +349,7 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
                     }
                 }
             },
-            Entry::Vacant(pending) => {
+            btree_map::Entry::Vacant(pending) => {
                 if let Some(prior) = get_canon(&self.canon, &self.committed, &txn_id, &key).cloned()
                 {
                     pending.insert(iter::once((key, None)).collect());
@@ -361,7 +362,12 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> State<I, K, V> {
     }
 }
 
-impl<I: Copy + Ord, K: Ord, V: Clone + fmt::Debug> State<I, K, V> {
+impl<I, K, V> State<I, K, V>
+where
+    I: Copy + Ord,
+    K: Hash + Ord,
+    V: Clone + fmt::Debug,
+{
     #[inline]
     fn get_mut(&mut self, txn_id: I, key: Arc<K>) -> Option<OwnedRwLockWriteGuard<V>> {
         #[inline]
@@ -373,8 +379,8 @@ impl<I: Copy + Ord, K: Ord, V: Clone + fmt::Debug> State<I, K, V> {
         }
 
         match self.pending.entry(txn_id) {
-            Entry::Occupied(mut pending) => match pending.get_mut().entry(key) {
-                Entry::Occupied(delta) => {
+            btree_map::Entry::Occupied(mut pending) => match pending.get_mut().entry(key) {
+                hash_map::Entry::Occupied(delta) => {
                     let value = delta.get().as_ref()?;
 
                     value
@@ -383,7 +389,7 @@ impl<I: Copy + Ord, K: Ord, V: Clone + fmt::Debug> State<I, K, V> {
                         .map(Some)
                         .expect("write version")
                 }
-                Entry::Vacant(delta) => {
+                hash_map::Entry::Vacant(delta) => {
                     let canon = get_canon(&self.canon, &self.committed, &txn_id, delta.key())?;
                     let (value, guard) = new_value(&**canon);
 
@@ -392,7 +398,7 @@ impl<I: Copy + Ord, K: Ord, V: Clone + fmt::Debug> State<I, K, V> {
                     Some(guard)
                 }
             },
-            Entry::Vacant(pending) => {
+            btree_map::Entry::Vacant(pending) => {
                 let canon = get_canon(&self.canon, &self.committed, &txn_id, &key)?;
                 let (value, guard) = new_value(&**canon);
 
@@ -406,12 +412,16 @@ impl<I: Copy + Ord, K: Ord, V: Clone + fmt::Debug> State<I, K, V> {
 }
 
 #[inline]
-fn get_canon<'a, I: Ord, K: Ord, V>(
+fn get_canon<'a, I, K, V>(
     canon: &'a Canon<K, V>,
     committed: &'a Committed<I, K, V>,
     txn_id: &'a I,
     key: &'a K,
-) -> Option<&'a Arc<V>> {
+) -> Option<&'a Arc<V>>
+where
+    I: Ord,
+    K: Hash + Ord,
+{
     let committed = committed
         .iter()
         .rev()
@@ -430,7 +440,7 @@ fn get_canon<'a, I: Ord, K: Ord, V>(
 }
 
 #[inline]
-fn merge_keys<K: Ord, V>(keys: &mut BTreeSet<Arc<K>>, deltas: &Delta<K, V>) {
+fn merge_keys<K: Hash + Ord, V>(keys: &mut HashSet<Arc<K>>, deltas: &Delta<K, V>) {
     for (key, delta) in deltas {
         if delta.is_some() {
             keys.insert(key.clone());
@@ -440,7 +450,7 @@ fn merge_keys<K: Ord, V>(keys: &mut BTreeSet<Arc<K>>, deltas: &Delta<K, V>) {
     }
 }
 
-/// A futures-aware read-write lock on a [`BTreeMap`] which supports transactional versioning
+/// A futures-aware read-write lock on a [`HashMap`] which supports transactional versioning
 ///
 /// The `get_mut` and `try_get_mut` methods require the value type `V` to implement [`Clone`]
 /// in order to support multiple transactions with different versions.
@@ -470,7 +480,12 @@ impl<I, K, V> TxnMapLock<I, K, V> {
     }
 }
 
-impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLock<I, K, V> {
+impl<I, K, V> TxnMapLock<I, K, V>
+where
+    I: Ord + Copy + fmt::Display,
+    K: Eq + Hash + Ord + fmt::Debug,
+    V: fmt::Debug,
+{
     /// Construct a new [`TxnMapLock`].
     pub fn new(txn_id: I) -> Self {
         Self {
@@ -756,7 +771,12 @@ impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: fmt::Debug> TxnMapLoc
     }
 }
 
-impl<I: Ord + Copy + fmt::Display, K: Ord + fmt::Debug, V: Clone + fmt::Debug> TxnMapLock<I, K, V> {
+impl<I, K, V> TxnMapLock<I, K, V>
+where
+    I: Ord + Copy + fmt::Display,
+    K: Hash + Ord + fmt::Debug,
+    V: Clone + fmt::Debug,
+{
     /// Read a mutable value from this [`TxnMapLock`] at `txn_id`.
     pub async fn get_mut<Q: Into<Arc<K>>>(
         &self,
@@ -862,7 +882,7 @@ pub struct Iter<I, K, V> {
     lock_state: Arc<RwLockInner<State<I, K, V>>>,
     txn_id: I,
     permit: Option<PermitRead<Range<K>>>,
-    keys: <BTreeSet<Arc<K>> as IntoIterator>::IntoIter,
+    keys: <HashSet<Arc<K>> as IntoIterator>::IntoIter,
 }
 
 impl<I, K, V> Iter<I, K, V> {
@@ -870,7 +890,7 @@ impl<I, K, V> Iter<I, K, V> {
         lock_state: Arc<RwLockInner<State<I, K, V>>>,
         txn_id: I,
         permit: Option<PermitRead<Range<K>>>,
-        keys: BTreeSet<Arc<K>>,
+        keys: HashSet<Arc<K>>,
     ) -> Self {
         Self {
             lock_state,
@@ -881,7 +901,12 @@ impl<I, K, V> Iter<I, K, V> {
     }
 }
 
-impl<I: Copy + Ord, K: Ord, V: fmt::Debug> Iterator for Iter<I, K, V> {
+impl<I, K, V> Iterator for Iter<I, K, V>
+where
+    I: Copy + Ord,
+    K: Hash + Ord,
+    V: fmt::Debug,
+{
     type Item = (Arc<K>, TxnMapIterGuard<V>);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -901,27 +926,18 @@ impl<I: Copy + Ord, K: Ord, V: fmt::Debug> Iterator for Iter<I, K, V> {
     }
 }
 
-impl<I: Copy + Ord, K: Ord, V: fmt::Debug> DoubleEndedIterator for Iter<I, K, V> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        let state = self.lock_state.read().expect("lock state");
-
-        loop {
-            let key = self.keys.next_back()?;
-            let value = get_key(&state, &self.txn_id, &key, self.permit.is_none());
-            if let Some(value) = value {
-                return Some((key, value.into()));
-            }
-        }
-    }
-}
-
 #[inline]
-fn get_key<I: Copy + Ord, K: Ord, V: fmt::Debug>(
+fn get_key<I, K, V>(
     state: &State<I, K, V>,
     txn_id: &I,
     key: &K,
     committed: bool,
-) -> Option<PendingValue<V>> {
+) -> Option<PendingValue<V>>
+where
+    I: Copy + Ord,
+    K: Hash + Ord,
+    V: fmt::Debug,
+{
     if committed {
         state.get_canon(txn_id, &key).map(PendingValue::Committed)
     } else {
@@ -974,7 +990,7 @@ pub struct IterMut<I, K, V> {
 
     #[allow(unused)]
     permit: PermitWrite<Range<K>>,
-    keys: <BTreeSet<Arc<K>> as IntoIterator>::IntoIter,
+    keys: <HashSet<Arc<K>> as IntoIterator>::IntoIter,
 }
 
 impl<I, K, V> IterMut<I, K, V> {
@@ -982,7 +998,7 @@ impl<I, K, V> IterMut<I, K, V> {
         lock_state: Arc<RwLockInner<State<I, K, V>>>,
         txn_id: I,
         permit: PermitWrite<Range<K>>,
-        keys: BTreeSet<Arc<K>>,
+        keys: HashSet<Arc<K>>,
     ) -> Self {
         Self {
             lock_state,
@@ -993,7 +1009,12 @@ impl<I, K, V> IterMut<I, K, V> {
     }
 }
 
-impl<I: Copy + Ord, K: Ord, V: Clone + fmt::Debug> Iterator for IterMut<I, K, V> {
+impl<I, K, V> Iterator for IterMut<I, K, V>
+where
+    I: Copy + Ord,
+    K: Hash + Ord,
+    V: Clone + fmt::Debug,
+{
     type Item = (Arc<K>, TxnMapIterMutGuard<V>);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1012,21 +1033,8 @@ impl<I: Copy + Ord, K: Ord, V: Clone + fmt::Debug> Iterator for IterMut<I, K, V>
     }
 }
 
-impl<I: Copy + Ord, K: Ord, V: Clone + fmt::Debug> DoubleEndedIterator for IterMut<I, K, V> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        let mut state = self.lock_state.write().expect("lock state");
-
-        loop {
-            let key = self.keys.next_back()?;
-            if let Some(guard) = state.get_mut(self.txn_id, key.clone()) {
-                return Some((key, TxnMapIterMutGuard::from(guard)));
-            }
-        }
-    }
-}
-
 #[inline]
-fn merge<K: Ord, V>(canon: &mut Canon<K, V>, deltas: Delta<K, V>) {
+fn merge<K: Eq + Hash, V>(canon: &mut Canon<K, V>, deltas: Delta<K, V>) {
     for (key, delta) in deltas {
         match delta {
             Some(value) => canon.insert(key, value),
