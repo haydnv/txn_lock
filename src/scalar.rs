@@ -40,12 +40,13 @@
 //! assert_eq!(*lock.try_read(3).expect("current value"), "three");
 //! ```
 
-use std::collections::BTreeMap;
 use std::fmt;
+use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
 
+use ds_ext::LinkedHashMap;
 use tokio::sync::RwLock;
 
 use super::guard::{TxnReadGuard, TxnWriteGuard};
@@ -70,17 +71,17 @@ impl Overlaps<Range> for Range {
 
 struct State<I, T> {
     canon: Arc<T>,
-    committed: BTreeMap<I, Option<Arc<T>>>,
-    pending: BTreeMap<I, Arc<RwLock<T>>>,
+    committed: LinkedHashMap<I, Option<Arc<T>>>,
+    pending: LinkedHashMap<I, Arc<RwLock<T>>>,
     finalized: Option<I>,
 }
 
-impl<I: Ord, T> State<I, T> {
+impl<I: Hash + Ord + fmt::Debug, T: fmt::Debug> State<I, T> {
     fn new(canon: T) -> Self {
         State {
             canon: Arc::new(canon),
-            committed: BTreeMap::new(),
-            pending: BTreeMap::new(),
+            committed: LinkedHashMap::new(),
+            pending: LinkedHashMap::new(),
             finalized: None,
         }
     }
@@ -116,11 +117,11 @@ impl<I: Ord, T> State<I, T> {
 
     #[inline]
     fn read_committed(&self, txn_id: &I) -> Poll<Result<Arc<T>>> {
-        if self.finalized.as_ref() > Some(&txn_id) {
+        if self.finalized.as_ref() > Some(txn_id) {
             Poll::Ready(Err(Error::Outdated))
-        } else if self.committed.contains_key(&txn_id) {
-            assert!(!self.pending.contains_key(&txn_id));
-            Poll::Ready(Ok(self.read_canon(&txn_id).clone()))
+        } else if self.committed.contains_key(txn_id) {
+            assert!(!self.pending.contains_key(txn_id));
+            Poll::Ready(Ok(self.read_canon(txn_id).clone()))
         } else {
             Poll::Pending
         }
@@ -139,7 +140,7 @@ impl<I: Ord, T> State<I, T> {
     }
 }
 
-impl<I: Ord, T: Clone> State<I, T> {
+impl<I: Hash + Ord + fmt::Debug, T: Clone + fmt::Debug> State<I, T> {
     #[inline]
     fn get_or_create_version(&mut self, txn_id: I) -> Arc<RwLock<T>> {
         if let Some(version) = self.pending.get(&txn_id) {
@@ -198,7 +199,7 @@ impl<I, T> TxnLock<I, T> {
     }
 }
 
-impl<I: Copy + Ord + fmt::Display, T: fmt::Debug> TxnLock<I, T> {
+impl<I: Copy + Hash + Ord + fmt::Debug, T: fmt::Debug> TxnLock<I, T> {
     /// Construct a new [`TxnLock`].
     pub fn new(canon: T) -> Self {
         Self {
@@ -213,7 +214,7 @@ impl<I: Copy + Ord + fmt::Display, T: fmt::Debug> TxnLock<I, T> {
 
         if state.finalized.as_ref() >= Some(&txn_id) {
             #[cfg(feature = "logging")]
-            log::warn!("committed already-finalized version {}", txn_id);
+            log::warn!("committed already-finalized version {:?}", txn_id);
             return;
         }
 
@@ -223,7 +224,7 @@ impl<I: Copy + Ord + fmt::Display, T: fmt::Debug> TxnLock<I, T> {
             if let Ok(lock) = Arc::try_unwrap(version) {
                 Arc::new(lock.into_inner())
             } else {
-                panic!("value to commit at {} is still locked!", txn_id);
+                panic!("value to commit at {:?} is still locked!", txn_id);
             }
         });
 
@@ -236,7 +237,7 @@ impl<I: Copy + Ord + fmt::Display, T: fmt::Debug> TxnLock<I, T> {
         } else if let Some(prior_commit) = state.committed.insert(txn_id, None) {
             assert!(prior_commit.is_none());
             #[cfg(feature = "logging")]
-            log::warn!("duplicate commit at {}", txn_id);
+            log::warn!("duplicate commit at {:?}", txn_id);
         }
     }
 
@@ -286,8 +287,8 @@ impl<I: Copy + Ord + fmt::Display, T: fmt::Debug> TxnLock<I, T> {
         let mut state = self.state_mut();
 
         assert!(
-            !state.committed.contains_key(&txn_id),
-            "cannot roll back committed transaction {}",
+            !state.committed.contains_key(txn_id),
+            "cannot roll back committed transaction {:?}",
             txn_id
         );
 
@@ -296,7 +297,7 @@ impl<I: Copy + Ord + fmt::Display, T: fmt::Debug> TxnLock<I, T> {
     }
 }
 
-impl<I: Copy + Ord, T: Clone + fmt::Debug> TxnLock<I, T> {
+impl<I: Copy + Hash + Ord + fmt::Debug, T: Clone + fmt::Debug> TxnLock<I, T> {
     /// Acquire a write lock for this value at `txn_id`.
     pub async fn write(&self, txn_id: I) -> Result<TxnLockWriteGuard<T>> {
         // before acquiring a permit, check if this version has already been committed
