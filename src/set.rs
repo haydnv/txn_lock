@@ -1,8 +1,8 @@
-//! A futures-aware read-write lock on a [`BTreeSet`] which supports transactional versioning.
+//! A futures-aware read-write lock on a [`HashSet`] which supports transactional versioning.
 //!
 //! Example usage:
 //! ```
-//! use std::collections::BTreeSet;
+//! use std::collections::HashSet;
 //! use std::sync::Arc;
 //! use futures::executor::block_on;
 //!
@@ -37,7 +37,7 @@
 //! assert!(!set.try_remove(3, two).expect("remove"));
 //! set.commit(3);
 //!
-//! let new_values: BTreeSet<Arc<String>> = ["one", "two", "three", "four"]
+//! let new_values: HashSet<Arc<String>> = ["one", "two", "three", "four"]
 //!     .into_iter()
 //!     .map(String::from)
 //!     .map(Arc::from)
@@ -49,7 +49,8 @@
 
 use std::cmp::Ordering;
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, HashSet};
+use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
@@ -61,22 +62,22 @@ use super::{Error, Result};
 pub use super::range::Range;
 
 type Delta<T> = BTreeMap<Arc<T>, bool>;
-type Canon<T> = BTreeSet<Arc<T>>;
+type Canon<T> = HashSet<Arc<T>>;
 type Committed<I, T> = BTreeMap<I, Option<Delta<T>>>;
 
 struct State<I, T> {
-    canon: BTreeSet<Arc<T>>,
+    canon: Canon<T>,
     committed: BTreeMap<I, Option<Delta<T>>>,
     pending: BTreeMap<I, Delta<T>>,
     finalized: Option<I>,
 }
 
-impl<I: Copy + Ord, T: Ord> State<I, T> {
-    fn new(txn_id: I, set: BTreeSet<Arc<T>>) -> Self {
+impl<I: Copy + Ord, T: Hash + Ord> State<I, T> {
+    fn new(txn_id: I, set: Canon<T>) -> Self {
         let delta = set.into_iter().map(|key| (key, true)).collect();
 
         State {
-            canon: BTreeSet::new(),
+            canon: Canon::new(),
             committed: BTreeMap::new(),
             pending: BTreeMap::from_iter(iter::once((txn_id, delta))),
             finalized: None,
@@ -186,8 +187,8 @@ impl<I: Copy + Ord, T: Ord> State<I, T> {
 }
 
 #[inline]
-fn contains_canon<I: Ord, T: Ord>(
-    canon: &BTreeSet<Arc<T>>,
+fn contains_canon<I: Ord, T: Hash + Ord>(
+    canon: &Canon<T>,
     committed: &Committed<I, T>,
     txn_id: &I,
     key: &T,
@@ -209,7 +210,7 @@ fn contains_canon<I: Ord, T: Ord>(
     canon.contains(key)
 }
 
-/// A futures-aware read-write lock on a [`BTreeSet`] which supports transactional versioning.
+/// A futures-aware read-write lock on a [`HashSet`] which supports transactional versioning.
 pub struct TxnSetLock<I, T> {
     state: Arc<RwLockInner<State<I, T>>>,
     semaphore: Semaphore<I, Range<T>>,
@@ -236,11 +237,11 @@ impl<I, T> TxnSetLock<I, T> {
     }
 }
 
-impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
+impl<I: Copy + Ord + fmt::Display, T: Hash + Ord + fmt::Debug> TxnSetLock<I, T> {
     /// Construct a new, empty [`TxnSetLock`].
     pub fn new(txn_id: I) -> Self {
         Self {
-            state: Arc::new(RwLockInner::new(State::new(txn_id, BTreeSet::new()))),
+            state: Arc::new(RwLockInner::new(State::new(txn_id, Canon::new()))),
             semaphore: Semaphore::new(),
         }
     }
@@ -330,7 +331,7 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
     }
 
     /// Remove and return all keys in this [`TxnSetLock`] at `txn_id`.
-    pub async fn clear(&self, txn_id: I) -> Result<BTreeSet<Arc<T>>> {
+    pub async fn clear(&self, txn_id: I) -> Result<Canon<T>> {
         // before acquiring a permit, check if this version has already been committed
         let mut set = {
             let state = self.state();
@@ -353,7 +354,7 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
     }
 
     /// Remove and return all keys in this [`TxnSetLock`] at `txn_id` synchronously, if possible.
-    pub fn try_clear(&self, txn_id: I) -> Result<BTreeSet<Arc<T>>> {
+    pub fn try_clear(&self, txn_id: I) -> Result<Canon<T>> {
         let mut state = self.state_mut();
 
         // before acquiring a permit, check if this version has already been committed
@@ -521,11 +522,11 @@ impl<I: Copy + Ord + fmt::Display, T: Ord + fmt::Debug> TxnSetLock<I, T> {
 pub struct Iter<T> {
     #[allow(unused)]
     permit: Option<PermitRead<Range<T>>>,
-    iter: <BTreeSet<Arc<T>> as IntoIterator>::IntoIter,
+    iter: <Canon<T> as IntoIterator>::IntoIter,
 }
 
 impl<T> Iter<T> {
-    fn new(permit: Option<PermitRead<Range<T>>>, set: BTreeSet<Arc<T>>) -> Self {
+    fn new(permit: Option<PermitRead<Range<T>>>, set: Canon<T>) -> Self {
         Self {
             permit,
             iter: set.into_iter(),
@@ -545,14 +546,8 @@ impl<T> Iterator for Iter<T> {
     }
 }
 
-impl<T> DoubleEndedIterator for Iter<T> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.iter.next_back()
-    }
-}
-
 #[inline]
-fn merge_owned<I: Ord, T: Ord>(canon: &mut Canon<T>, delta: Delta<T>) {
+fn merge_owned<I: Ord, T: Hash + Ord>(canon: &mut Canon<T>, delta: Delta<T>) {
     for (key, key_state) in delta {
         match key_state {
             true => canon.insert(key),
@@ -562,7 +557,7 @@ fn merge_owned<I: Ord, T: Ord>(canon: &mut Canon<T>, delta: Delta<T>) {
 }
 
 #[inline]
-fn merge<T: Ord>(canon: &mut Canon<T>, delta: &Delta<T>) {
+fn merge<T: Hash + Ord>(canon: &mut Canon<T>, delta: &Delta<T>) {
     for (key, key_state) in delta {
         match key_state {
             true => canon.insert(key.clone()),
