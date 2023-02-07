@@ -1,8 +1,9 @@
-use std::fmt;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::{fmt, mem};
 
+use ds_ext::List;
 use futures::future::{self, Future, TryFutureExt};
 use futures::try_join;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -407,14 +408,14 @@ impl<R: fmt::Debug> fmt::Debug for RangeLock<R> {
 
 /// Semaphores for ranges within a single transactional version
 pub struct Version<R> {
-    roots: Vec<RangeLock<R>>,
+    roots: List<RangeLock<R>>,
 }
 
 impl<R> Version<R> {
     /// Create a new [`Version`] semaphore
     pub fn new() -> Self {
         Self {
-            roots: Vec::with_capacity(1),
+            roots: List::with_capacity(1),
         }
     }
 }
@@ -430,14 +431,16 @@ impl<R: Overlaps<R> + fmt::Debug> Version<R> {
             let root = RangeLock::new(range, write);
             self.roots.insert(insert_at, root);
         } else if take_until - insert_at == 1 {
-            match self.roots[insert_at].range.overlaps(&range) {
-                Overlap::Equal => self.roots[insert_at].reserve(write),
+            let mut root = self.roots.get_mut(insert_at).expect("root range");
+            match root.range.overlaps(&range) {
+                Overlap::Equal => root.reserve(write),
                 Overlap::WideLess | Overlap::Wide | Overlap::WideGreater => {
                     let node = RangeLock::new(range, write);
-                    self.roots[insert_at].insert(node);
+                    root.insert(node);
                 }
                 Overlap::Narrow => {
-                    let node = self.roots.remove(insert_at);
+                    mem::drop(root);
+                    let node = self.roots.remove(insert_at).expect("root");
                     let mut root = RangeLock::new(range, write);
                     root.insert(node);
                     self.roots.insert(insert_at, root);
@@ -448,14 +451,14 @@ impl<R: Overlaps<R> + fmt::Debug> Version<R> {
             let mut root = RangeLock::new(range, write);
 
             for _ in insert_at..take_until {
-                let node = self.roots.remove(insert_at);
+                let node = self.roots.remove(insert_at).expect("root");
                 root.insert(node);
             }
 
             self.roots.insert(insert_at, root);
         }
 
-        self.roots[insert_at].clone()
+        self.roots.get(insert_at).expect("range").clone()
     }
 
     /// Return `true` if any part of the given range has been reserved for reading.
@@ -484,7 +487,7 @@ impl<R: Overlaps<R> + fmt::Debug> Version<R> {
 }
 
 #[inline]
-fn bisect_left<'a, R>(roots: &'a [RangeLock<R>], range: &'a R) -> usize
+fn bisect_left<'a, R>(roots: &'a List<RangeLock<R>>, range: &'a R) -> usize
 where
     R: Overlaps<R> + 'a,
 {
@@ -494,7 +497,7 @@ where
     while start < end {
         let mid = (start + end) / 2;
 
-        let node = &roots[mid];
+        let node = roots.get(mid).expect("range");
         if node.range.overlaps(range) == Overlap::Less {
             start = mid + 1;
         } else {
@@ -506,7 +509,7 @@ where
 }
 
 #[inline]
-fn bisect_right<'a, R>(roots: &'a [RangeLock<R>], range: &'a R) -> usize
+fn bisect_right<'a, R>(roots: &'a List<RangeLock<R>>, range: &'a R) -> usize
 where
     R: Overlaps<R> + 'a,
 {
@@ -516,7 +519,7 @@ where
     while start < end {
         let mid = (end - start) / 2;
 
-        let node = &roots[mid];
+        let node = roots.get(mid).expect("range");
         if node.range.overlaps(range) == Overlap::Greater {
             end = mid;
         } else {

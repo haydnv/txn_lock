@@ -131,6 +131,18 @@ pub trait Overlaps<T> {
     fn overlaps(&self, other: &T) -> Overlap;
 }
 
+impl<T: Overlaps<T>> Overlaps<T> for Arc<T> {
+    fn overlaps(&self, other: &T) -> Overlap {
+        (&**self).overlaps(&other)
+    }
+}
+
+impl<T: Overlaps<T>> Overlaps<Arc<T>> for Arc<T> {
+    fn overlaps(&self, other: &Arc<T>) -> Overlap {
+        (&**self).overlaps(&**other)
+    }
+}
+
 impl<Idx: PartialOrd<Idx>> Overlaps<Range<Idx>> for Range<Idx> {
     fn overlaps(&self, other: &Self) -> Overlap {
         assert!(self.end >= self.start);
