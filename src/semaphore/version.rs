@@ -411,7 +411,7 @@ pub struct Version<R> {
     roots: List<RangeLock<R>>,
 }
 
-impl<R> Version<R> {
+impl<R: fmt::Debug> Version<R> {
     /// Create a new [`Version`] semaphore
     pub fn new() -> Self {
         Self {
@@ -431,7 +431,7 @@ impl<R: Overlaps<R> + fmt::Debug> Version<R> {
             let root = RangeLock::new(range, write);
             self.roots.insert(insert_at, root);
         } else if take_until - insert_at == 1 {
-            let mut root = self.roots.get_mut(insert_at).expect("root range");
+            let root = self.roots.get_mut(insert_at).expect("root range");
             match root.range.overlaps(&range) {
                 Overlap::Equal => root.reserve(write),
                 Overlap::WideLess | Overlap::Wide | Overlap::WideGreater => {
@@ -489,7 +489,7 @@ impl<R: Overlaps<R> + fmt::Debug> Version<R> {
 #[inline]
 fn bisect_left<'a, R>(roots: &'a List<RangeLock<R>>, range: &'a R) -> usize
 where
-    R: Overlaps<R> + 'a,
+    R: Overlaps<R> + fmt::Debug + 'a,
 {
     let mut start = 0;
     let mut end = roots.len();
@@ -511,7 +511,7 @@ where
 #[inline]
 fn bisect_right<'a, R>(roots: &'a List<RangeLock<R>>, range: &'a R) -> usize
 where
-    R: Overlaps<R> + 'a,
+    R: Overlaps<R> + fmt::Debug + 'a,
 {
     let mut start = 0;
     let mut end = roots.len();
