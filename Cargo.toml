@@ -15,6 +15,7 @@ categories = ["concurrency", "data-structures"]
 logging = ["log"]
 
 [dependencies]
+collate = { path = "../collate" }
 ds-ext = { path = "../ds-ext" }
 futures = "0.3"
 log = { version = "0.4", features = ["release_max_level_info"], optional = true }

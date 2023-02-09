@@ -3,14 +3,13 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::{fmt, mem};
 
+use collate::{Overlap, Overlaps};
 use ds_ext::List;
 use futures::future::{self, Future, TryFutureExt};
 use futures::try_join;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::Result;
-
-use super::{Overlap, Overlaps};
 
 const PERMITS: u32 = u32::MAX >> 3;
 

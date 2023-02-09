@@ -46,11 +46,12 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
 
+use collate::{Overlap, Overlaps};
 use ds_ext::OrdHashMap;
 use tokio::sync::RwLock;
 
 use super::guard::{TxnReadGuard, TxnWriteGuard};
-use super::semaphore::{Overlap, Overlaps, PermitRead, PermitWrite, Semaphore};
+use super::semaphore::{PermitRead, PermitWrite, Semaphore};
 use super::{Error, Result};
 
 /// A read guard on a [`TxnLock`]

@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use super::semaphore::{Overlap, Overlaps};
+use collate::{Overlap, Overlaps};
 
 /// A range used to reserve a permit to acquire a transactional lock
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
