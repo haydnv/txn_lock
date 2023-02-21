@@ -317,3 +317,9 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: Clone + fmt::Debug> TxnLock<I, T> {
         self.state_mut().write(txn_id, permit)
     }
 }
+
+impl<I, T> fmt::Debug for TxnLock<I, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a transactional lock on a scalar")
+    }
+}

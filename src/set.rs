@@ -565,3 +565,9 @@ fn merge<T: Hash + Ord>(canon: &mut Canon<T>, delta: &Delta<T>) {
         };
     }
 }
+
+impl<I, T> fmt::Debug for TxnSetLock<I, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a transactional lock on a set of values")
+    }
+}

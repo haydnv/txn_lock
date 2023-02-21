@@ -838,6 +838,12 @@ where
     }
 }
 
+impl<I, K, V> fmt::Debug for TxnMapLock<I, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a transactional lock on a map of keys to values")
+    }
+}
+
 /// A guard on a value in an [`Iter`]
 #[derive(Debug)]
 pub struct TxnMapIterGuard<V> {
