@@ -103,7 +103,7 @@ use std::{fmt, iter};
 use ds_ext::OrdHashMap;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
-use super::guard::{TxnReadGuard, TxnWriteGuard};
+use super::guard::{TxnReadGuard, TxnReadGuardMap, TxnWriteGuard};
 use super::semaphore::*;
 use super::{Error, Result};
 
@@ -111,6 +111,9 @@ pub use super::range::Range;
 
 /// A read guard on a value in a [`TxnMapLock`]
 pub type TxnMapValueReadGuard<K, V> = TxnReadGuard<Range<K>, V>;
+
+/// A mapped read guard on a value in a [`TxnMapLock`]
+pub type TxnMapValueReadGuardMap<K, V> = TxnReadGuardMap<Range<K>, V>;
 
 /// A write guard on a value in a [`TxnMapLock`]
 pub type TxnMapValueWriteGuard<K, V> = TxnWriteGuard<Range<K>, V>;

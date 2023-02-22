@@ -9,9 +9,21 @@ use super::semaphore::{PermitRead, PermitWrite};
 /// A permit to read a value in a pending read transaction
 #[derive(Debug)]
 pub struct PendingRead<R, T> {
-    #[allow(unused)]
     permit: PermitRead<R>,
     value: Arc<T>,
+}
+
+impl<R, F> PendingRead<R, F> {
+    /// Attempts to make a [`PendingMap`] read guard for a component of the locked data.
+    pub fn try_map<T, E, MapFn>(self, map: MapFn) -> Result<PendingMap<R, T>, E>
+    where
+        MapFn: FnOnce(&F) -> Result<T, E>,
+    {
+        map(&*self.value).map(|value| PendingMap {
+            permit: self.permit,
+            value,
+        })
+    }
 }
 
 impl<R, T> Deref for PendingRead<R, T> {
@@ -22,12 +34,24 @@ impl<R, T> Deref for PendingRead<R, T> {
     }
 }
 
-/// A permit to read a value in a pending write transaction
+/// A permit to read a value in a pending transaction
 #[derive(Debug)]
 pub struct PendingWrite<R, T> {
-    #[allow(unused)]
     permit: PermitRead<R>,
     value: OwnedRwLockReadGuard<T>,
+}
+
+impl<R, F> PendingWrite<R, F> {
+    /// Attempts to make a [`PendingMap`] read guard for a component of the locked data.
+    pub fn try_map<T, E, MapFn>(self, map: MapFn) -> Result<PendingMap<R, T>, E>
+    where
+        MapFn: FnOnce(&F) -> Result<T, E>,
+    {
+        map(&*self.value).map(|value| PendingMap {
+            permit: self.permit,
+            value,
+        })
+    }
 }
 
 impl<R, T> Deref for PendingWrite<R, T> {
@@ -35,6 +59,22 @@ impl<R, T> Deref for PendingWrite<R, T> {
 
     fn deref(&self) -> &Self::Target {
         self.value.deref()
+    }
+}
+
+/// A permit to read a mapped value in a pending transaction
+#[derive(Debug)]
+pub struct PendingMap<R, T> {
+    #[allow(unused)]
+    permit: PermitRead<R>,
+    value: T,
+}
+
+impl<R, T> Deref for PendingMap<R, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
     }
 }
 
@@ -63,6 +103,20 @@ impl<R, T> TxnReadGuard<R, T> {
     }
 }
 
+impl<R, F> TxnReadGuard<R, F> {
+    /// Construct a [`TxnReadGuard`] map with a specific component of this [`TxnReadGuard`].
+    pub fn try_map<T, E, MapFn>(self, map: MapFn) -> Result<TxnReadGuardMap<R, T>, E>
+    where
+        MapFn: FnOnce(&F) -> Result<T, E>,
+    {
+        match self {
+            Self::Committed(value) => map(&*value).map(|value| TxnReadGuardMap::Committed(value)),
+            Self::PendingRead(guard) => guard.try_map(map).map(TxnReadGuardMap::Pending),
+            Self::PendingWrite(guard) => guard.try_map(map).map(TxnReadGuardMap::Pending),
+        }
+    }
+}
+
 impl<R, T> Deref for TxnReadGuard<R, T> {
     type Target = T;
 
@@ -84,6 +138,23 @@ impl<R, T: PartialEq> PartialEq<T> for TxnReadGuard<R, T> {
 impl<R, T: PartialOrd> PartialOrd<T> for TxnReadGuard<R, T> {
     fn partial_cmp(&self, other: &T) -> Option<Ordering> {
         self.deref().partial_cmp(other)
+    }
+}
+
+/// A read guard on a value mapped from a [`TxnReadGuard`]
+pub enum TxnReadGuardMap<R, T> {
+    Committed(T),
+    Pending(PendingMap<R, T>),
+}
+
+impl<R, T> Deref for TxnReadGuardMap<R, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Committed(value) => value,
+            Self::Pending(value) => value.deref(),
+        }
     }
 }
 
