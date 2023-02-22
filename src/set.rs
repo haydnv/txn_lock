@@ -47,6 +47,7 @@
 //! assert_eq!(new_values, set.try_clear(4).expect("clear"));
 //! ```
 
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::hash_map::{self, HashMap};
 use std::collections::HashSet;
@@ -119,12 +120,20 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
     }
 
     #[inline]
-    fn contains_canon(&self, txn_id: &I, key: &T) -> bool {
+    fn contains_canon<Q>(&self, txn_id: &I, key: &Q) -> bool
+    where
+        Q: Eq + Hash + ?Sized,
+        Arc<T>: Borrow<Q>,
+    {
         contains_canon(&self.canon, &self.committed, txn_id, key)
     }
 
     #[inline]
-    fn contains_committed(&self, txn_id: &I, key: &T) -> Poll<Result<bool>> {
+    fn contains_committed<Q>(&self, txn_id: &I, key: &Q) -> Poll<Result<bool>>
+    where
+        Q: Eq + Hash + ?Sized,
+        Arc<T>: Borrow<Q>,
+    {
         match self.finalized.as_ref().cmp(&Some(txn_id)) {
             Ordering::Greater => Poll::Ready(Err(Error::Outdated)),
             Ordering::Equal => Poll::Ready(Ok(self.contains_canon(txn_id, key))),
@@ -139,7 +148,11 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
     }
 
     #[inline]
-    fn contains_pending(&self, txn_id: &I, key: &T) -> bool {
+    fn contains_pending<Q>(&self, txn_id: &I, key: &Q) -> bool
+    where
+        Q: Eq + Hash + ?Sized,
+        Arc<T>: Borrow<Q>,
+    {
         if let Some(delta) = self.pending.get(txn_id) {
             if let Some(key_state) = delta.get(key) {
                 return *key_state;
@@ -156,6 +169,21 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
         } else {
             let delta = iter::once((key, true)).collect();
             self.pending.insert(txn_id, delta);
+        }
+    }
+
+    #[inline]
+    fn key<Q>(&self, txn_id: &I, key: &Q) -> Option<&Arc<T>>
+    where
+        Q: Eq + Hash + ?Sized,
+        Arc<T>: Borrow<Q>,
+    {
+        if let Some(key) = self.canon.get(key) {
+            Some(key)
+        } else if let Some(deltas) = self.pending.get(txn_id) {
+            deltas.get_key_value(key).map(|(key, _present)| key)
+        } else {
+            None
         }
     }
 
@@ -184,10 +212,17 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
 }
 
 #[inline]
-fn contains_canon<I, T>(canon: &Canon<T>, committed: &Committed<I, T>, txn_id: &I, key: &T) -> bool
+fn contains_canon<I, T, Q>(
+    canon: &Canon<T>,
+    committed: &Committed<I, T>,
+    txn_id: &I,
+    key: &Q,
+) -> bool
 where
     I: Hash + Ord + fmt::Debug,
     T: Hash + Ord,
+    Q: Eq + Hash + ?Sized,
+    Arc<T>: Borrow<Q>,
 {
     let committed = committed
         .iter()
@@ -246,6 +281,16 @@ where
         }
     }
 
+    /// Construct a new [`TxnSetLock`] with the given `contents`.
+    pub fn with_contents<C: IntoIterator<Item = T>>(txn_id: I, contents: C) -> Self {
+        let set = contents.into_iter().map(Arc::new).collect();
+
+        Self {
+            state: Arc::new(RwLockInner::new(State::new(txn_id, set))),
+            semaphore: Semaphore::with_reservation(txn_id, Range::All),
+        }
+    }
+
     /// Commit the state of this [`TxnSetLock`] at `txn_id`.
     pub fn commit(&self, txn_id: I) {
         let mut state = self.state_mut();
@@ -275,6 +320,20 @@ where
         }
     }
 
+    /// Roll back the state of this [`TxnSetLock`] at `txn_id`.
+    pub fn rollback(&self, txn_id: &I) {
+        let mut state = self.state_mut();
+
+        assert!(
+            !state.committed.contains_key(txn_id),
+            "cannot roll back committed transaction {:?}",
+            txn_id
+        );
+
+        self.semaphore.finalize(txn_id, false);
+        state.pending.remove(txn_id);
+    }
+
     /// Finalize the state of this [`TxnSetLock`] at `txn_id`.
     /// This will merge in deltas and prevent further reads of versions earlier than `txn_id`.
     pub fn finalize(&self, txn_id: I) {
@@ -298,36 +357,48 @@ where
         state.finalized = Some(txn_id);
     }
 
-    /// Construct a new [`TxnSetLock`] with the given `contents`.
-    pub fn with_contents<C: IntoIterator<Item = T>>(txn_id: I, contents: C) -> Self {
-        let set = contents.into_iter().map(Arc::new).collect();
-
-        Self {
-            state: Arc::new(RwLockInner::new(State::new(txn_id, set))),
-            semaphore: Semaphore::with_reservation(txn_id, Range::All),
-        }
-    }
-
     /// Check whether the given `key` is present in this [`TxnSetLock`] at `txn_id`.
-    pub async fn contains(&self, txn_id: I, key: &Arc<T>) -> Result<bool> {
+    pub async fn contains<Q>(&self, txn_id: I, key: &Q) -> Result<bool>
+    where
+        Q: Eq + Hash + Clone + ?Sized,
+        Arc<T>: Borrow<Q> + From<Q>,
+    {
         // before acquiring a permit, check if this version has already been committed
-        if let Poll::Ready(result) = self.state().contains_committed(&txn_id, key) {
-            return result;
-        }
+        let range_key = {
+            let state = self.state();
+            if let Poll::Ready(result) = self.state().contains_committed(&txn_id, key) {
+                return result;
+            } else if let Some(key) = state.key(&txn_id, key) {
+                key.clone()
+            } else {
+                key.clone().into()
+            }
+        };
 
-        let _permit = self.semaphore.read(txn_id, Range::One(key.clone())).await?;
+        let _permit = self.semaphore.read(txn_id, Range::One(range_key)).await?;
         Ok(self.state().contains_pending(&txn_id, key))
     }
 
     /// Synchronously check whether the given `key` is present in this [`TxnSetLock`], if possible.
-    pub fn try_contains(&self, txn_id: I, key: &Arc<T>) -> Result<bool> {
+    pub fn try_contains<Q>(&self, txn_id: I, key: &Q) -> Result<bool>
+    where
+        Q: Eq + Hash + Clone + ?Sized,
+        Arc<T>: Borrow<Q> + From<Q>,
+    {
         // before acquiring a permit, check if this version has already been committed
-        if let Poll::Ready(result) = self.state().contains_committed(&txn_id, key) {
+        let state = self.state();
+        if let Poll::Ready(result) = state.contains_committed(&txn_id, key) {
             return result;
         }
 
-        let _permit = self.semaphore.try_read(txn_id, Range::One(key.clone()))?;
-        Ok(self.state().contains_pending(&txn_id, key))
+        let range_key = if let Some(key) = state.key(&txn_id, key) {
+            key.clone()
+        } else {
+            key.clone().into()
+        };
+
+        let _permit = self.semaphore.try_read(txn_id, Range::One(range_key))?;
+        Ok(state.contains_pending(&txn_id, key))
     }
 
     /// Remove and return all keys in this [`TxnSetLock`] at `txn_id`.
@@ -501,20 +572,6 @@ where
         let range = Range::One(key.clone());
         let _permit = self.semaphore.try_write(txn_id, range)?;
         Ok(state.remove(txn_id, key))
-    }
-
-    /// Roll back the state of this [`TxnSetLock`] at `txn_id`.
-    pub fn rollback(&self, txn_id: &I) {
-        let mut state = self.state_mut();
-
-        assert!(
-            !state.committed.contains_key(txn_id),
-            "cannot roll back committed transaction {:?}",
-            txn_id
-        );
-
-        self.semaphore.finalize(txn_id, false);
-        state.pending.remove(txn_id);
     }
 }
 

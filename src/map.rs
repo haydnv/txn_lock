@@ -91,6 +91,7 @@
 //!
 //! ```
 
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::hash_map::{self, HashMap};
 use std::collections::HashSet;
@@ -226,16 +227,24 @@ where
     }
 
     #[inline]
-    fn get_canon(&self, txn_id: &I, key: &K) -> Option<Arc<V>> {
+    fn get_canon<Q>(&self, txn_id: &I, key: &Q) -> Option<Arc<V>>
+    where
+        Q: Hash + Eq + ?Sized,
+        Arc<K>: Borrow<Q>,
+    {
         get_canon(&self.canon, &self.committed, txn_id, key).cloned()
     }
 
     #[inline]
-    fn get_committed(
+    fn get_committed<Q>(
         &self,
         txn_id: &I,
-        key: &K,
-    ) -> Poll<Result<Option<TxnMapValueReadGuard<K, V>>>> {
+        key: &Q,
+    ) -> Poll<Result<Option<TxnMapValueReadGuard<K, V>>>>
+    where
+        Q: Hash + Eq + ?Sized,
+        Arc<K>: Borrow<Q>,
+    {
         if self.finalized.as_ref() > Some(txn_id) {
             Poll::Ready(Err(Error::Outdated))
         } else if self.committed.contains_key(txn_id) {
@@ -248,7 +257,11 @@ where
     }
 
     #[inline]
-    fn get_pending(&self, txn_id: &I, key: &K) -> Option<PendingValue<V>> {
+    fn get_pending<Q>(&self, txn_id: &I, key: &Q) -> Option<PendingValue<V>>
+    where
+        Q: Eq + Hash + ?Sized,
+        Arc<K>: Borrow<Q>,
+    {
         if let Some(version) = self.pending.get(txn_id) {
             if let Some(delta) = version.get(key) {
                 return if let Some(value) = delta {
@@ -295,6 +308,21 @@ where
             self.pending.insert(txn_id, pending);
 
             prior
+        }
+    }
+
+    #[inline]
+    fn key<Q>(&self, txn_id: &I, key: &Q) -> Option<&Arc<K>>
+    where
+        Q: Eq + Hash + ?Sized,
+        Arc<K>: Borrow<Q>,
+    {
+        if let Some((key, _)) = self.canon.get_key_value(key) {
+            Some(key)
+        } else if let Some(deltas) = self.pending.get(txn_id) {
+            deltas.get_key_value(key).map(|(key, _delta)| key)
+        } else {
+            None
         }
     }
 
@@ -426,15 +454,17 @@ where
 }
 
 #[inline]
-fn get_canon<'a, I, K, V>(
+fn get_canon<'a, I, K, V, Q>(
     canon: &'a Canon<K, V>,
     committed: &'a Committed<I, K, V>,
     txn_id: &'a I,
-    key: &'a K,
+    key: &'a Q,
 ) -> Option<&'a Arc<V>>
 where
     I: Hash + Ord + fmt::Debug,
     K: Hash + Ord,
+    Q: Eq + Hash + ?Sized,
+    Arc<K>: Borrow<Q>,
 {
     let committed = committed
         .iter()
@@ -631,6 +661,20 @@ where
         }
     }
 
+    /// Roll back the state of this [`TxnMapLock`] at `txn_id`.
+    pub fn rollback(&self, txn_id: &I) {
+        let mut state = self.state_mut();
+
+        assert!(
+            !state.committed.contains_key(txn_id),
+            "cannot roll back committed transaction {:?}",
+            txn_id
+        );
+
+        self.semaphore.finalize(txn_id, false);
+        state.pending.remove(txn_id);
+    }
+
     /// Finalize the state of this [`TxnMapLock`] at `txn_id`.
     /// This will finalize commits and prevent further reads of versions earlier than `txn_id`.
     pub fn finalize(&self, txn_id: I) {
@@ -703,13 +747,25 @@ where
     }
 
     /// Read a value from this [`TxnMapLock`] at `txn_id`.
-    pub async fn get(&self, txn_id: I, key: &Arc<K>) -> Result<Option<TxnMapValueReadGuard<K, V>>> {
+    pub async fn get<Q>(&self, txn_id: I, key: &Q) -> Result<Option<TxnMapValueReadGuard<K, V>>>
+    where
+        Q: Eq + Hash + Clone + ?Sized,
+        Arc<K>: Borrow<Q> + From<Q>,
+    {
         // before acquiring a permit, check if this version has already been committed
-        if let Poll::Ready(result) = self.state().get_committed(&txn_id, key) {
-            return result;
-        }
+        let range_key = {
+            let state = self.state();
 
-        let permit = self.semaphore.read(txn_id, Range::One(key.clone())).await?;
+            if let Poll::Ready(result) = state.get_committed(&txn_id, key) {
+                return result;
+            } else if let Some(key) = state.key(&txn_id, key) {
+                key.clone()
+            } else {
+                key.clone().into()
+            }
+        };
+
+        let permit = self.semaphore.read(txn_id, Range::One(range_key)).await?;
         let value = self
             .state()
             .get_pending(&txn_id, key)
@@ -722,7 +778,11 @@ where
     }
 
     /// Read a value from this [`TxnMapLock`] at `txn_id` synchronously, if possible.
-    pub fn try_get(&self, txn_id: I, key: &Arc<K>) -> Result<Option<TxnMapValueReadGuard<K, V>>> {
+    pub fn try_get<Q>(&self, txn_id: I, key: &Q) -> Result<Option<TxnMapValueReadGuard<K, V>>>
+    where
+        Q: Eq + Hash + Clone + ?Sized,
+        Arc<K>: Borrow<Q> + From<Q>,
+    {
         let state = self.state();
 
         // before acquiring a permit, check if this version has already been committed
@@ -730,7 +790,13 @@ where
             return result;
         }
 
-        let permit = self.semaphore.try_read(txn_id, Range::One(key.clone()))?;
+        let range_key = if let Some(key) = state.key(&txn_id, key) {
+            key.clone()
+        } else {
+            key.clone().into()
+        };
+
+        let permit = self.semaphore.try_read(txn_id, Range::One(range_key))?;
         let value = state.get_pending(&txn_id, key).map(|value| match value {
             PendingValue::Committed(value) => TxnMapValueReadGuard::committed(value),
             PendingValue::Pending(value) => TxnMapValueReadGuard::pending_write(permit, value),
@@ -830,20 +896,6 @@ where
         let _permit = self.semaphore.try_write(txn_id, range)?;
 
         Ok(state.remove(txn_id, key))
-    }
-
-    /// Roll back the state of this [`TxnMapLock`] at `txn_id`.
-    pub fn rollback(&self, txn_id: &I) {
-        let mut state = self.state_mut();
-
-        assert!(
-            !state.committed.contains_key(txn_id),
-            "cannot roll back committed transaction {:?}",
-            txn_id
-        );
-
-        self.semaphore.finalize(txn_id, false);
-        state.pending.remove(txn_id);
     }
 }
 
@@ -1032,21 +1084,23 @@ where
 }
 
 #[inline]
-fn get_key<I, K, V>(
+fn get_key<I, K, V, Q>(
     state: &State<I, K, V>,
     txn_id: &I,
-    key: &K,
+    key: &Q,
     committed: bool,
 ) -> Option<PendingValue<V>>
 where
     I: Copy + Hash + Ord + fmt::Debug,
     K: Hash + Ord,
     V: fmt::Debug,
+    Q: Eq + Hash + ?Sized,
+    Arc<K>: Borrow<Q>,
 {
     if committed {
-        state.get_canon(txn_id, &key).map(PendingValue::Committed)
+        state.get_canon(txn_id, key).map(PendingValue::Committed)
     } else {
-        state.get_pending(txn_id, &key)
+        state.get_pending(txn_id, key)
     }
 }
 
