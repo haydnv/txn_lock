@@ -405,6 +405,21 @@ where
             Some(guard)
         }
     }
+
+    #[inline]
+    fn insert_new(&mut self, txn_id: I, key: Arc<K>, value: V) -> OwnedRwLockWriteGuard<V> {
+        let value = Arc::new(RwLock::new(value));
+        let guard = value.clone().try_write_owned().expect("value");
+
+        if let Some(version) = self.pending.get_mut(&txn_id) {
+            assert!(version.insert(key, Some(value)).is_none());
+        } else {
+            let version = iter::once((key, Some(value))).collect();
+            self.pending.insert(txn_id, version);
+        }
+
+        guard
+    }
 }
 
 #[inline]
@@ -443,6 +458,68 @@ fn merge_keys<K: Hash + Ord, V>(keys: &mut HashSet<Arc<K>>, deltas: &Delta<K, V>
         } else {
             keys.remove(key);
         }
+    }
+}
+
+/// An occupied entry in a [`TxnMapLock`]
+pub struct EntryOccupied<K, V> {
+    key: Arc<K>,
+    value: TxnMapValueWriteGuard<K, V>,
+}
+
+impl<K, V> EntryOccupied<K, V> {
+    /// Borrow this entry's value.
+    pub fn get(&self) -> &V {
+        self.value.deref()
+    }
+
+    /// Borrow this entry's value mutably.
+    pub fn get_mut(&mut self) -> &mut V {
+        self.value.deref_mut()
+    }
+
+    /// Borrow this entry's key.
+    pub fn key(&self) -> &K {
+        &*self.key
+    }
+}
+
+/// A vacant entry in a [`TxnMapLock`]
+pub struct EntryVacant<I, K, V> {
+    permit: PermitWrite<Range<K>>,
+    txn_id: I,
+    key: Arc<K>,
+    map_state: Arc<RwLockInner<State<I, K, V>>>,
+}
+
+impl<I, K, V> EntryVacant<I, K, V>
+where
+    I: Hash + Ord + Copy + fmt::Debug,
+    K: Hash + Ord + Clone + fmt::Debug,
+    V: Clone + fmt::Debug,
+{
+    /// Insert a new value at this [`Entry`].
+    pub fn insert(self, value: V) -> TxnMapValueWriteGuard<K, V> {
+        let mut map_state = self.map_state.write().expect("lock state");
+        let value = map_state.insert_new(self.txn_id, self.key, value);
+        TxnMapValueWriteGuard::new(self.permit, value)
+    }
+
+    /// Borrow this entry's key.
+    pub fn key(&self) -> &K {
+        &*self.key
+    }
+}
+
+/// An entry in a [`TxnMapLock`]
+pub enum Entry<I, K, V> {
+    Occupied(EntryOccupied<K, V>),
+    Vacant(EntryVacant<I, K, V>),
+}
+
+impl<I, K, V> Entry<I, K, V> {
+    pub fn key(&self) -> &K {
+        todo!()
     }
 }
 
@@ -773,6 +850,29 @@ where
     K: Hash + Ord + fmt::Debug,
     V: Clone + fmt::Debug,
 {
+    /// Borrow an [`Entry`] mutably for writing at `txn_id`.
+    pub async fn entry<Q: Into<Arc<K>>>(&self, txn_id: I, key: Q) -> Result<Entry<I, K, V>> {
+        // before acquiring a permit, check if this version has already been committed
+        self.state().check_pending(&txn_id)?;
+
+        let key = key.into();
+        let range = Range::One(key.clone());
+        let permit = self.semaphore.write(txn_id, range).await?;
+
+        if let Some(value) = self.state_mut().get_mut(txn_id, key.clone()) {
+            Ok(Entry::Occupied(EntryOccupied {
+                key,
+                value: TxnMapValueWriteGuard::new(permit, value),
+            }))
+        } else {
+            Ok(Entry::Vacant(EntryVacant {
+                permit,
+                key,
+                txn_id,
+                map_state: self.state.clone(),
+            }))
+        }
+    }
     /// Read a mutable value from this [`TxnMapLock`] at `txn_id`.
     pub async fn get_mut<Q: Into<Arc<K>>>(
         &self,
