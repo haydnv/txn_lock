@@ -616,13 +616,13 @@ where
     /// Commit the state of this [`TxnMapLock`] at `txn_id`.
     /// Panics:
     ///  - if any new value to commit is still locked (for reading or writing)
-    pub fn commit(&self, txn_id: I) {
+    pub fn commit(&self, txn_id: I) -> Option<Delta<K, V>> {
         let mut state = self.state_mut();
 
         if state.finalized.as_ref() >= Some(&txn_id) {
             #[cfg(feature = "logging")]
             log::warn!("committed already-finalized version {:?}", txn_id);
-            return;
+            return None;
         }
 
         self.semaphore.finalize(&txn_id, false);
@@ -649,15 +649,24 @@ where
 
         if finalize {
             assert!(!state.committed.contains_key(&txn_id));
-            let deltas = version.expect("committed version");
-            merge(&mut state.canon, deltas);
+            let deltas: Delta<K, V> = version.expect("committed version");
+            merge(&mut state.canon, deltas.clone());
             state.finalized = Some(txn_id);
+            Some(deltas)
         } else if let Some(deltas) = version {
-            assert!(state.committed.insert(txn_id, Some(deltas)).is_none());
+            assert!(state
+                .committed
+                .insert(txn_id, Some(deltas.clone()))
+                .is_none());
+
+            Some(deltas)
         } else if let Some(prior_commit) = state.committed.insert(txn_id, None) {
             assert!(prior_commit.is_none());
             #[cfg(feature = "logging")]
             log::warn!("duplicate commit at {:?}", txn_id);
+            None
+        } else {
+            None
         }
     }
 

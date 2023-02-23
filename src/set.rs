@@ -297,13 +297,14 @@ where
     }
 
     /// Commit the state of this [`TxnSetLock`] at `txn_id`.
-    pub fn commit(&self, txn_id: I) {
+    /// Returns the set of deltas committed, if any.
+    pub fn commit(&self, txn_id: I) -> Option<Delta<T>> {
         let mut state = self.state_mut();
 
         if state.finalized.as_ref() >= Some(&txn_id) {
             #[cfg(feature = "logging")]
             log::warn!("committed already-finalized version {:?}", txn_id);
-            return;
+            return None;
         }
 
         self.semaphore.finalize(&txn_id, false);
@@ -314,14 +315,23 @@ where
         if finalize {
             assert!(!state.committed.contains_key(&txn_id));
             let delta = version.expect("committed version");
-            merge_owned::<I, T>(&mut state.canon, delta);
+            merge(&mut state.canon, &delta);
             state.finalized = Some(txn_id);
+            Some(delta)
         } else if let Some(delta) = version {
-            assert!(state.committed.insert(txn_id, Some(delta)).is_none());
+            assert!(state
+                .committed
+                .insert(txn_id, Some(delta.clone()))
+                .is_none());
+
+            Some(delta)
         } else if let Some(prior_commit) = state.committed.insert(txn_id, None) {
             assert!(prior_commit.is_none());
             #[cfg(feature = "logging")]
             log::warn!("duplicate commit at {:?}", txn_id);
+            None
+        } else {
+            None
         }
     }
 
@@ -347,7 +357,7 @@ where
         while let Some(version_id) = state.committed.keys().next().copied() {
             if version_id <= txn_id {
                 if let Some(delta) = state.committed.remove(&version_id).expect("version") {
-                    merge_owned::<I, T>(&mut state.canon, delta);
+                    merge_owned::<T>(&mut state.canon, delta);
                 }
             } else {
                 break;
@@ -610,7 +620,7 @@ impl<T> Iterator for Iter<T> {
 }
 
 #[inline]
-fn merge_owned<I: Ord, T: Hash + Ord>(canon: &mut Canon<T>, delta: Delta<T>) {
+fn merge_owned<T: Hash + Ord>(canon: &mut Canon<T>, delta: Delta<T>) {
     for (key, key_state) in delta {
         match key_state {
             true => canon.insert(key),
