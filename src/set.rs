@@ -336,7 +336,7 @@ where
     }
 
     /// Roll back the state of this [`TxnSetLock`] at `txn_id`.
-    pub fn rollback(&self, txn_id: &I) {
+    pub fn rollback(&self, txn_id: &I) -> Option<Delta<T>> {
         let mut state = self.state_mut();
 
         assert!(
@@ -346,7 +346,7 @@ where
         );
 
         self.semaphore.finalize(txn_id, false);
-        state.pending.remove(txn_id);
+        state.pending.remove(txn_id)
     }
 
     /// Finalize the state of this [`TxnSetLock`] at `txn_id`.

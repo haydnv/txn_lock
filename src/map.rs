@@ -671,7 +671,9 @@ where
     }
 
     /// Roll back the state of this [`TxnMapLock`] at `txn_id`.
-    pub fn rollback(&self, txn_id: &I) {
+    ///
+    /// Panics: if any updated value is still locked for reading or writing.
+    pub fn rollback(&self, txn_id: &I) -> Option<HashMap<Arc<K>, Option<V>>> {
         let mut state = self.state_mut();
 
         assert!(
@@ -681,7 +683,20 @@ where
         );
 
         self.semaphore.finalize(txn_id, false);
-        state.pending.remove(txn_id);
+
+        state.pending.remove(txn_id).map(|delta| {
+            delta
+                .into_iter()
+                .map(|(key, maybe_lock)| {
+                    let value = maybe_lock.map(|lock| {
+                        let lock = Arc::try_unwrap(lock).expect("value");
+                        lock.into_inner()
+                    });
+
+                    (key.into(), value)
+                })
+                .collect()
+        })
     }
 
     /// Finalize the state of this [`TxnMapLock`] at `txn_id`.
