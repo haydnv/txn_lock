@@ -11,40 +11,45 @@
 //!
 //! let set = TxnSetLock::<u64, String>::new(0);
 //!
-//! let one = Arc::new("one".to_string());
-//! let two = Arc::new("two".to_string());
+//! let one = "one";
+//! let two = "two";
 //!
-//! assert!(!block_on(set.contains(1, &one)).expect("contains"));
-//! block_on(set.insert(1, one.clone())).expect("insert");
-//! assert!(set.try_contains(1, &one).expect("contains"));
-//! assert_eq!(set.try_insert(2, one.clone()).unwrap_err(), Error::WouldBlock);
+//! assert!(!block_on(set.contains(1, one)).expect("contains"));
+//! block_on(set.insert(1, one.to_string())).expect("insert");
+//! assert!(set.try_contains(1, one).expect("contains"));
+//! assert_eq!(set.try_insert(2, one.to_string()).unwrap_err(), Error::WouldBlock);
 //! set.commit(1);
 //!
-//! assert!(set.try_contains(2, &one).expect("contains"));
-//! assert_eq!(block_on(set.iter(2)).expect("iter").collect::<Vec<Arc<String>>>(), vec![one.clone()]);
-//! assert!(block_on(set.remove(2, one.clone())).expect("remove"));
-//! assert!(!set.try_contains(2, &one).expect("contains"));
-//! assert!(!set.try_remove(2, one.clone()).expect("remove"));
-//! assert!(!set.try_contains(2, &one).expect("contains"));
-//! assert!(!set.try_remove(2, two.clone()).expect("remove"));
-//! set.try_insert(2, two.clone()).expect("insert");
+//! assert!(set.try_contains(2, one).expect("contains"));
+//! assert_eq!(
+//!     block_on(set.iter(2)).expect("iter").collect::<Vec<Arc<String>>>(),
+//!     vec![Arc::new(one.to_string())]
+//! );
+//! assert!(block_on(set.remove(2, one)).expect("remove"));
+//! assert!(!set.try_contains(2, one).expect("contains"));
+//! assert!(!set.try_remove(2, one).expect("remove"));
+//! assert!(!set.try_contains(2, one).expect("contains"));
+//! assert!(!set.try_remove(2, two).expect("remove"));
+//! set.try_insert(2, two.to_string()).expect("insert");
 //! set.finalize(2);
 //!
-//! assert_eq!(set.try_contains(1, &one).unwrap_err(), Error::Outdated);
-//! assert!(set.try_contains(3, &one).expect("contains"));
-//! assert!(set.try_remove(3, one.clone()).expect("remove"));
+//! assert_eq!(set.try_contains(1, one).unwrap_err(), Error::Outdated);
+//! assert!(set.try_contains(3, one).expect("contains"));
+//! assert!(set.try_remove(3, one).expect("remove"));
 //! assert!(!set.try_remove(3, one).expect("remove"));
 //! assert!(!set.try_remove(3, two).expect("remove"));
 //! set.commit(3);
 //!
-//! let new_values: HashSet<Arc<String>> = ["one", "two", "three", "four"]
+//! let new_values: HashSet<String> = ["one", "two", "three", "four"]
 //!     .into_iter()
 //!     .map(String::from)
-//!     .map(Arc::from)
 //!     .collect();
 //!
 //! set.try_extend(4, new_values.clone()).expect("extend");
-//! assert_eq!(new_values, set.try_clear(4).expect("clear"));
+//! assert_eq!(
+//!     new_values.into_iter().map(Arc::from).collect::<HashSet<Arc<String>>>(),
+//!     set.try_clear(4).expect("clear").into_iter().map(Arc::from).collect::<HashSet<_>>()
+//! );
 //! ```
 
 use std::borrow::Borrow;
@@ -62,10 +67,10 @@ use ds_ext::OrdHashMap;
 use super::semaphore::{PermitRead, Semaphore};
 use super::{Error, Result};
 
-pub use super::range::Range;
+pub use super::range::{Key, Range};
 
-type Delta<T> = HashMap<Arc<T>, bool>;
-type Canon<T> = HashSet<Arc<T>>;
+type Delta<T> = HashMap<Key<T>, bool>;
+type Canon<T> = HashSet<Key<T>>;
 type Committed<I, T> = OrdHashMap<I, Option<Delta<T>>>;
 
 struct State<I, T> {
@@ -123,7 +128,7 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
     fn contains_canon<Q>(&self, txn_id: &I, key: &Q) -> bool
     where
         Q: Eq + Hash + ?Sized,
-        Arc<T>: Borrow<Q>,
+        Key<T>: Borrow<Q>,
     {
         contains_canon(&self.canon, &self.committed, txn_id, key)
     }
@@ -132,7 +137,7 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
     fn contains_committed<Q>(&self, txn_id: &I, key: &Q) -> Poll<Result<bool>>
     where
         Q: Eq + Hash + ?Sized,
-        Arc<T>: Borrow<Q>,
+        Key<T>: Borrow<Q>,
     {
         match self.finalized.as_ref().cmp(&Some(txn_id)) {
             Ordering::Greater => Poll::Ready(Err(Error::Outdated)),
@@ -151,7 +156,7 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
     fn contains_pending<Q>(&self, txn_id: &I, key: &Q) -> bool
     where
         Q: Eq + Hash + ?Sized,
-        Arc<T>: Borrow<Q>,
+        Key<T>: Borrow<Q>,
     {
         if let Some(delta) = self.pending.get(txn_id) {
             if let Some(key_state) = delta.get(key) {
@@ -163,7 +168,7 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
     }
 
     #[inline]
-    fn insert(&mut self, txn_id: I, key: Arc<T>) {
+    fn insert(&mut self, txn_id: I, key: Key<T>) {
         if let Some(pending) = self.pending.get_mut(&txn_id) {
             pending.insert(key, true);
         } else {
@@ -173,10 +178,10 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
     }
 
     #[inline]
-    fn key<Q>(&self, txn_id: &I, key: &Q) -> Option<&Arc<T>>
+    fn key<Q>(&self, txn_id: &I, key: &Q) -> Option<&Key<T>>
     where
         Q: Eq + Hash + ?Sized,
-        Arc<T>: Borrow<Q>,
+        Key<T>: Borrow<Q>,
     {
         if let Some(key) = self.canon.get(key) {
             Some(key)
@@ -188,7 +193,7 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
     }
 
     #[inline]
-    fn remove(&mut self, txn_id: I, key: Arc<T>) -> bool {
+    fn remove(&mut self, txn_id: I, key: Key<T>) -> bool {
         if let Some(pending) = self.pending.get_mut(&txn_id) {
             match pending.entry(key) {
                 hash_map::Entry::Occupied(mut entry) => entry.insert(false),
@@ -222,7 +227,7 @@ where
     I: Hash + Ord + fmt::Debug,
     T: Hash + Ord,
     Q: Eq + Hash + ?Sized,
-    Arc<T>: Borrow<Q>,
+    Key<T>: Borrow<Q>,
 {
     let committed = committed
         .iter()
@@ -283,7 +288,7 @@ where
 
     /// Construct a new [`TxnSetLock`] with the given `contents`.
     pub fn with_contents<C: IntoIterator<Item = T>>(txn_id: I, contents: C) -> Self {
-        let set = contents.into_iter().map(Arc::new).collect();
+        let set = contents.into_iter().map(Key::new).collect();
 
         Self {
             state: Arc::new(RwLockInner::new(State::new(txn_id, set))),
@@ -360,30 +365,28 @@ where
     /// Check whether the given `key` is present in this [`TxnSetLock`] at `txn_id`.
     pub async fn contains<Q>(&self, txn_id: I, key: &Q) -> Result<bool>
     where
-        Q: Eq + Hash + Clone + ?Sized,
-        Arc<T>: Borrow<Q> + From<Q>,
+        Q: Eq + Hash + ToOwned<Owned = T> + ?Sized,
+        Key<T>: Borrow<Q>,
     {
         // before acquiring a permit, check if this version has already been committed
-        let range_key = {
+        let range: Range<T> = {
             let state = self.state();
             if let Poll::Ready(result) = self.state().contains_committed(&txn_id, key) {
                 return result;
-            } else if let Some(key) = state.key(&txn_id, key) {
-                key.clone()
             } else {
-                key.clone().into()
+                Key::<T>::from((key, state.key(&txn_id, key))).into()
             }
         };
 
-        let _permit = self.semaphore.read(txn_id, Range::One(range_key)).await?;
+        let _permit = self.semaphore.read(txn_id, range).await?;
         Ok(self.state().contains_pending(&txn_id, key))
     }
 
     /// Synchronously check whether the given `key` is present in this [`TxnSetLock`], if possible.
     pub fn try_contains<Q>(&self, txn_id: I, key: &Q) -> Result<bool>
     where
-        Q: Eq + Hash + Clone + ?Sized,
-        Arc<T>: Borrow<Q> + From<Q>,
+        Q: Eq + Hash + ToOwned<Owned = T> + ?Sized,
+        Key<T>: Borrow<Q>,
     {
         // before acquiring a permit, check if this version has already been committed
         let state = self.state();
@@ -391,13 +394,8 @@ where
             return result;
         }
 
-        let range_key = if let Some(key) = state.key(&txn_id, key) {
-            key.clone()
-        } else {
-            key.clone().into()
-        };
-
-        let _permit = self.semaphore.try_read(txn_id, Range::One(range_key))?;
+        let range = Key::<T>::from((key, state.key(&txn_id, key))).into();
+        let _permit = self.semaphore.try_read(txn_id, range)?;
         Ok(state.contains_pending(&txn_id, key))
     }
 
@@ -450,7 +448,7 @@ where
     /// Insert the `other` keys into this [`TxnSetLock`] at `txn_id`.
     pub async fn extend<K, E>(&self, txn_id: I, other: E) -> Result<()>
     where
-        K: Into<Arc<T>>,
+        K: Into<Key<T>>,
         E: IntoIterator<Item = K>,
     {
         // before acquiring a permit, check if this version has already been committed
@@ -468,7 +466,7 @@ where
     /// Insert the `other` keys into this [`TxnSetLock`] at `txn_id` synchronously, if possible.
     pub fn try_extend<K, E>(&self, txn_id: I, other: E) -> Result<()>
     where
-        K: Into<Arc<T>>,
+        K: Into<Key<T>>,
         E: IntoIterator<Item = K>,
     {
         let mut state = self.state_mut();
@@ -528,49 +526,57 @@ where
     }
 
     /// Insert a new `key` into this [`TxnSetLock`] at `txn_id`.
-    pub async fn insert<K: Into<Arc<T>>>(&self, txn_id: I, key: K) -> Result<()> {
+    pub async fn insert<K: Into<Key<T>>>(&self, txn_id: I, key: K) -> Result<()> {
         // before acquiring a permit, check if this version has already been committed
         self.state().check_pending(&txn_id)?;
 
         let key = key.into();
-        let range = Range::One(key.clone());
-        let _permit = self.semaphore.write(txn_id, range).await?;
+        let _permit = self.semaphore.write(txn_id, key.clone().into()).await?;
         Ok(self.state_mut().insert(txn_id, key))
     }
 
     /// Insert a new `key` into this [`TxnSetLock`] at `txn_id` synchronously, if possible.
-    pub fn try_insert<K: Into<Arc<T>>>(&self, txn_id: I, key: K) -> Result<()> {
+    pub fn try_insert<K: Into<Key<T>>>(&self, txn_id: I, key: K) -> Result<()> {
         let mut state = self.state_mut();
 
         // before acquiring a permit, check if this version has already been committed
         state.check_pending(&txn_id)?;
 
         let key = key.into();
-        let _permit = self.semaphore.try_write(txn_id, Range::One(key.clone()))?;
+        let _permit = self.semaphore.try_write(txn_id, key.clone().into())?;
         Ok(state.insert(txn_id, key))
     }
 
     /// Remove a `key` into this [`TxnSetLock`] at `txn_id` and return `true` if it was present.
-    pub async fn remove<K: Into<Arc<T>>>(&self, txn_id: I, key: K) -> Result<bool> {
+    pub async fn remove<Q>(&self, txn_id: I, key: &Q) -> Result<bool>
+    where
+        Q: Eq + Hash + ToOwned<Owned = T> + ?Sized,
+        Key<T>: Borrow<Q>,
+    {
         // before acquiring a permit, check if this version has already been committed
-        self.state().check_pending(&txn_id)?;
+        let key: Key<T> = {
+            let state = self.state();
+            state.check_pending(&txn_id)?;
+            (key, state.key(&txn_id, key)).into()
+        };
 
-        let key = key.into();
-        let range = Range::One(key.clone());
-        let _permit = self.semaphore.try_write(txn_id, range)?;
+        let _permit = self.semaphore.try_write(txn_id, key.clone().into())?;
         Ok(self.state_mut().remove(txn_id, key))
     }
 
     /// Remove a `key` into this [`TxnSetLock`] at `txn_id` and return `true` if it was present.
-    pub fn try_remove<K: Into<Arc<T>>>(&self, txn_id: I, key: K) -> Result<bool> {
+    pub fn try_remove<Q>(&self, txn_id: I, key: &Q) -> Result<bool>
+    where
+        Q: Eq + Hash + ToOwned<Owned = T> + ?Sized,
+        Key<T>: Borrow<Q>,
+    {
         let mut state = self.state_mut();
 
         // before acquiring a permit, check if this version has already been committed
         state.check_pending(&txn_id)?;
 
-        let key = key.into();
-        let range = Range::One(key.clone());
-        let _permit = self.semaphore.try_write(txn_id, range)?;
+        let key: Key<T> = (key, state.key(&txn_id, key)).into();
+        let _permit = self.semaphore.try_write(txn_id, key.clone().into())?;
         Ok(state.remove(txn_id, key))
     }
 }
@@ -595,7 +601,7 @@ impl<T> Iterator for Iter<T> {
     type Item = Arc<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next()
+        self.iter.next().map(Arc::from)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

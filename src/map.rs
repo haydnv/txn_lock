@@ -9,50 +9,50 @@
 //! use txn_lock::map::*;
 //! use txn_lock::Error;
 //!
-//! let one = Arc::new("one".to_string());
-//! let two = Arc::new("two".to_string());
+//! let one = "one";
+//! let two = "two";
 //!
 //! let map = TxnMapLock::<u64, String, f32>::new(1);
 //!
-//! assert_eq!(block_on(map.insert(1, one.clone(), 1.0)).expect("insert"), None);
+//! assert_eq!(block_on(map.insert(1, one.to_string(), 1.0)).expect("insert"), None);
 //!
-//! let value = block_on(map.get(1, &one)).expect("read").expect("value");
+//! let value = block_on(map.get(1, one)).expect("read").expect("value");
 //! assert_eq!(value, 1.0);
 //!
-//! assert_eq!(map.try_insert(1, one.clone(), 2.0).unwrap_err(), Error::WouldBlock);
+//! assert_eq!(map.try_insert(1, one.to_string(), 2.0).unwrap_err(), Error::WouldBlock);
 //!
 //! std::mem::drop(value);
 //!
 //! map.commit(1);
 //!
-//! let mut value = map.try_get_mut(2, one.clone()).expect("read").expect("value");
+//! let mut value = map.try_get_mut(2, one).expect("read").expect("value");
 //! assert_eq!(value, 1.0);
 //! *value = 2.0;
 //!
-//! assert_eq!(map.try_remove(2, one.clone()).unwrap_err(), Error::WouldBlock);
+//! assert_eq!(map.try_remove(2, one).unwrap_err(), Error::WouldBlock);
 //! std::mem::drop(value);
 //!
-//! let value = block_on(map.remove(2, one.clone())).expect("remove").expect("value");
+//! let value = block_on(map.remove(2, one)).expect("remove").expect("value");
 //! assert_eq!(*value, 2.0);
 //!
-//! assert_eq!(map.try_insert(2, two.clone(), 1.0).expect("insert"), None);
+//! assert_eq!(map.try_insert(2, two.to_string(), 1.0).expect("insert"), None);
 //!
-//! assert!(map.try_remove(2, one.clone()).expect("remove").is_none());
+//! assert!(map.try_remove(2, one).expect("remove").is_none());
 //!
-//! assert_eq!(map.try_insert(2, two.clone(), 2.0).expect("insert"), Some(1.0.into()));
+//! assert_eq!(map.try_insert(2, two.to_string(), 2.0).expect("insert"), Some(1.0.into()));
 //!
 //! map.rollback(&2);
 //!
-//! let value = map.try_get(1, &one).expect("read");
+//! let value = map.try_get(1, one).expect("read");
 //! assert_eq!(*(value.expect("guard")), 1.0);
 //!
 //! assert!(map.try_remove(3, two).expect("remove").is_none());
 //!
 //! map.finalize(2);
 //!
-//! assert_eq!(map.try_get(1, &one).unwrap_err(), Error::Outdated);
+//! assert_eq!(map.try_get(1, one).unwrap_err(), Error::Outdated);
 //!
-//! let value = map.try_get(3, &one).expect("read");
+//! let value = map.try_get(3, one).expect("read");
 //! assert_eq!(*(value.expect("guard")), 1.0);
 //!
 //! map.commit(3);
@@ -108,7 +108,7 @@ use super::guard::{TxnReadGuard, TxnReadGuardMap, TxnWriteGuard};
 use super::semaphore::*;
 use super::{Error, Result};
 
-pub use super::range::Range;
+pub use super::range::{Key, Range};
 
 /// A read guard on a value in a [`TxnMapLock`]
 pub type TxnMapValueReadGuard<K, V> = TxnReadGuard<Range<K>, V>;
@@ -119,10 +119,10 @@ pub type TxnMapValueReadGuardMap<K, V> = TxnReadGuardMap<Range<K>, V>;
 /// A write guard on a value in a [`TxnMapLock`]
 pub type TxnMapValueWriteGuard<K, V> = TxnWriteGuard<Range<K>, V>;
 
-type Canon<K, V> = HashMap<Arc<K>, Arc<V>>;
-type Delta<K, V> = HashMap<Arc<K>, Option<Arc<V>>>;
+type Canon<K, V> = HashMap<Key<K>, Arc<V>>;
+type Delta<K, V> = HashMap<Key<K>, Option<Arc<V>>>;
 type Committed<I, K, V> = OrdHashMap<I, Option<Delta<K, V>>>;
-type Pending<K, V> = HashMap<Arc<K>, Option<Arc<RwLock<V>>>>;
+type Pending<K, V> = HashMap<Key<K>, Option<Arc<RwLock<V>>>>;
 
 #[derive(Debug)]
 enum PendingValue<V> {
@@ -212,7 +212,7 @@ where
     #[inline]
     fn extend<Q, E>(&mut self, txn_id: I, other: E)
     where
-        Q: Into<Arc<K>>,
+        Q: Into<Key<K>>,
         E: IntoIterator<Item = (Q, V)>,
     {
         let entries = other
@@ -230,7 +230,7 @@ where
     fn get_canon<Q>(&self, txn_id: &I, key: &Q) -> Option<Arc<V>>
     where
         Q: Hash + Eq + ?Sized,
-        Arc<K>: Borrow<Q>,
+        Key<K>: Borrow<Q>,
     {
         get_canon(&self.canon, &self.committed, txn_id, key).cloned()
     }
@@ -243,7 +243,7 @@ where
     ) -> Poll<Result<Option<TxnMapValueReadGuard<K, V>>>>
     where
         Q: Hash + Eq + ?Sized,
-        Arc<K>: Borrow<Q>,
+        Key<K>: Borrow<Q>,
     {
         if self.finalized.as_ref() > Some(txn_id) {
             Poll::Ready(Err(Error::Outdated))
@@ -260,7 +260,7 @@ where
     fn get_pending<Q>(&self, txn_id: &I, key: &Q) -> Option<PendingValue<V>>
     where
         Q: Eq + Hash + ?Sized,
-        Arc<K>: Borrow<Q>,
+        Key<K>: Borrow<Q>,
     {
         if let Some(version) = self.pending.get(txn_id) {
             if let Some(delta) = version.get(key) {
@@ -279,7 +279,7 @@ where
     }
 
     #[inline]
-    fn insert(&mut self, txn_id: I, key: Arc<K>, value: V) -> Option<Arc<V>> {
+    fn insert(&mut self, txn_id: I, key: Key<K>, value: V) -> Option<Arc<V>> {
         let value = Arc::new(RwLock::new(value));
 
         if let Some(deltas) = self.pending.get_mut(&txn_id) {
@@ -312,10 +312,10 @@ where
     }
 
     #[inline]
-    fn key<Q>(&self, txn_id: &I, key: &Q) -> Option<&Arc<K>>
+    fn key<Q>(&self, txn_id: &I, key: &Q) -> Option<&Key<K>>
     where
         Q: Eq + Hash + ?Sized,
-        Arc<K>: Borrow<Q>,
+        Key<K>: Borrow<Q>,
     {
         if let Some((key, _)) = self.canon.get_key_value(key) {
             Some(key)
@@ -327,7 +327,7 @@ where
     }
 
     #[inline]
-    fn keys_committed(&self, txn_id: &I) -> HashSet<Arc<K>> {
+    fn keys_committed(&self, txn_id: &I) -> HashSet<Key<K>> {
         let mut keys = self.canon.keys().cloned().collect();
 
         let committed = self.committed.iter().filter_map(|(id, version)| {
@@ -346,7 +346,7 @@ where
     }
 
     #[inline]
-    fn keys_pending(&self, txn_id: I) -> HashSet<Arc<K>> {
+    fn keys_pending(&self, txn_id: I) -> HashSet<Key<K>> {
         let mut keys = self.keys_committed(&txn_id);
 
         if let Some(pending) = self.pending.get(&txn_id) {
@@ -357,7 +357,7 @@ where
     }
 
     #[inline]
-    fn remove(&mut self, txn_id: I, key: Arc<K>) -> Option<Arc<V>> {
+    fn remove(&mut self, txn_id: I, key: Key<K>) -> Option<Arc<V>> {
         if let Some(pending) = self.pending.get_mut(&txn_id) {
             match pending.entry(key) {
                 hash_map::Entry::Occupied(mut entry) => {
@@ -397,7 +397,7 @@ where
     V: Clone + fmt::Debug,
 {
     #[inline]
-    fn get_mut(&mut self, txn_id: I, key: Arc<K>) -> Option<OwnedRwLockWriteGuard<V>> {
+    fn get_mut(&mut self, txn_id: I, key: Key<K>) -> Option<OwnedRwLockWriteGuard<V>> {
         #[inline]
         fn new_value<V: Clone>(canon: &V) -> (Arc<RwLock<V>>, OwnedRwLockWriteGuard<V>) {
             let value = V::clone(canon);
@@ -438,7 +438,7 @@ where
     }
 
     #[inline]
-    fn insert_new(&mut self, txn_id: I, key: Arc<K>, value: V) -> OwnedRwLockWriteGuard<V> {
+    fn insert_new(&mut self, txn_id: I, key: Key<K>, value: V) -> OwnedRwLockWriteGuard<V> {
         let value = Arc::new(RwLock::new(value));
         let guard = value.clone().try_write_owned().expect("value");
 
@@ -464,7 +464,7 @@ where
     I: Hash + Ord + fmt::Debug,
     K: Hash + Ord,
     Q: Eq + Hash + ?Sized,
-    Arc<K>: Borrow<Q>,
+    Key<K>: Borrow<Q>,
 {
     let committed = committed
         .iter()
@@ -484,7 +484,7 @@ where
 }
 
 #[inline]
-fn merge_keys<K: Hash + Ord, V>(keys: &mut HashSet<Arc<K>>, deltas: &Delta<K, V>) {
+fn merge_keys<K: Hash + Ord, V>(keys: &mut HashSet<Key<K>>, deltas: &Delta<K, V>) {
     for (key, delta) in deltas {
         if delta.is_some() {
             keys.insert(key.clone());
@@ -496,7 +496,7 @@ fn merge_keys<K: Hash + Ord, V>(keys: &mut HashSet<Arc<K>>, deltas: &Delta<K, V>
 
 /// An occupied entry in a [`TxnMapLock`]
 pub struct EntryOccupied<K, V> {
-    key: Arc<K>,
+    key: Key<K>,
     value: TxnMapValueWriteGuard<K, V>,
 }
 
@@ -521,7 +521,7 @@ impl<K, V> EntryOccupied<K, V> {
 pub struct EntryVacant<I, K, V> {
     permit: PermitWrite<Range<K>>,
     txn_id: I,
-    key: Arc<K>,
+    key: Key<K>,
     map_state: Arc<RwLockInner<State<I, K, V>>>,
 }
 
@@ -604,7 +604,7 @@ where
     pub fn with_contents<C: IntoIterator<Item = (K, V)>>(txn_id: I, contents: C) -> Self {
         let version = contents
             .into_iter()
-            .map(|(key, value)| (Arc::new(key), Some(Arc::new(RwLock::new(value)))))
+            .map(|(key, value)| (Key::new(key), Some(Arc::new(RwLock::new(value)))))
             .collect();
 
         Self {
@@ -719,7 +719,7 @@ where
     /// Insert the entries from `other` [`TxnMapLock`] at `txn_id`.
     pub async fn extend<Q, E>(&self, txn_id: I, other: E) -> Result<()>
     where
-        Q: Into<Arc<K>>,
+        Q: Into<Key<K>>,
         E: IntoIterator<Item = (Q, V)>,
     {
         // before acquiring a permit, check if this version has already been committed
@@ -733,7 +733,7 @@ where
     /// Insert the entries from `other` [`TxnMapLock`] at `txn_id` synchronously, if possible.
     pub fn try_extend<Q, E>(&self, txn_id: I, other: E) -> Result<()>
     where
-        Q: Into<Arc<K>>,
+        Q: Into<Key<K>>,
         E: IntoIterator<Item = (Q, V)>,
     {
         let mut state = self.state_mut();
@@ -749,23 +749,22 @@ where
     /// Read a value from this [`TxnMapLock`] at `txn_id`.
     pub async fn get<Q>(&self, txn_id: I, key: &Q) -> Result<Option<TxnMapValueReadGuard<K, V>>>
     where
-        Q: Eq + Hash + Clone + ?Sized,
-        Arc<K>: Borrow<Q> + From<Q>,
+        Q: Eq + Hash + ToOwned<Owned = K> + ?Sized,
+        Key<K>: Borrow<Q>,
     {
         // before acquiring a permit, check if this version has already been committed
-        let range_key = {
+        let range: Range<K> = {
             let state = self.state();
 
             if let Poll::Ready(result) = state.get_committed(&txn_id, key) {
                 return result;
-            } else if let Some(key) = state.key(&txn_id, key) {
-                key.clone()
-            } else {
-                key.clone().into()
             }
+
+            Key::<K>::from((key, state.key(&txn_id, key))).into()
         };
 
-        let permit = self.semaphore.read(txn_id, Range::One(range_key)).await?;
+        let permit = self.semaphore.read(txn_id, range).await?;
+
         let value = self
             .state()
             .get_pending(&txn_id, key)
@@ -780,8 +779,8 @@ where
     /// Read a value from this [`TxnMapLock`] at `txn_id` synchronously, if possible.
     pub fn try_get<Q>(&self, txn_id: I, key: &Q) -> Result<Option<TxnMapValueReadGuard<K, V>>>
     where
-        Q: Eq + Hash + Clone + ?Sized,
-        Arc<K>: Borrow<Q> + From<Q>,
+        Q: Eq + Hash + ToOwned<Owned = K> + ?Sized,
+        Key<K>: Borrow<Q>,
     {
         let state = self.state();
 
@@ -790,13 +789,8 @@ where
             return result;
         }
 
-        let range_key = if let Some(key) = state.key(&txn_id, key) {
-            key.clone()
-        } else {
-            key.clone().into()
-        };
-
-        let permit = self.semaphore.try_read(txn_id, Range::One(range_key))?;
+        let range = Key::<K>::from((key, state.key(&txn_id, key))).into();
+        let permit = self.semaphore.try_read(txn_id, range)?;
         let value = state.get_pending(&txn_id, key).map(|value| match value {
             PendingValue::Committed(value) => TxnMapValueReadGuard::committed(value),
             PendingValue::Pending(value) => TxnMapValueReadGuard::pending_write(permit, value),
@@ -838,7 +832,7 @@ where
     }
 
     /// Insert a new entry into this [`TxnMapLock`] at `txn_id` and return the prior value, if any.
-    pub async fn insert<Q: Into<Arc<K>>>(
+    pub async fn insert<Q: Into<Key<K>>>(
         &self,
         txn_id: I,
         key: Q,
@@ -847,15 +841,14 @@ where
         // before acquiring a permit, check if this version has already been committed
         self.state().check_pending(&txn_id)?;
 
-        let key = key.into();
-        let range = Range::One(key.clone());
-        let _permit = self.semaphore.write(txn_id, range).await?;
+        let key: Key<K> = key.into();
+        let _permit = self.semaphore.write(txn_id, key.clone().into()).await?;
 
         Ok(self.state_mut().insert(txn_id, key, value))
     }
 
     /// Insert a new entry into this [`TxnMapLock`] at `txn_id` synchronously, if possible.
-    pub fn try_insert<Q: Into<Arc<K>>>(
+    pub fn try_insert<Q: Into<Key<K>>>(
         &self,
         txn_id: I,
         key: Q,
@@ -867,33 +860,42 @@ where
         state.check_pending(&txn_id)?;
 
         let key = key.into();
-        let _permit = self.semaphore.try_write(txn_id, Range::One(key.clone()))?;
+        let _permit = self.semaphore.try_write(txn_id, key.clone().into())?;
 
         Ok(state.insert(txn_id, key, value))
     }
 
     /// Remove and return the value at `key` from this [`TxnMapLock`] at `txn_id`, if present.
-    pub async fn remove<Q: Into<Arc<K>>>(&self, txn_id: I, key: Q) -> Result<Option<Arc<V>>> {
+    pub async fn remove<Q>(&self, txn_id: I, key: &Q) -> Result<Option<Arc<V>>>
+    where
+        Q: Eq + Hash + ToOwned<Owned = K> + ?Sized,
+        Key<K>: Borrow<Q>,
+    {
         // before acquiring a permit, check if this version has already been committed
-        self.state().check_pending(&txn_id)?;
+        let key: Key<K> = {
+            let state = self.state();
+            state.check_pending(&txn_id)?;
+            (key, state.key(&txn_id, key)).into()
+        };
 
-        let key = key.into();
-        let range = Range::One(key.clone());
-        let _permit = self.semaphore.write(txn_id, range).await?;
+        let _permit = self.semaphore.write(txn_id, key.clone().into()).await?;
 
         Ok(self.state_mut().remove(txn_id, key))
     }
 
     /// Remove and return the value at `key` from this [`TxnMapLock`] at `txn_id`, if present.
-    pub fn try_remove<Q: Into<Arc<K>>>(&self, txn_id: I, key: Q) -> Result<Option<Arc<V>>> {
+    pub fn try_remove<Q>(&self, txn_id: I, key: &Q) -> Result<Option<Arc<V>>>
+    where
+        Q: Eq + Hash + ToOwned<Owned = K> + ?Sized,
+        Key<K>: Borrow<Q>,
+    {
         let mut state = self.state_mut();
 
         // before acquiring a permit, check if this version has already been committed
         state.check_pending(&txn_id)?;
 
-        let key = key.into();
-        let range = Range::One(key.clone());
-        let _permit = self.semaphore.try_write(txn_id, range)?;
+        let key: Key<K> = (key, state.key(&txn_id, key)).into();
+        let _permit = self.semaphore.try_write(txn_id, key.clone().into())?;
 
         Ok(state.remove(txn_id, key))
     }
@@ -906,12 +908,12 @@ where
     V: Clone + fmt::Debug,
 {
     /// Borrow an [`Entry`] mutably for writing at `txn_id`.
-    pub async fn entry<Q: Into<Arc<K>>>(&self, txn_id: I, key: Q) -> Result<Entry<I, K, V>> {
+    pub async fn entry<Q: Into<Key<K>>>(&self, txn_id: I, key: Q) -> Result<Entry<I, K, V>> {
         // before acquiring a permit, check if this version has already been committed
         self.state().check_pending(&txn_id)?;
 
-        let key = key.into();
-        let range = Range::One(key.clone());
+        let key: Key<K> = key.into();
+        let range = key.clone().into();
         let permit = self.semaphore.write(txn_id, range).await?;
 
         if let Some(value) = self.state_mut().get_mut(txn_id, key.clone()) {
@@ -929,7 +931,7 @@ where
         }
     }
     /// Read a mutable value from this [`TxnMapLock`] at `txn_id`.
-    pub async fn get_mut<Q: Into<Arc<K>>>(
+    pub async fn get_mut<Q: Into<Key<K>>>(
         &self,
         txn_id: I,
         key: Q,
@@ -938,8 +940,7 @@ where
         self.state().check_pending(&txn_id)?;
 
         let key = key.into();
-        let range = Range::One(key.clone());
-        let permit = self.semaphore.write(txn_id, range).await?;
+        let permit = self.semaphore.write(txn_id, key.clone().into()).await?;
 
         if let Some(value) = self.state_mut().get_mut(txn_id, key) {
             Ok(Some(TxnMapValueWriteGuard::new(permit, value)))
@@ -949,18 +950,19 @@ where
     }
 
     /// Read a mutable value from this [`TxnMapLock`] at `txn_id`.
-    pub fn try_get_mut<Q: Into<Arc<K>>>(
-        &self,
-        txn_id: I,
-        key: Q,
-    ) -> Result<Option<TxnMapValueWriteGuard<K, V>>> {
+    pub fn try_get_mut<Q>(&self, txn_id: I, key: &Q) -> Result<Option<TxnMapValueWriteGuard<K, V>>>
+    where
+        Q: Eq + Hash + ToOwned<Owned = K> + ?Sized,
+        Key<K>: Borrow<Q>,
+    {
         let mut state = self.state_mut();
 
         // before acquiring a permit, check if this version has already been committed
         state.check_pending(&txn_id)?;
 
-        let key = key.into();
-        let permit = self.semaphore.try_write(txn_id, Range::One(key.clone()))?;
+        let maybe_key = state.key(&txn_id, key);
+        let key = Key::<K>::from((key, maybe_key));
+        let permit = self.semaphore.try_write(txn_id, key.clone().into())?;
 
         if let Some(value) = state.get_mut(txn_id, key) {
             Ok(Some(TxnMapValueWriteGuard::new(permit, value)))
@@ -1039,7 +1041,7 @@ pub struct Iter<I, K, V> {
     lock_state: Arc<RwLockInner<State<I, K, V>>>,
     txn_id: I,
     permit: Option<PermitRead<Range<K>>>,
-    keys: <HashSet<Arc<K>> as IntoIterator>::IntoIter,
+    keys: <HashSet<Key<K>> as IntoIterator>::IntoIter,
 }
 
 impl<I, K, V> Iter<I, K, V> {
@@ -1047,7 +1049,7 @@ impl<I, K, V> Iter<I, K, V> {
         lock_state: Arc<RwLockInner<State<I, K, V>>>,
         txn_id: I,
         permit: Option<PermitRead<Range<K>>>,
-        keys: HashSet<Arc<K>>,
+        keys: HashSet<Key<K>>,
     ) -> Self {
         Self {
             lock_state,
@@ -1064,7 +1066,7 @@ where
     K: Hash + Ord,
     V: fmt::Debug,
 {
-    type Item = (Arc<K>, TxnMapIterGuard<V>);
+    type Item = (Key<K>, TxnMapIterGuard<V>);
 
     fn next(&mut self) -> Option<Self::Item> {
         let state = self.lock_state.read().expect("lock state");
@@ -1095,7 +1097,7 @@ where
     K: Hash + Ord,
     V: fmt::Debug,
     Q: Eq + Hash + ?Sized,
-    Arc<K>: Borrow<Q>,
+    Key<K>: Borrow<Q>,
 {
     if committed {
         state.get_canon(txn_id, key).map(PendingValue::Committed)
@@ -1149,7 +1151,7 @@ pub struct IterMut<I, K, V> {
 
     #[allow(unused)]
     permit: PermitWrite<Range<K>>,
-    keys: <HashSet<Arc<K>> as IntoIterator>::IntoIter,
+    keys: <HashSet<Key<K>> as IntoIterator>::IntoIter,
 }
 
 impl<I, K, V> IterMut<I, K, V> {
@@ -1157,7 +1159,7 @@ impl<I, K, V> IterMut<I, K, V> {
         lock_state: Arc<RwLockInner<State<I, K, V>>>,
         txn_id: I,
         permit: PermitWrite<Range<K>>,
-        keys: HashSet<Arc<K>>,
+        keys: HashSet<Key<K>>,
     ) -> Self {
         Self {
             lock_state,
@@ -1182,7 +1184,7 @@ where
         loop {
             let key = self.keys.next()?;
             if let Some(guard) = state.get_mut(self.txn_id, key.clone()) {
-                return Some((key, TxnMapIterMutGuard::from(guard)));
+                return Some((key.into(), TxnMapIterMutGuard::from(guard)));
             }
         }
     }
