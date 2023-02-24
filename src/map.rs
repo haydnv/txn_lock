@@ -203,7 +203,7 @@ where
 
     #[inline]
     fn clear(&mut self, txn_id: I) -> Canon<K, V> {
-        let mut map = self.canon(txn_id);
+        let mut map = self.canon(&txn_id);
 
         if let Some(version) = self.pending.remove(&txn_id) {
             for (key, delta) in version {
