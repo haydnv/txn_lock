@@ -298,17 +298,16 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
                 .map_err(Error::from),
         }
     }
+}
 
+impl<I: Copy + Ord, R> Semaphore<I, R> {
     /// Mark a transaction completed, un-blocking waiting requests for future permits.
     ///
     /// Call this when the transactional resource is no longer writable at `txn_id`
     /// (due to a commit, rollback, timeout, or any other reason).
     ///
     /// Set `drop_past` to `true` to finalize all transactions older than `txn_id`.
-    pub fn finalize(&self, txn_id: &I, drop_past: bool)
-    where
-        I: Copy,
-    {
+    pub fn finalize(&self, txn_id: &I, drop_past: bool) {
         let mut versions = self.versions.lock().expect("versions");
 
         let notify = if drop_past {
