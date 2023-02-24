@@ -181,7 +181,7 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
         VersionRead::Version(range, root)
     }
 
-    /// Acquire a permit to read a section of a transactional resource, if possible.
+    /// Acquire a permit to read a section of a transactional resource.
     pub async fn read(&self, mut txn_id: I, range: R) -> Result<PermitRead<R>> {
         let mut range = Arc::new(range);
 
