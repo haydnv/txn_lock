@@ -300,110 +300,6 @@ where
         }
     }
 
-    /// Commit the state of this [`TxnSetLock`] at `txn_id`.
-    pub fn commit(&self, txn_id: I) {
-        let mut state = self.state_mut();
-
-        if state.finalized >= Some(txn_id) {
-            #[cfg(feature = "logging")]
-            log::warn!("committed already-finalized version {:?}", txn_id);
-            return;
-        }
-
-        self.semaphore.finalize(&txn_id, false);
-
-        let finalize = state.pending.keys().next() == Some(&txn_id);
-        let version = state.pending.remove(&txn_id);
-
-        if finalize {
-            assert!(!state.committed.contains_key(&txn_id));
-            let delta = version.expect("committed version");
-            merge_owned(&mut state.canon, delta);
-            state.finalized = Some(txn_id);
-        } else if let Some(delta) = version {
-            assert!(state.committed.insert(txn_id, Some(delta)).is_none());
-        } else if let Some(prior_commit) = state.committed.insert(txn_id, None) {
-            assert!(prior_commit.is_none());
-            #[cfg(feature = "logging")]
-            log::warn!("duplicate commit at {:?}", txn_id);
-        }
-    }
-
-    /// Acquire a read lock on the contents of this [`TxnSetLock`] and commit in the same operation.
-    /// Panics: if the state of this [`TxnSetLock`] has already been finalized at `txn_id`.
-    pub async fn read_and_commit(&self, txn_id: I) -> TxnSetLockCommitGuard<I, T> {
-        {
-            let state = self.state();
-
-            // before acquiring a permit, check if this version has already been committed
-            if state.check_committed(&txn_id).expect("committed") {
-                #[cfg(feature = "logging")]
-                log::warn!("duplicate commit at {:?}", txn_id);
-
-                return TxnSetLockCommitGuard::duplicate(state.canon(&txn_id));
-            }
-        };
-
-        let permit = self
-            .semaphore
-            .read(txn_id, Range::All)
-            .await
-            .expect("permit");
-
-        let mut state = self.state_mut();
-        let finalize = state.pending.keys().next() == Some(&txn_id);
-        let version = state.pending.remove(&txn_id);
-
-        if finalize {
-            assert!(!state.committed.contains_key(&txn_id));
-            let delta = version.expect("committed version");
-            merge_owned(&mut state.canon, delta);
-            state.finalized = Some(txn_id);
-        } else {
-            // the case of a duplicate commit has already been handled
-            assert!(state.committed.insert(txn_id, version).is_none());
-        }
-
-        TxnSetLockCommitGuard::commit(txn_id, self.semaphore.clone(), permit, state.canon.clone())
-    }
-
-    /// Roll back the state of this [`TxnSetLock`] at `txn_id`.
-    pub fn rollback(&self, txn_id: &I) {
-        let mut state = self.state_mut();
-
-        assert!(
-            !state.committed.contains_key(txn_id),
-            "cannot roll back committed transaction {:?}",
-            txn_id
-        );
-
-        self.semaphore.finalize(txn_id, false);
-        state.pending.remove(txn_id);
-    }
-
-    /// Finalize the state of this [`TxnSetLock`] at `txn_id`.
-    /// This will merge in deltas and prevent further reads of versions earlier than `txn_id`.
-    pub fn finalize(&self, txn_id: I) {
-        let mut state = self.state_mut();
-
-        while let Some(version_id) = state.committed.keys().next().copied() {
-            if version_id <= txn_id {
-                if let Some(delta) = state.committed.remove(&version_id).expect("version") {
-                    merge_owned::<T>(&mut state.canon, delta);
-                }
-            } else {
-                break;
-            }
-        }
-
-        if let Some(next_commit) = state.committed.keys().next() {
-            assert!(next_commit > &txn_id);
-        }
-
-        self.semaphore.finalize(&txn_id, true);
-        state.finalized = Some(txn_id);
-    }
-
     /// Check whether the given `key` is present in this [`TxnSetLock`] at `txn_id`.
     pub async fn contains<Q>(&self, txn_id: I, key: &Q) -> Result<bool>
     where
@@ -620,6 +516,116 @@ where
         let key: Key<T> = (key, state.key(&txn_id, key)).into();
         let _permit = self.semaphore.try_write(txn_id, key.clone().into())?;
         Ok(state.remove(txn_id, key))
+    }
+}
+
+impl<I, T> TxnSetLock<I, T>
+where
+    I: Copy + Hash + Ord + fmt::Debug,
+    T: Hash + Ord + fmt::Debug,
+{
+    /// Commit the state of this [`TxnSetLock`] at `txn_id`.
+    pub fn commit(&self, txn_id: I) {
+        let mut state = self.state_mut();
+
+        if state.finalized >= Some(txn_id) {
+            #[cfg(feature = "logging")]
+            log::warn!("committed already-finalized version {:?}", txn_id);
+            return;
+        }
+
+        self.semaphore.finalize(&txn_id, false);
+
+        let finalize = state.pending.keys().next() == Some(&txn_id);
+        let version = state.pending.remove(&txn_id);
+
+        if finalize {
+            assert!(!state.committed.contains_key(&txn_id));
+            let delta = version.expect("committed version");
+            merge_owned(&mut state.canon, delta);
+            state.finalized = Some(txn_id);
+        } else if let Some(delta) = version {
+            assert!(state.committed.insert(txn_id, Some(delta)).is_none());
+        } else if let Some(prior_commit) = state.committed.insert(txn_id, None) {
+            assert!(prior_commit.is_none());
+            #[cfg(feature = "logging")]
+            log::warn!("duplicate commit at {:?}", txn_id);
+        }
+    }
+
+    /// Acquire a read lock on the contents of this [`TxnSetLock`] and commit in the same operation.
+    /// Panics: if the state of this [`TxnSetLock`] has already been finalized at `txn_id`.
+    pub async fn read_and_commit(&self, txn_id: I) -> TxnSetLockCommitGuard<I, T> {
+        {
+            let state = self.state();
+
+            // before acquiring a permit, check if this version has already been committed
+            if state.check_committed(&txn_id).expect("committed") {
+                #[cfg(feature = "logging")]
+                log::warn!("duplicate commit at {:?}", txn_id);
+
+                return TxnSetLockCommitGuard::duplicate(state.canon(&txn_id));
+            }
+        };
+
+        let permit = self
+            .semaphore
+            .read(txn_id, Range::All)
+            .await
+            .expect("permit");
+
+        let mut state = self.state_mut();
+        let finalize = state.pending.keys().next() == Some(&txn_id);
+        let version = state.pending.remove(&txn_id);
+
+        if finalize {
+            assert!(!state.committed.contains_key(&txn_id));
+            let delta = version.expect("committed version");
+            merge_owned(&mut state.canon, delta);
+            state.finalized = Some(txn_id);
+        } else {
+            // the case of a duplicate commit has already been handled
+            assert!(state.committed.insert(txn_id, version).is_none());
+        }
+
+        TxnSetLockCommitGuard::commit(txn_id, self.semaphore.clone(), permit, state.canon.clone())
+    }
+
+    /// Roll back the state of this [`TxnSetLock`] at `txn_id`.
+    pub fn rollback(&self, txn_id: &I) {
+        let mut state = self.state_mut();
+
+        assert!(
+            !state.committed.contains_key(txn_id),
+            "cannot roll back committed transaction {:?}",
+            txn_id
+        );
+
+        self.semaphore.finalize(txn_id, false);
+        state.pending.remove(txn_id);
+    }
+
+    /// Finalize the state of this [`TxnSetLock`] at `txn_id`.
+    /// This will merge in deltas and prevent further reads of versions earlier than `txn_id`.
+    pub fn finalize(&self, txn_id: I) {
+        let mut state = self.state_mut();
+
+        while let Some(version_id) = state.committed.keys().next().copied() {
+            if version_id <= txn_id {
+                if let Some(delta) = state.committed.remove(&version_id).expect("version") {
+                    merge_owned::<T>(&mut state.canon, delta);
+                }
+            } else {
+                break;
+            }
+        }
+
+        if let Some(next_commit) = state.committed.keys().next() {
+            assert!(next_commit > &txn_id);
+        }
+
+        self.semaphore.finalize(&txn_id, true);
+        state.finalized = Some(txn_id);
     }
 }
 

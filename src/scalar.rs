@@ -200,7 +200,11 @@ impl<I, T> TxnLock<I, T> {
     }
 }
 
-impl<I: Copy + Hash + Ord + fmt::Debug, T: fmt::Debug> TxnLock<I, T> {
+impl<I, T> TxnLock<I, T>
+where
+    I: Copy + Hash + Ord + fmt::Debug,
+    T: fmt::Debug,
+{
     /// Construct a new [`TxnLock`].
     pub fn new(canon: T) -> Self {
         Self {
@@ -209,6 +213,54 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: fmt::Debug> TxnLock<I, T> {
         }
     }
 
+    /// Acquire a read lock for this value at `txn_id`.
+    pub async fn read(&self, txn_id: I) -> Result<TxnLockReadGuard<T>> {
+        // before acquiring a permit, check if this version has already been committed
+        if let Poll::Ready(result) = self.state().read_committed(&txn_id) {
+            return result.map(TxnLockReadGuard::Committed);
+        }
+
+        let permit = self.semaphore.read(txn_id, Range).await?;
+        Ok(self.state_mut().read_pending(&txn_id, permit))
+    }
+
+    /// Acquire a read lock for this value at `txn_id` synchronously, if possible.
+    pub fn try_read(&self, txn_id: I) -> Result<TxnLockReadGuard<T>> {
+        // before acquiring a permit, check if this version has already been committed
+        if let Poll::Ready(result) = self.state().read_committed(&txn_id) {
+            return result.map(TxnLockReadGuard::Committed);
+        }
+
+        let permit = self.semaphore.try_read(txn_id, Range)?;
+        Ok(self.state_mut().read_pending(&txn_id, permit))
+    }
+}
+
+impl<I: Copy + Hash + Ord + fmt::Debug, T: Clone + fmt::Debug> TxnLock<I, T> {
+    /// Acquire a write lock for this value at `txn_id`.
+    pub async fn write(&self, txn_id: I) -> Result<TxnLockWriteGuard<T>> {
+        // before acquiring a permit, check if this version has already been committed
+        self.state().check_pending(&txn_id)?;
+
+        let permit = self.semaphore.write(txn_id, Range).await?;
+        self.state_mut().write(txn_id, permit)
+    }
+
+    /// Acquire a write lock for this value at `txn_id` synchronously, if possible.
+    pub fn try_write(&self, txn_id: I) -> Result<TxnLockWriteGuard<T>> {
+        // before acquiring a permit, check if this version has already been committed
+        self.state().check_pending(&txn_id)?;
+
+        let permit = self.semaphore.try_write(txn_id, Range)?;
+        self.state_mut().write(txn_id, permit)
+    }
+}
+
+impl<I, T> TxnLock<I, T>
+where
+    I: Copy + Hash + Ord + fmt::Debug,
+    T: fmt::Debug,
+{
     /// Commit the state of this [`TxnLock`] at `txn_id`.
     pub fn commit(&self, txn_id: I) {
         let mut state = self.state_mut();
@@ -261,28 +313,6 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: fmt::Debug> TxnLock<I, T> {
         state.finalized = Some(txn_id);
     }
 
-    /// Acquire a read lock for this value at `txn_id`.
-    pub async fn read(&self, txn_id: I) -> Result<TxnLockReadGuard<T>> {
-        // before acquiring a permit, check if this version has already been committed
-        if let Poll::Ready(result) = self.state().read_committed(&txn_id) {
-            return result.map(TxnLockReadGuard::Committed);
-        }
-
-        let permit = self.semaphore.read(txn_id, Range).await?;
-        Ok(self.state_mut().read_pending(&txn_id, permit))
-    }
-
-    /// Acquire a read lock for this value at `txn_id` synchronously, if possible.
-    pub fn try_read(&self, txn_id: I) -> Result<TxnLockReadGuard<T>> {
-        // before acquiring a permit, check if this version has already been committed
-        if let Poll::Ready(result) = self.state().read_committed(&txn_id) {
-            return result.map(TxnLockReadGuard::Committed);
-        }
-
-        let permit = self.semaphore.try_read(txn_id, Range)?;
-        Ok(self.state_mut().read_pending(&txn_id, permit))
-    }
-
     /// Roll back the state of this [`TxnLock`] at `txn_id`.
     pub fn rollback(&self, txn_id: &I) {
         let mut state = self.state_mut();
@@ -295,26 +325,6 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: fmt::Debug> TxnLock<I, T> {
 
         self.semaphore.finalize(txn_id, false);
         state.pending.remove(txn_id);
-    }
-}
-
-impl<I: Copy + Hash + Ord + fmt::Debug, T: Clone + fmt::Debug> TxnLock<I, T> {
-    /// Acquire a write lock for this value at `txn_id`.
-    pub async fn write(&self, txn_id: I) -> Result<TxnLockWriteGuard<T>> {
-        // before acquiring a permit, check if this version has already been committed
-        self.state().check_pending(&txn_id)?;
-
-        let permit = self.semaphore.write(txn_id, Range).await?;
-        self.state_mut().write(txn_id, permit)
-    }
-
-    /// Acquire a write lock for this value at `txn_id` synchronously, if possible.
-    pub fn try_write(&self, txn_id: I) -> Result<TxnLockWriteGuard<T>> {
-        // before acquiring a permit, check if this version has already been committed
-        self.state().check_pending(&txn_id)?;
-
-        let permit = self.semaphore.try_write(txn_id, Range)?;
-        self.state_mut().write(txn_id, permit)
     }
 }
 
