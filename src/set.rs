@@ -553,8 +553,8 @@ where
         }
     }
 
-    /// Acquire a read lock on the contents of this [`TxnSetLock`] and commit in the same operation.
-    /// Panics: if the state of this [`TxnSetLock`] has already been finalized at `txn_id`.
+    /// Read and commit the contents of this [`TxnSetLock`] and in a single operation.
+    /// Panics: if this [`TxnSetLock`] has already been finalized at `txn_id`
     pub async fn read_and_commit(&self, txn_id: I) -> TxnSetLockCommitGuard<I, T> {
         {
             let state = self.state();
@@ -592,6 +592,7 @@ where
     }
 
     /// Roll back the state of this [`TxnSetLock`] at `txn_id`.
+    /// Panics: if this [`TxnSetLock`] has already been committed at `txn_id`
     pub fn rollback(&self, txn_id: &I) {
         let mut state = self.state_mut();
 
@@ -603,6 +604,31 @@ where
 
         self.semaphore.finalize(txn_id, false);
         state.pending.remove(txn_id);
+    }
+
+    /// Read the contents of this [`TxnSetLock`] and roll back in a single operation.
+    /// Panics: if this [`TxnSetLock`] has already been committed or finalized at `txn_id`
+    pub async fn read_and_rollback(&self, txn_id: I) -> TxnSetLockCommitGuard<I, T> {
+        let permit = self
+            .semaphore
+            .read(txn_id, Range::All)
+            .await
+            .expect("permit");
+
+        let mut state = self.state_mut();
+
+        assert!(
+            !state.committed.contains_key(&txn_id),
+            "cannot roll back committed transaction {:?}",
+            txn_id
+        );
+
+        let mut version = state.canon(&txn_id);
+        if let Some(deltas) = state.pending.remove(&txn_id) {
+            merge_owned(&mut version, deltas);
+        }
+
+        TxnSetLockCommitGuard::commit(txn_id, self.semaphore.clone(), permit, version)
     }
 
     /// Finalize the state of this [`TxnSetLock`] at `txn_id`.
@@ -618,10 +644,6 @@ where
             } else {
                 break;
             }
-        }
-
-        if let Some(next_commit) = state.committed.keys().next() {
-            assert!(next_commit > &txn_id);
         }
 
         self.semaphore.finalize(&txn_id, true);

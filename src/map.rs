@@ -932,8 +932,8 @@ where
 
     /// Roll back the state of this [`TxnMapLock`] at `txn_id`.
     ///
-    /// Panics: if any updated value is still locked for reading or writing.
-    pub fn rollback(&self, txn_id: &I) -> Option<HashMap<Arc<K>, Option<V>>> {
+    /// Panics: if this [`TxnMapLock`] has already been committed at `txn_id`
+    pub fn rollback(&self, txn_id: &I) {
         let mut state = self.state_mut();
 
         assert!(
@@ -943,24 +943,39 @@ where
         );
 
         self.semaphore.finalize(txn_id, false);
+        state.pending.remove(txn_id);
+    }
 
-        state.pending.remove(txn_id).map(|delta| {
-            delta
-                .into_iter()
-                .map(|(key, maybe_lock)| {
-                    let value = maybe_lock.map(|lock| {
-                        let lock = Arc::try_unwrap(lock).expect("value");
-                        lock.into_inner()
-                    });
+    /// Read and roll back this [`TxnMapLock`] at `txn_id` in a single operation.
+    ///
+    /// Panics:
+    ///  - if this [`TxnMapLock`] has already been committed or finalized at `txn_id`
+    ///  - if any updated value is still locked for reading or writing
+    pub async fn read_and_rollback(&self, txn_id: I) -> TxnMapCommitGuard<I, K, V> {
+        let permit = self
+            .semaphore
+            .read(txn_id, Range::All)
+            .await
+            .expect("permit");
 
-                    (key.into(), value)
-                })
-                .collect()
-        })
+        let mut state = self.state_mut();
+
+        assert!(
+            !state.committed.contains_key(&txn_id),
+            "cannot roll back committed transaction {:?}",
+            txn_id
+        );
+
+        let mut version = state.canon(&txn_id);
+        if let Some(deltas) = state.commit_version(&txn_id) {
+            merge(&mut version, deltas);
+        }
+
+        TxnMapCommitGuard::commit(txn_id, self.semaphore.clone(), permit, version)
     }
 
     /// Finalize the state of this [`TxnMapLock`] at `txn_id`.
-    /// This will finalize commits and prevent further reads of versions earlier than `txn_id`.
+    /// This will finalize commits and prevent further reads of all versions earlier than `txn_id`.
     pub fn finalize(&self, txn_id: I) {
         let mut state = self.state_mut();
 
