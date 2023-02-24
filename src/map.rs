@@ -104,11 +104,19 @@ use std::{fmt, iter};
 use ds_ext::OrdHashMap;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
-use super::guard::{TxnReadGuard, TxnReadGuardMap, TxnWriteGuard};
+use super::guard::{TxnCommitGuard, TxnReadGuard, TxnReadGuardMap, TxnWriteGuard};
 use super::semaphore::*;
 use super::{Error, Result};
 
 pub use super::range::{Key, Range};
+
+type Canon<K, V> = HashMap<Key<K>, Arc<V>>;
+type Delta<K, V> = HashMap<Key<K>, Option<Arc<V>>>;
+type Committed<I, K, V> = OrdHashMap<I, Option<Delta<K, V>>>;
+type Pending<K, V> = HashMap<Key<K>, Option<Arc<RwLock<V>>>>;
+
+/// A read guard on the committed state of a [`TxnMapLock`]
+pub type TxnMapCommitGuard<I, K, V> = TxnCommitGuard<I, Range<K>, Canon<K, V>>;
 
 /// A read guard on a value in a [`TxnMapLock`]
 pub type TxnMapValueReadGuard<K, V> = TxnReadGuard<Range<K>, V>;
@@ -118,11 +126,6 @@ pub type TxnMapValueReadGuardMap<K, V> = TxnReadGuardMap<Range<K>, V>;
 
 /// A write guard on a value in a [`TxnMapLock`]
 pub type TxnMapValueWriteGuard<K, V> = TxnWriteGuard<Range<K>, V>;
-
-type Canon<K, V> = HashMap<Key<K>, Arc<V>>;
-type Delta<K, V> = HashMap<Key<K>, Option<Arc<V>>>;
-type Committed<I, K, V> = OrdHashMap<I, Option<Delta<K, V>>>;
-type Pending<K, V> = HashMap<Key<K>, Option<Arc<RwLock<V>>>>;
 
 #[derive(Debug)]
 enum PendingValue<V> {
@@ -174,23 +177,33 @@ where
     }
 
     #[inline]
-    fn clear(&mut self, txn_id: I) -> Canon<K, V> {
-        let mut map = self.canon.clone();
+    fn canon(&self, txn_id: &I) -> Canon<K, V> {
+        let mut canon = self.canon.clone();
 
-        let committed =
-            self.committed
-                .iter()
-                .filter_map(|(id, version)| if id < &txn_id { version.as_ref() } else { None });
+        let committed = self.committed.iter().filter_map(|(id, version)| {
+            if id <= &txn_id {
+                version.as_ref()
+            } else {
+                None
+            }
+        });
 
         for deltas in committed {
             for (key, delta) in deltas {
                 if let Some(value) = delta {
-                    map.insert(key.clone(), value.clone());
+                    canon.insert(key.clone(), value.clone());
                 } else {
-                    map.remove(key);
+                    canon.remove(key);
                 }
             }
         }
+
+        canon
+    }
+
+    #[inline]
+    fn clear(&mut self, txn_id: I) -> Canon<K, V> {
+        let mut map = self.canon(txn_id);
 
         if let Some(version) = self.pending.remove(&txn_id) {
             for (key, delta) in version {
@@ -207,6 +220,28 @@ where
         self.pending.insert(txn_id, version);
 
         map
+    }
+
+    #[inline]
+    fn commit_version(&mut self, txn_id: &I) -> Option<Delta<K, V>> {
+        self.pending.remove(txn_id).map(|version| {
+            version
+                .into_iter()
+                .map(|(key, delta)| {
+                    let value = if let Some(present) = delta {
+                        if let Ok(value) = Arc::try_unwrap(present) {
+                            Some(Arc::new(value.into_inner()))
+                        } else {
+                            panic!("a value to commit at {:?} is still locked", txn_id);
+                        }
+                    } else {
+                        None
+                    };
+
+                    (key, value)
+                })
+                .collect()
+        })
     }
 
     #[inline]
@@ -614,60 +649,72 @@ where
     }
 
     /// Commit the state of this [`TxnMapLock`] at `txn_id`.
-    /// Panics:
-    ///  - if any new value to commit is still locked (for reading or writing)
-    pub fn commit(&self, txn_id: I) -> Option<Delta<K, V>> {
+    /// Panics: if any new value to commit is still locked (for reading or writing)
+    pub fn commit(&self, txn_id: I) {
         let mut state = self.state_mut();
 
         if state.finalized.as_ref() >= Some(&txn_id) {
             #[cfg(feature = "logging")]
             log::warn!("committed already-finalized version {:?}", txn_id);
-            return None;
+            return;
         }
 
         self.semaphore.finalize(&txn_id, false);
 
         let finalize = state.pending.keys().next() == Some(&txn_id);
-        let version = state.pending.remove(&txn_id).map(|version| {
-            version
-                .into_iter()
-                .map(|(key, delta)| {
-                    let value = if let Some(present) = delta {
-                        if let Ok(value) = Arc::try_unwrap(present) {
-                            Some(Arc::new(value.into_inner()))
-                        } else {
-                            panic!("a value to commit at {:?} is still locked", txn_id);
-                        }
-                    } else {
-                        None
-                    };
+        let version = state.commit_version(&txn_id);
 
-                    (key, value)
-                })
-                .collect()
-        });
+        if finalize {
+            assert!(!state.committed.contains_key(&txn_id));
+            let deltas: Delta<K, V> = version.expect("committed version");
+            merge(&mut state.canon, deltas);
+            state.finalized = Some(txn_id);
+        } else if let Some(deltas) = version {
+            assert!(state.committed.insert(txn_id, Some(deltas)).is_none());
+        } else if let Some(prior_commit) = state.committed.insert(txn_id, None) {
+            assert!(prior_commit.is_none());
+            #[cfg(feature = "logging")]
+            log::warn!("duplicate commit at {:?}", txn_id);
+        }
+    }
+
+    /// Acquire a read lock on the contents of this [`TxnMapLock`] and commit in the same operation.
+    /// Panics:
+    ///  - if the state of this [`TxnMapLock`] has already been finalized at `txn_id`
+    ///  - if any new value to commit is still locked (for reading or writing)
+    pub async fn read_and_commit(&self, txn_id: I) -> TxnMapCommitGuard<I, K, V> {
+        {
+            let state = self.state();
+
+            // before acquiring a permit, check if this version has already been committed
+            if state.check_committed(&txn_id).expect("committed") {
+                #[cfg(feature = "logging")]
+                log::warn!("duplicate commit at {:?}", txn_id);
+                return TxnMapCommitGuard::duplicate(state.canon(&txn_id));
+            }
+        }
+
+        let permit = self
+            .semaphore
+            .read(txn_id, Range::All)
+            .await
+            .expect("permit");
+
+        let mut state = self.state_mut();
+        let finalize = state.pending.keys().next() == Some(&txn_id);
+        let version = state.commit_version(&txn_id);
 
         if finalize {
             assert!(!state.committed.contains_key(&txn_id));
             let deltas: Delta<K, V> = version.expect("committed version");
             merge(&mut state.canon, deltas.clone());
             state.finalized = Some(txn_id);
-            Some(deltas)
-        } else if let Some(deltas) = version {
-            assert!(state
-                .committed
-                .insert(txn_id, Some(deltas.clone()))
-                .is_none());
-
-            Some(deltas)
-        } else if let Some(prior_commit) = state.committed.insert(txn_id, None) {
-            assert!(prior_commit.is_none());
-            #[cfg(feature = "logging")]
-            log::warn!("duplicate commit at {:?}", txn_id);
-            None
         } else {
-            None
+            // the case of a duplicate commit has already been handled
+            assert!(state.committed.insert(txn_id, version).is_none());
         }
+
+        TxnMapCommitGuard::commit(txn_id, self.semaphore.clone(), permit, state.canon.clone())
     }
 
     /// Roll back the state of this [`TxnMapLock`] at `txn_id`.

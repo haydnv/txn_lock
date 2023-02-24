@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard};
 
-use super::semaphore::{PermitRead, PermitWrite};
+use super::semaphore::{PermitRead, PermitWrite, Semaphore};
 
 /// A permit to read a value in a pending read transaction
 #[derive(Debug)]
@@ -196,5 +196,48 @@ impl<R, T: PartialEq> PartialEq<T> for TxnWriteGuard<R, T> {
 impl<R, T: PartialOrd> PartialOrd<T> for TxnWriteGuard<R, T> {
     fn partial_cmp(&self, other: &T) -> Option<Ordering> {
         self.deref().partial_cmp(other)
+    }
+}
+
+/// A read guard on the committed state of a transactional lock
+pub struct TxnCommitGuard<I: Copy + Ord, R, T> {
+    permit: Option<(I, Semaphore<I, R>, PermitRead<R>)>,
+    canon: T,
+}
+
+impl<I: Copy + Ord, R, T> TxnCommitGuard<I, R, T> {
+    pub(crate) fn commit(
+        txn_id: I,
+        semaphore: Semaphore<I, R>,
+        permit: PermitRead<R>,
+        canon: T,
+    ) -> Self {
+        Self {
+            permit: Some((txn_id, semaphore, permit)),
+            canon,
+        }
+    }
+
+    pub(crate) fn duplicate(canon: T) -> Self {
+        Self {
+            permit: None,
+            canon,
+        }
+    }
+}
+
+impl<I: Copy + Ord, R, T> Deref for TxnCommitGuard<I, R, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.canon
+    }
+}
+
+impl<I: Copy + Ord, R, T> Drop for TxnCommitGuard<I, R, T> {
+    fn drop(&mut self) {
+        if let Some((txn_id, semaphore, _permit)) = &self.permit {
+            semaphore.finalize(txn_id, false);
+        }
     }
 }

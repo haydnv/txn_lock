@@ -64,6 +64,7 @@ use std::{fmt, iter};
 
 use ds_ext::OrdHashMap;
 
+use super::guard::TxnCommitGuard;
 use super::semaphore::{PermitRead, Semaphore};
 use super::{Error, Result};
 
@@ -72,6 +73,9 @@ pub use super::range::{Key, Range};
 type Delta<T> = HashMap<Key<T>, bool>;
 type Canon<T> = HashSet<Key<T>>;
 type Committed<I, T> = OrdHashMap<I, Option<Delta<T>>>;
+
+/// A read guard on the committed state of a [`TxnSetLock`]
+pub type TxnSetLockCommitGuard<I, T> = TxnCommitGuard<I, Range<T>, Canon<T>>;
 
 struct State<I, T> {
     canon: Canon<T>,
@@ -246,29 +250,6 @@ where
     canon.contains(key)
 }
 
-/// A read guard on the committed state of a transactional lock
-pub struct TxnSetLockCommitGuard<I: Copy + Ord, T> {
-    permit: Option<(Semaphore<I, Range<T>>, PermitRead<Range<T>>)>,
-    canon: Canon<T>,
-    txn_id: I,
-}
-
-impl<I: Copy + Ord, T> Deref for TxnSetLockCommitGuard<I, T> {
-    type Target = Canon<T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.canon
-    }
-}
-
-impl<I: Copy + Ord, T> Drop for TxnSetLockCommitGuard<I, T> {
-    fn drop(&mut self) {
-        if let Some((semaphore, _permit)) = &self.permit {
-            semaphore.finalize(&self.txn_id, false);
-        }
-    }
-}
-
 /// A futures-aware read-write lock on a [`HashSet`] which supports transactional versioning
 pub struct TxnSetLock<I, T> {
     state: Arc<RwLockInner<State<I, T>>>,
@@ -359,11 +340,7 @@ where
                 #[cfg(feature = "logging")]
                 log::warn!("duplicate commit at {:?}", txn_id);
 
-                return TxnSetLockCommitGuard {
-                    permit: None,
-                    canon: state.canon(&txn_id),
-                    txn_id,
-                };
+                return TxnSetLockCommitGuard::duplicate(state.canon(&txn_id));
             }
         };
 
@@ -387,11 +364,7 @@ where
             assert!(state.committed.insert(txn_id, version).is_none());
         }
 
-        TxnSetLockCommitGuard {
-            permit: Some((self.semaphore.clone(), permit)),
-            canon: state.canon.clone(),
-            txn_id,
-        }
+        TxnSetLockCommitGuard::commit(txn_id, self.semaphore.clone(), permit, state.canon.clone())
     }
 
     /// Roll back the state of this [`TxnSetLock`] at `txn_id`.
