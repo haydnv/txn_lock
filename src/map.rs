@@ -101,7 +101,7 @@ use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
 use std::{fmt, iter};
 
-use ds_ext::OrdHashMap;
+use ds_ext::{OrdHashMap, OrdHashSet};
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use super::guard::{TxnReadGuard, TxnReadGuardMap, TxnVersionGuard, TxnWriteGuard};
@@ -112,7 +112,7 @@ pub use super::range::{Key, Range};
 
 type Canon<K, V> = HashMap<Key<K>, Arc<V>>;
 type Delta<K, V> = HashMap<Key<K>, Option<Arc<V>>>;
-type Committed<I, K, V> = OrdHashMap<I, Option<Delta<K, V>>>;
+type Deltas<I, K, V> = OrdHashMap<I, Delta<K, V>>;
 type Pending<K, V> = HashMap<Key<K>, Option<Arc<RwLock<V>>>>;
 
 /// A read guard on a version of a [`TxnMapLock`]
@@ -135,7 +135,8 @@ enum PendingValue<V> {
 
 struct State<I, K, V> {
     canon: Canon<K, V>,
-    committed: Committed<I, K, V>,
+    commits: OrdHashSet<I>,
+    deltas: Deltas<I, K, V>,
     pending: OrdHashMap<I, Pending<K, V>>,
     finalized: Option<I>,
 }
@@ -150,7 +151,8 @@ where
     fn new(txn_id: I, version: Pending<K, V>) -> Self {
         Self {
             canon: Canon::new(),
-            committed: Committed::new(),
+            commits: OrdHashSet::new(),
+            deltas: OrdHashMap::new(),
             pending: OrdHashMap::from_iter(iter::once((txn_id, version))),
             finalized: None,
         }
@@ -161,7 +163,7 @@ where
         match self.finalized.as_ref().cmp(&Some(txn_id)) {
             Ordering::Greater => Err(Error::Outdated),
             Ordering::Equal => Ok(true),
-            Ordering::Less => Ok(self.committed.contains_key(txn_id)),
+            Ordering::Less => Ok(self.commits.contains(txn_id)),
         }
     }
 
@@ -169,7 +171,7 @@ where
     fn check_pending(&self, txn_id: &I) -> Result<()> {
         if self.finalized.as_ref() > Some(txn_id) {
             Err(Error::Outdated)
-        } else if self.committed.contains_key(txn_id) {
+        } else if self.commits.contains(txn_id) {
             Err(Error::Committed)
         } else {
             Ok(())
@@ -180,16 +182,14 @@ where
     fn canon(&self, txn_id: &I) -> Canon<K, V> {
         let mut canon = self.canon.clone();
 
-        let committed = self.committed.iter().filter_map(|(id, version)| {
-            if id <= &txn_id {
-                version.as_ref()
-            } else {
-                None
-            }
-        });
+        let deltas = self
+            .deltas
+            .iter()
+            .take_while(|(id, _)| *id <= txn_id)
+            .map(|(_id, version)| version);
 
-        for deltas in committed {
-            for (key, delta) in deltas {
+        for version in deltas {
+            for (key, delta) in version {
                 if let Some(value) = delta {
                     canon.insert(key.clone(), value.clone());
                 } else {
@@ -232,7 +232,7 @@ where
                         if let Ok(value) = Arc::try_unwrap(present) {
                             Some(Arc::new(value.into_inner()))
                         } else {
-                            panic!("a value to commit at {:?} is still locked", txn_id);
+                            panic!("a value at {:?} is still locked", txn_id);
                         }
                     } else {
                         None
@@ -246,22 +246,14 @@ where
 
     #[inline]
     fn commit(&mut self, txn_id: I) {
-        let finalize = self.pending.keys().next() == Some(&txn_id);
-        let version = self.commit_version(&txn_id);
-
-        if finalize {
-            assert!(!self.committed.contains_key(&txn_id));
-            let deltas: Delta<K, V> = version.expect("committed version");
-            merge(&mut self.canon, deltas);
-            self.finalize(txn_id);
-        } else if let Some(deltas) = version {
-            assert!(self.committed.insert(txn_id, Some(deltas)).is_none());
-        } else if let Some(prior_commit) = self.committed.insert(txn_id, None) {
-            assert!(prior_commit.is_none());
-
+        if self.commits.contains(&txn_id) {
             #[cfg(feature = "logging")]
             log::warn!("duplicate commit at {:?}", txn_id);
+        } else if let Some(version) = self.commit_version(&txn_id) {
+            self.deltas.insert(txn_id, version);
         }
+
+        self.commits.insert(txn_id);
     }
 
     #[inline]
@@ -283,6 +275,31 @@ where
 
     #[inline]
     fn finalize(&mut self, txn_id: I) {
+        while let Some(version_id) = self.pending.keys().next().copied() {
+            if version_id <= txn_id {
+                self.pending.pop_first();
+            } else {
+                break;
+            }
+        }
+
+        while let Some(version_id) = self.commits.first().map(|id| **id) {
+            if version_id <= txn_id {
+                self.commits.pop_first();
+            } else {
+                break;
+            }
+        }
+
+        while let Some(version_id) = self.deltas.keys().next().copied() {
+            if version_id <= txn_id {
+                let version = self.deltas.pop_first().expect("version");
+                merge(&mut self.canon, version);
+            } else {
+                break;
+            }
+        }
+
         if let Some(finalized) = self.finalized.as_mut() {
             *finalized = Ord::max(txn_id, *finalized);
         } else {
@@ -296,7 +313,7 @@ where
         Q: Hash + Eq + ?Sized,
         Key<K>: Borrow<Q>,
     {
-        get_canon(&self.canon, &self.committed, txn_id, key).cloned()
+        get_canon(&self.canon, &self.deltas, txn_id, key).cloned()
     }
 
     #[inline]
@@ -311,8 +328,8 @@ where
     {
         if self.finalized.as_ref() > Some(txn_id) {
             Poll::Ready(Err(Error::Outdated))
-        } else if self.committed.contains_key(txn_id) {
-            assert!(!self.pending.contains_key(txn_id));
+        } else if self.commits.contains(txn_id) {
+            debug_assert!(!self.pending.contains_key(txn_id));
             let value = self.get_canon(txn_id, key);
             Poll::Ready(Ok(value.map(TxnMapValueReadGuard::committed)))
         } else {
@@ -354,19 +371,18 @@ where
                         let prior_value = Arc::new(lock.into_inner());
                         Some(prior_value)
                     } else {
-                        get_canon(&self.canon, &self.committed, &txn_id, delta.key()).cloned()
+                        get_canon(&self.canon, &self.deltas, &txn_id, delta.key()).cloned()
                     }
                 }
                 hash_map::Entry::Vacant(delta) => {
-                    let prior =
-                        get_canon(&self.canon, &self.committed, &txn_id, delta.key()).cloned();
+                    let prior = get_canon(&self.canon, &self.deltas, &txn_id, delta.key()).cloned();
 
                     delta.insert(Some(value));
                     prior
                 }
             }
         } else {
-            let prior = get_canon(&self.canon, &self.committed, &txn_id, &key).cloned();
+            let prior = get_canon(&self.canon, &self.deltas, &txn_id, &key).cloned();
 
             let pending = iter::once((key, Some(value))).collect();
             self.pending.insert(txn_id, pending);
@@ -394,16 +410,14 @@ where
     fn keys_committed(&self, txn_id: &I) -> HashSet<Key<K>> {
         let mut keys = self.canon.keys().cloned().collect();
 
-        let committed = self.committed.iter().filter_map(|(id, version)| {
-            if id <= &txn_id {
-                version.as_ref()
-            } else {
-                None
-            }
-        });
+        let deltas = self
+            .deltas
+            .iter()
+            .take_while(|(id, _)| *id <= txn_id)
+            .map(|(_, version)| version);
 
-        for deltas in committed {
-            merge_keys(&mut keys, deltas);
+        for version in deltas {
+            merge_keys(&mut keys, version);
         }
 
         keys
@@ -434,7 +448,7 @@ where
                 }
                 hash_map::Entry::Vacant(entry) => {
                     if let Some(prior) =
-                        get_canon(&self.canon, &self.committed, &txn_id, entry.key()).cloned()
+                        get_canon(&self.canon, &self.deltas, &txn_id, entry.key()).cloned()
                     {
                         entry.insert(None);
                         Some(prior)
@@ -443,8 +457,7 @@ where
                     }
                 }
             }
-        } else if let Some(prior) = get_canon(&self.canon, &self.committed, &txn_id, &key).cloned()
-        {
+        } else if let Some(prior) = get_canon(&self.canon, &self.deltas, &txn_id, &key).cloned() {
             let pending = iter::once((key, None)).collect();
             self.pending.insert(txn_id, pending);
             Some(prior)
@@ -482,7 +495,7 @@ where
                         .expect("write version")
                 }
                 hash_map::Entry::Vacant(delta) => {
-                    let canon = get_canon(&self.canon, &self.committed, &txn_id, delta.key())?;
+                    let canon = get_canon(&self.canon, &self.deltas, &txn_id, delta.key())?;
                     let (value, guard) = new_value(&**canon);
 
                     delta.insert(Some(value));
@@ -491,7 +504,7 @@ where
                 }
             }
         } else {
-            let canon = get_canon(&self.canon, &self.committed, &txn_id, &key)?;
+            let canon = get_canon(&self.canon, &self.deltas, &txn_id, &key)?;
             let (value, guard) = new_value(&**canon);
 
             let version = iter::once((key, Some(value))).collect();
@@ -520,7 +533,7 @@ where
 #[inline]
 fn get_canon<'a, I, K, V, Q>(
     canon: &'a Canon<K, V>,
-    committed: &'a Committed<I, K, V>,
+    deltas: &'a Deltas<I, K, V>,
     txn_id: &'a I,
     key: &'a Q,
 ) -> Option<&'a Arc<V>>
@@ -530,17 +543,15 @@ where
     Q: Eq + Hash + ?Sized,
     Key<K>: Borrow<Q>,
 {
-    let committed = committed
+    let committed = deltas
         .iter()
         .rev()
         .skip_while(|(id, _)| *id > txn_id)
         .map(|(_, version)| version);
 
     for version in committed {
-        if let Some(deltas) = version {
-            if let Some(delta) = deltas.get(key) {
-                return delta.as_ref();
-            }
+        if let Some(delta) = version.get(key) {
+            return delta.as_ref();
         }
     }
 
@@ -679,19 +690,17 @@ where
 
     /// Remove and return all entries from this [`TxnMapLock`] at `txn_id`.
     pub async fn clear(&self, txn_id: I) -> Result<Canon<K, V>> {
-        // before acquiring a permit, check if this version has already been committed
-        self.state().check_pending(&txn_id)?;
-
         let _permit = self.semaphore.write(txn_id, Range::All).await?;
 
-        Ok(self.state_mut().clear(txn_id))
+        let mut state = self.state_mut();
+        state.check_pending(&txn_id)?;
+
+        Ok(state.clear(txn_id))
     }
 
     /// Remove and return all entries from this [`TxnMapLock`] at `txn_id`.
     pub fn try_clear(&self, txn_id: I) -> Result<Canon<K, V>> {
         let mut state = self.state_mut();
-
-        // before acquiring a permit, check if this version has already been committed
         state.check_pending(&txn_id)?;
 
         let _permit = self.semaphore.try_write(txn_id, Range::All)?;
@@ -705,12 +714,12 @@ where
         Q: Into<Key<K>>,
         E: IntoIterator<Item = (Q, V)>,
     {
-        // before acquiring a permit, check if this version has already been committed
-        self.state().check_pending(&txn_id)?;
-
         let _permit = self.semaphore.write(txn_id, Range::All).await?;
 
-        Ok(self.state_mut().extend(txn_id, other))
+        let mut state = self.state_mut();
+        state.check_pending(&txn_id)?;
+
+        Ok(state.extend(txn_id, other))
     }
 
     /// Insert the entries from `other` [`TxnMapLock`] at `txn_id` synchronously, if possible.
@@ -720,8 +729,6 @@ where
         E: IntoIterator<Item = (Q, V)>,
     {
         let mut state = self.state_mut();
-
-        // before acquiring a permit, check if this version has already been committed
         state.check_pending(&txn_id)?;
 
         let _permit = self.semaphore.try_write(txn_id, Range::All)?;
@@ -735,7 +742,6 @@ where
         Q: Eq + Hash + ToOwned<Owned = K> + ?Sized,
         Key<K>: Borrow<Q>,
     {
-        // before acquiring a permit, check if this version has already been committed
         let range: Range<K> = {
             let state = self.state();
 
@@ -748,13 +754,16 @@ where
 
         let permit = self.semaphore.read(txn_id, range).await?;
 
-        let value = self
-            .state()
-            .get_pending(&txn_id, key)
-            .map(|value| match value {
-                PendingValue::Committed(value) => TxnMapValueReadGuard::committed(value),
-                PendingValue::Pending(value) => TxnMapValueReadGuard::pending_write(permit, value),
-            });
+        let state = self.state();
+
+        if let Poll::Ready(result) = state.get_committed(&txn_id, key) {
+            return result;
+        }
+
+        let value = state.get_pending(&txn_id, key).map(|value| match value {
+            PendingValue::Committed(value) => TxnMapValueReadGuard::committed(value),
+            PendingValue::Pending(value) => TxnMapValueReadGuard::pending_write(permit, value),
+        });
 
         Ok(value)
     }
@@ -767,7 +776,6 @@ where
     {
         let state = self.state();
 
-        // before acquiring a permit, check if this version has already been committed
         if let Poll::Ready(result) = state.get_committed(&txn_id, key) {
             return result;
         }
@@ -784,34 +792,31 @@ where
 
     /// Construct an iterator over the entries in this [`TxnMapLock`] at `txn_id`.
     pub async fn iter(&self, txn_id: I) -> Result<Iter<I, K, V>> {
-        {
-            let state = self.state();
-
-            // before acquiring a permit, check if this version has already been committed
-            if state.check_committed(&txn_id)? {
-                let keys = state.keys_committed(&txn_id);
-                return Ok(Iter::new(self.state.clone(), txn_id, None, keys));
-            }
-        }
-
         let permit = self.semaphore.read(txn_id, Range::All).await?;
-        let keys = self.state().keys_pending(txn_id);
-        return Ok(Iter::new(self.state.clone(), txn_id, Some(permit), keys));
+
+        let state = self.state();
+
+        if state.check_committed(&txn_id)? {
+            let keys = state.keys_committed(&txn_id);
+            Ok(Iter::new(self.state.clone(), txn_id, None, keys))
+        } else {
+            let keys = self.state().keys_pending(txn_id);
+            Ok(Iter::new(self.state.clone(), txn_id, Some(permit), keys))
+        }
     }
 
     /// Construct an iterator over the entries in this [`TxnMapLock`] at `txn_id` synchronously.
     pub fn try_iter(&self, txn_id: I) -> Result<Iter<I, K, V>> {
         let state = self.state();
 
-        // before acquiring a permit, check if this version has already been committed
         if state.check_committed(&txn_id)? {
             let keys = state.keys_committed(&txn_id);
-            return Ok(Iter::new(self.state.clone(), txn_id, None, keys));
+            Ok(Iter::new(self.state.clone(), txn_id, None, keys))
+        } else {
+            let permit = self.semaphore.try_read(txn_id, Range::All)?;
+            let keys = state.keys_pending(txn_id);
+            Ok(Iter::new(self.state.clone(), txn_id, Some(permit), keys))
         }
-
-        let permit = self.semaphore.try_read(txn_id, Range::All)?;
-        let keys = state.keys_pending(txn_id);
-        return Ok(Iter::new(self.state.clone(), txn_id, Some(permit), keys));
     }
 
     /// Insert a new entry into this [`TxnMapLock`] at `txn_id` and return the prior value, if any.
@@ -821,13 +826,13 @@ where
         key: Q,
         value: V,
     ) -> Result<Option<Arc<V>>> {
-        // before acquiring a permit, check if this version has already been committed
-        self.state().check_pending(&txn_id)?;
-
         let key: Key<K> = key.into();
         let _permit = self.semaphore.write(txn_id, key.clone().into()).await?;
 
-        Ok(self.state_mut().insert(txn_id, key, value))
+        let mut state = self.state_mut();
+        state.check_pending(&txn_id)?;
+
+        Ok(state.insert(txn_id, key, value))
     }
 
     /// Insert a new entry into this [`TxnMapLock`] at `txn_id` synchronously, if possible.
@@ -838,8 +843,6 @@ where
         value: V,
     ) -> Result<Option<Arc<V>>> {
         let mut state = self.state_mut();
-
-        // before acquiring a permit, check if this version has already been committed
         state.check_pending(&txn_id)?;
 
         let key = key.into();
@@ -854,7 +857,6 @@ where
         Q: Eq + Hash + ToOwned<Owned = K> + ?Sized,
         Key<K>: Borrow<Q>,
     {
-        // before acquiring a permit, check if this version has already been committed
         let key: Key<K> = {
             let state = self.state();
             state.check_pending(&txn_id)?;
@@ -863,7 +865,10 @@ where
 
         let _permit = self.semaphore.write(txn_id, key.clone().into()).await?;
 
-        Ok(self.state_mut().remove(txn_id, key))
+        let mut state = self.state_mut();
+        state.check_pending(&txn_id)?;
+
+        Ok(state.remove(txn_id, key))
     }
 
     /// Remove and return the value at `key` from this [`TxnMapLock`] at `txn_id`, if present.
@@ -873,158 +878,12 @@ where
         Key<K>: Borrow<Q>,
     {
         let mut state = self.state_mut();
-
-        // before acquiring a permit, check if this version has already been committed
         state.check_pending(&txn_id)?;
 
         let key: Key<K> = (key, state.key(&txn_id, key)).into();
         let _permit = self.semaphore.try_write(txn_id, key.clone().into())?;
 
         Ok(state.remove(txn_id, key))
-    }
-}
-
-impl<I, K, V> TxnMapLock<I, K, V>
-where
-    I: Copy + Hash + Ord + fmt::Debug,
-    K: Eq + Hash + Ord + fmt::Debug,
-    V: fmt::Debug,
-{
-    /// Commit the state of this [`TxnMapLock`] at `txn_id`.
-    /// Panics: if any new value to commit is still locked (for reading or writing)
-    pub fn commit(&self, txn_id: I) {
-        let mut state = self.state_mut();
-
-        if state.finalized.as_ref() >= Some(&txn_id) {
-            #[cfg(feature = "logging")]
-            log::warn!("tried to commit already-finalized version {:?}", txn_id);
-            return;
-        }
-
-        self.semaphore.finalize(&txn_id, false);
-        state.commit(txn_id);
-    }
-
-    /// Read and commit this [`TxnMapLock`] in a single operation, if there is a version pending.
-    ///
-    /// Panics:
-    ///  - if any new value to commit is still locked (for reading or writing)
-    pub async fn read_and_commit(&self, txn_id: I) -> Option<TxnMapVersionGuard<I, K, V>> {
-        let permit = self
-            .semaphore
-            .read(txn_id, Range::All)
-            .await
-            .expect("permit");
-
-        let canon = {
-            let mut state = self.state_mut();
-
-            if state.finalized > Some(txn_id) {
-                self.semaphore.finalize(&txn_id, false);
-                return None;
-            }
-
-            state.commit(txn_id);
-            state.canon.clone()
-        };
-
-        Some(TxnMapVersionGuard::new(
-            txn_id,
-            self.semaphore.clone(),
-            permit,
-            canon,
-        ))
-    }
-
-    /// Roll back the state of this [`TxnMapLock`] at `txn_id`.
-    ///
-    /// Panics: if this [`TxnMapLock`] has already been committed at `txn_id`
-    pub fn rollback(&self, txn_id: &I) {
-        let mut state = self.state_mut();
-
-        assert!(
-            !state.committed.contains_key(txn_id),
-            "cannot roll back committed transaction {:?}",
-            txn_id
-        );
-
-        if state.finalized.as_ref() > Some(txn_id) {
-            #[cfg(feature = "logging")]
-            log::warn!("tried to roll back finalized version at {:?}", txn_id);
-        }
-
-        self.semaphore.finalize(txn_id, false);
-        state.pending.remove(txn_id);
-    }
-
-    /// Read and roll back this [`TxnMapLock`] in a single operation, if there is a version pending.
-    ///
-    /// Panics:
-    ///  - if this [`TxnMapLock`] has already been committed at `txn_id`
-    ///  - if any updated value is still locked for reading or writing
-    pub async fn read_and_rollback(&self, txn_id: I) -> Option<TxnMapVersionGuard<I, K, V>> {
-        let permit = self
-            .semaphore
-            .read(txn_id, Range::All)
-            .await
-            .expect("permit");
-
-        let version = {
-            let mut state = self.state_mut();
-
-            assert!(
-                !state.committed.contains_key(&txn_id),
-                "cannot roll back committed transaction {:?}",
-                txn_id
-            );
-
-            if state.finalized > Some(txn_id) {
-                #[cfg(feature = "logging")]
-                log::warn!("tried to roll back finalized version at {:?}", txn_id);
-                self.semaphore.finalize(&txn_id, false);
-                return None;
-            }
-
-            let mut version = state.canon(&txn_id);
-            if let Some(deltas) = state.commit_version(&txn_id) {
-                merge(&mut version, deltas);
-            }
-            version
-        };
-
-        Some(TxnMapVersionGuard::new(
-            txn_id,
-            self.semaphore.clone(),
-            permit,
-            version,
-        ))
-    }
-
-    /// Finalize the state of this [`TxnMapLock`] at `txn_id`.
-    /// This will finalize commits and prevent further reads of all versions earlier than `txn_id`.
-    pub fn finalize(&self, txn_id: I) {
-        let mut state = self.state_mut();
-
-        while let Some(version_id) = state.pending.keys().next().copied() {
-            if version_id <= txn_id {
-                state.pending.remove(&version_id);
-            } else {
-                break;
-            }
-        }
-
-        while let Some(version_id) = state.committed.keys().next().copied() {
-            if version_id <= txn_id {
-                if let Some(deltas) = state.committed.remove(&version_id).expect("version") {
-                    merge(&mut state.canon, deltas);
-                }
-            } else {
-                break;
-            }
-        }
-
-        self.semaphore.finalize(&txn_id, true);
-        state.finalize(txn_id);
     }
 }
 
@@ -1057,6 +916,7 @@ where
             }))
         }
     }
+
     /// Read a mutable value from this [`TxnMapLock`] at `txn_id`.
     pub async fn get_mut<Q: Into<Key<K>>>(
         &self,
@@ -1119,6 +979,126 @@ where
         let permit = self.semaphore.try_write(txn_id, Range::All)?;
         let keys = state.keys_pending(txn_id);
         Ok(IterMut::new(self.state.clone(), txn_id, permit, keys))
+    }
+}
+
+impl<I, K, V> TxnMapLock<I, K, V>
+where
+    I: Copy + Hash + Ord + fmt::Debug,
+    K: Eq + Hash + Ord + fmt::Debug,
+    V: fmt::Debug,
+{
+    /// Commit the state of this [`TxnMapLock`] at `txn_id`.
+    /// Panics:
+    ///  - if this [`TxnMapLock`] has already been finalized at `txn_id`
+    ///  - if any new value to commit is still locked (for reading or writing)
+    pub fn commit(&self, txn_id: I) {
+        let mut state = self.state_mut();
+
+        if state.finalized.as_ref() >= Some(&txn_id) {
+            panic!("tried to commit already-finalized version {:?}", txn_id);
+        }
+
+        state.commit(txn_id);
+        self.semaphore.finalize(&txn_id, false);
+    }
+
+    /// Read and commit this [`TxnMapLock`] in a single operation, if there is a version pending.
+    ///
+    /// Panics:
+    ///  - if this [`TxnMapLock`] has already been finalized at `txn_id`
+    ///  - if any new value to commit is still locked (for reading or writing)
+    pub async fn read_and_commit(&self, txn_id: I) -> Option<TxnMapVersionGuard<I, K, V>> {
+        let permit = self
+            .semaphore
+            .read(txn_id, Range::All)
+            .await
+            .expect("permit");
+
+        let canon = {
+            let mut state = self.state_mut();
+
+            if state.finalized > Some(txn_id) {
+                panic!("tried to commit already-finalized version {:?}", txn_id);
+            }
+
+            state.commit(txn_id);
+            state.canon(&txn_id)
+        };
+
+        Some(TxnMapVersionGuard::new(
+            txn_id,
+            self.semaphore.clone(),
+            permit,
+            canon,
+        ))
+    }
+
+    /// Roll back the state of this [`TxnMapLock`] at `txn_id`.
+    ///
+    /// Panics: if this [`TxnMapLock`] has already been committed or finalized at `txn_id`
+    pub fn rollback(&self, txn_id: &I) {
+        let mut state = self.state_mut();
+
+        assert!(
+            !state.commits.contains(txn_id),
+            "cannot roll back committed transaction {:?}",
+            txn_id
+        );
+
+        if state.finalized.as_ref() > Some(txn_id) {
+            panic!("tried to roll back finalized version at {:?}", txn_id);
+        }
+
+        state.pending.remove(txn_id);
+        self.semaphore.finalize(txn_id, false);
+    }
+
+    /// Read and roll back this [`TxnMapLock`] in a single operation, if there is a version pending.
+    ///
+    /// Panics:
+    ///  - if this [`TxnMapLock`] has already been committed or finalized at `txn_id`
+    ///  - if any updated value is still locked for reading or writing
+    pub async fn read_and_rollback(&self, txn_id: I) -> Option<TxnMapVersionGuard<I, K, V>> {
+        let permit = self
+            .semaphore
+            .read(txn_id, Range::All)
+            .await
+            .expect("permit");
+
+        let version = {
+            let mut state = self.state_mut();
+
+            assert!(
+                !state.commits.contains(&txn_id),
+                "cannot roll back committed transaction {:?}",
+                txn_id
+            );
+
+            if state.finalized > Some(txn_id) {
+                panic!("tried to roll back finalized version at {:?}", txn_id);
+            }
+
+            let mut version = state.canon(&txn_id);
+            if let Some(deltas) = state.commit_version(&txn_id) {
+                merge(&mut version, deltas);
+            }
+            version
+        };
+
+        Some(TxnMapVersionGuard::new(
+            txn_id,
+            self.semaphore.clone(),
+            permit,
+            version,
+        ))
+    }
+
+    /// Finalize the state of this [`TxnMapLock`] at `txn_id`.
+    /// This will finalize commits and prevent further reads of all versions earlier than `txn_id`.
+    pub fn finalize(&self, txn_id: I) {
+        self.state_mut().finalize(txn_id);
+        self.semaphore.finalize(&txn_id, true);
     }
 }
 

@@ -47,7 +47,7 @@ use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
 
 use collate::{Overlap, Overlaps};
-use ds_ext::OrdHashMap;
+use ds_ext::{OrdHashMap, OrdHashSet};
 use tokio::sync::RwLock;
 
 use super::guard::{TxnReadGuard, TxnVersionGuard, TxnWriteGuard};
@@ -75,7 +75,8 @@ impl Overlaps<Range> for Range {
 
 struct State<I, T> {
     canon: Arc<T>,
-    committed: OrdHashMap<I, Option<Arc<T>>>,
+    deltas: OrdHashMap<I, Arc<T>>,
+    commits: OrdHashSet<I>,
     pending: OrdHashMap<I, Arc<RwLock<T>>>,
     finalized: Option<I>,
 }
@@ -84,7 +85,8 @@ impl<I: Ord + Hash + Copy + fmt::Debug, T: fmt::Debug> State<I, T> {
     fn new(canon: T) -> Self {
         State {
             canon: Arc::new(canon),
-            committed: OrdHashMap::new(),
+            deltas: OrdHashMap::new(),
+            commits: OrdHashSet::new(),
             pending: OrdHashMap::new(),
             finalized: None,
         }
@@ -94,7 +96,7 @@ impl<I: Ord + Hash + Copy + fmt::Debug, T: fmt::Debug> State<I, T> {
     fn check_pending(&self, txn_id: &I) -> Result<()> {
         if self.finalized.as_ref() > Some(txn_id) {
             Err(Error::Outdated)
-        } else if self.committed.contains_key(txn_id) {
+        } else if self.commits.contains(txn_id) {
             Err(Error::Committed)
         } else {
             Ok(())
@@ -114,24 +116,43 @@ impl<I: Ord + Hash + Copy + fmt::Debug, T: fmt::Debug> State<I, T> {
 
     #[inline]
     fn commit(&mut self, txn_id: I) {
-        let new_value = self.commit_version(&txn_id);
-
-        if self.pending.keys().next() == Some(&txn_id) {
-            assert!(!self.committed.contains_key(&txn_id));
-            self.canon = new_value.expect("committed version");
-            self.finalized = Some(txn_id);
-        } else if let Some(value) = new_value {
-            assert!(self.committed.insert(txn_id, Some(value)).is_none());
-        } else if let Some(prior_commit) = self.committed.insert(txn_id, None) {
-            assert!(prior_commit.is_none());
-
+        if self.commits.contains(&txn_id) {
             #[cfg(feature = "logging")]
             log::warn!("duplicate commit at {:?}", txn_id);
+        } else if let Some(new_value) = self.commit_version(&txn_id) {
+            assert!(self.deltas.insert(txn_id, new_value).is_none());
         }
+
+        self.commits.insert(txn_id);
     }
 
     #[inline]
     fn finalize(&mut self, txn_id: I) {
+        while let Some(version_id) = self.pending.keys().next().copied() {
+            if version_id <= txn_id {
+                self.pending.pop_first();
+            } else {
+                break;
+            }
+        }
+
+        while let Some(version_id) = self.commits.first().map(|id| **id) {
+            if version_id <= txn_id {
+                self.commits.pop_first();
+            } else {
+                break;
+            }
+        }
+
+        while let Some(version_id) = self.deltas.keys().next().copied() {
+            if version_id <= txn_id {
+                let version = self.deltas.pop_first().expect("version");
+                self.canon = version;
+            } else {
+                break;
+            }
+        }
+
         if let Some(finalized) = self.finalized.as_mut() {
             *finalized = Ord::max(txn_id, *finalized);
         } else {
@@ -141,17 +162,15 @@ impl<I: Ord + Hash + Copy + fmt::Debug, T: fmt::Debug> State<I, T> {
 
     #[inline]
     fn read_canon(&self, txn_id: &I) -> &Arc<T> {
-        let committed = self
-            .committed
+        let mut committed = self
+            .deltas
             .iter()
             .rev()
             .skip_while(|(id, _)| *id > txn_id)
             .map(|(_, version)| version);
 
-        for version in committed {
-            if let Some(version) = version {
-                return version;
-            }
+        if let Some(version) = committed.next() {
+            return version;
         }
 
         &self.canon
@@ -161,8 +180,8 @@ impl<I: Ord + Hash + Copy + fmt::Debug, T: fmt::Debug> State<I, T> {
     fn read_committed(&self, txn_id: &I) -> Poll<Result<Arc<T>>> {
         if self.finalized.as_ref() > Some(txn_id) {
             Poll::Ready(Err(Error::Outdated))
-        } else if self.committed.contains_key(txn_id) {
-            assert!(!self.pending.contains_key(txn_id));
+        } else if self.commits.contains(txn_id) {
+            debug_assert!(!self.pending.contains_key(txn_id));
             Poll::Ready(Ok(self.read_canon(txn_id).clone()))
         } else {
             Poll::Pending
@@ -256,44 +275,51 @@ where
 
     /// Acquire a read lock for this value at `txn_id`.
     pub async fn read(&self, txn_id: I) -> Result<TxnLockReadGuard<T>> {
-        // before acquiring a permit, check if this version has already been committed
         if let Poll::Ready(result) = self.state().read_committed(&txn_id) {
             return result.map(TxnLockReadGuard::Committed);
         }
 
         let permit = self.semaphore.read(txn_id, Range).await?;
-        Ok(self.state_mut().read_pending(&txn_id, permit))
+
+        let mut state = self.state_mut();
+
+        if let Poll::Ready(result) = state.read_committed(&txn_id) {
+            return result.map(TxnLockReadGuard::Committed);
+        }
+
+        Ok(state.read_pending(&txn_id, permit))
     }
 
     /// Acquire a read lock for this value at `txn_id` synchronously, if possible.
     pub fn try_read(&self, txn_id: I) -> Result<TxnLockReadGuard<T>> {
-        // before acquiring a permit, check if this version has already been committed
-        if let Poll::Ready(result) = self.state().read_committed(&txn_id) {
+        let mut state = self.state_mut();
+
+        if let Poll::Ready(result) = state.read_committed(&txn_id) {
             return result.map(TxnLockReadGuard::Committed);
         }
 
         let permit = self.semaphore.try_read(txn_id, Range)?;
-        Ok(self.state_mut().read_pending(&txn_id, permit))
+        Ok(state.read_pending(&txn_id, permit))
     }
 }
 
 impl<I: Copy + Hash + Ord + fmt::Debug, T: Clone + fmt::Debug> TxnLock<I, T> {
     /// Acquire a write lock for this value at `txn_id`.
     pub async fn write(&self, txn_id: I) -> Result<TxnLockWriteGuard<T>> {
-        // before acquiring a permit, check if this version has already been committed
-        self.state().check_pending(&txn_id)?;
-
         let permit = self.semaphore.write(txn_id, Range).await?;
-        self.state_mut().write(txn_id, permit)
+
+        let mut state = self.state_mut();
+        state.check_pending(&txn_id)?;
+        state.write(txn_id, permit)
     }
 
     /// Acquire a write lock for this value at `txn_id` synchronously, if possible.
     pub fn try_write(&self, txn_id: I) -> Result<TxnLockWriteGuard<T>> {
-        // before acquiring a permit, check if this version has already been committed
-        self.state().check_pending(&txn_id)?;
+        let mut state = self.state_mut();
+        state.check_pending(&txn_id)?;
 
         let permit = self.semaphore.try_write(txn_id, Range)?;
-        self.state_mut().write(txn_id, permit)
+        state.write(txn_id, permit)
     }
 }
 
@@ -303,35 +329,32 @@ where
     T: fmt::Debug,
 {
     /// Commit the state of this [`TxnLock`] at `txn_id`.
+    /// Panics: if this [`TxnLock`] has already been finalized at `txn_id`
     pub fn commit(&self, txn_id: I) {
         let mut state = self.state_mut();
 
-        if state.finalized >= Some(txn_id) {
-            #[cfg(feature = "logging")]
-            log::warn!("tried to commit already-finalized version {:?}", txn_id);
-            return;
+        if state.finalized > Some(txn_id) {
+            panic!("tried to commit already-finalized version {:?}", txn_id);
+        } else {
+            state.commit(txn_id);
         }
 
         self.semaphore.finalize(&txn_id, false);
-        state.commit(txn_id);
     }
 
-    /// Read and commit this [`TxnLock`] in a single operation, if there is a version pending.
+    /// Read and commit this [`TxnLock`] in a single operation.
+    /// Panics: if this [`TxnLock`] has already been finalized at `txn_id`
     pub async fn read_and_commit(&self, txn_id: I) -> Option<TxnLockVersionGuard<I, T>> {
         let permit = self.semaphore.read(txn_id, Range).await.expect("permit");
 
         let canon = {
             let mut state = self.state_mut();
-
-            if state.finalized >= Some(txn_id) {
-                #[cfg(feature = "logging")]
-                log::warn!("tried to commit already-finalized version {:?}", txn_id);
-                self.semaphore.finalize(&txn_id, false);
-                return None;
+            if state.finalized > Some(txn_id) {
+                panic!("tried to commit already-finalized version {:?}", txn_id);
+            } else {
+                state.commit(txn_id);
+                state.read_canon(&txn_id).clone()
             }
-
-            state.commit(txn_id);
-            state.canon.clone()
         };
 
         Some(TxnLockVersionGuard::new(
@@ -343,27 +366,26 @@ where
     }
 
     /// Roll back the state of this [`TxnLock`] at `txn_id`.
-    /// Panics: if this [`TxnLock`] has already been committed at `txn_id`
+    /// Panics: if this [`TxnLock`] has already been committed or finalized at `txn_id`
     pub fn rollback(&self, txn_id: &I) {
         let mut state = self.state_mut();
 
         assert!(
-            !state.committed.contains_key(txn_id),
+            !state.commits.contains(txn_id),
             "cannot roll back committed transaction {:?}",
             txn_id
         );
 
-        #[cfg(feature = "logging")]
         if state.finalized.as_ref() > Some(txn_id) {
-            log::warn!("tried to roll back a finalized version at {:?}", txn_id);
+            panic!("tried to roll back a finalized version at {:?}", txn_id);
         }
 
-        self.semaphore.finalize(txn_id, false);
         state.pending.remove(txn_id);
+        self.semaphore.finalize(txn_id, false);
     }
 
     /// Read and roll back this [`TxnLock`] in a single operation, if there is a version pending.
-    /// Panics: if this [`TxnLock`] has already been committed at `txn_id`
+    /// Panics: if this [`TxnLock`] has already been committed or finalized at `txn_id`
     pub async fn read_and_rollback(&self, txn_id: I) -> Option<TxnLockVersionGuard<I, T>> {
         let permit = self.semaphore.read(txn_id, Range).await.expect("permit");
 
@@ -371,19 +393,18 @@ where
             let mut state = self.state_mut();
 
             assert!(
-                !state.committed.contains_key(&txn_id),
+                !state.commits.contains(&txn_id),
                 "cannot roll back committed transaction {:?}",
                 txn_id
             );
 
-            #[cfg(feature = "logging")]
             if state.finalized > Some(txn_id) {
-                log::warn!("tried to roll back a finalized version at {:?}", txn_id);
+                panic!("tried to roll back a finalized version at {:?}", txn_id);
             }
 
             state
                 .commit_version(&txn_id)
-                .unwrap_or_else(|| state.canon.clone())
+                .unwrap_or_else(|| state.read_canon(&txn_id).clone())
         };
 
         Some(TxnLockVersionGuard::new(
@@ -397,28 +418,8 @@ where
     /// Finalize the state of this [`TxnLock`] at `txn_id`.
     /// This will merge in deltas and prevent further reads of versions earlier than `txn_id`.
     pub fn finalize(&self, txn_id: I) {
-        let mut state = self.state_mut();
-
-        while let Some(version_id) = state.pending.keys().next().copied() {
-            if version_id <= txn_id {
-                state.pending.remove(&version_id);
-            } else {
-                break;
-            }
-        }
-
-        while let Some(version_id) = state.committed.keys().next().copied() {
-            if version_id <= txn_id {
-                if let Some(version) = state.committed.remove(&version_id).expect("version") {
-                    state.canon = version;
-                }
-            } else {
-                break;
-            }
-        }
-
+        self.state_mut().finalize(txn_id);
         self.semaphore.finalize(&txn_id, true);
-        state.finalize(txn_id);
     }
 }
 
