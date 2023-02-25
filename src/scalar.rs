@@ -130,7 +130,11 @@ impl<I: Ord + Hash + Copy + fmt::Debug, T: fmt::Debug> State<I, T> {
     }
 
     #[inline]
-    fn finalize(&mut self, txn_id: I) {
+    fn finalize(&mut self, txn_id: I) -> Option<&Arc<T>> {
+        if self.finalized > Some(txn_id) {
+            return None;
+        }
+
         while let Some(version_id) = self.pending.keys().next().copied() {
             if version_id <= txn_id {
                 self.pending.pop_first();
@@ -156,11 +160,9 @@ impl<I: Ord + Hash + Copy + fmt::Debug, T: fmt::Debug> State<I, T> {
             }
         }
 
-        if let Some(finalized) = self.finalized.as_mut() {
-            *finalized = Ord::max(txn_id, *finalized);
-        } else {
-            self.finalized = Some(txn_id);
-        }
+        self.finalized = Some(txn_id);
+
+        Some(&self.canon)
     }
 
     #[inline]
@@ -422,8 +424,15 @@ where
     /// Finalize the state of this [`TxnLock`] at `txn_id`.
     /// This will merge in deltas and prevent further reads of versions earlier than `txn_id`.
     pub fn finalize(&self, txn_id: I) {
-        self.state_mut().finalize(txn_id);
         self.semaphore.finalize(&txn_id, true);
+        self.state_mut().finalize(txn_id);
+    }
+
+    /// Read and finalize the state of this [`TxnLock`] at `txn_id`, if not already finalized.
+    /// This will merge in deltas and prevent further reads of versions earlier than `txn_id`.
+    pub fn read_and_finalize(&self, txn_id: I) -> Option<Arc<T>> {
+        self.semaphore.finalize(&txn_id, true);
+        self.state_mut().finalize(txn_id).cloned()
     }
 }
 
