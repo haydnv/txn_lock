@@ -131,7 +131,7 @@ impl<I, R> Clone for Semaphore<I, R> {
     }
 }
 
-impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
+impl<I, R> Semaphore<I, R> {
     /// Construct a new transactional [`Semaphore`].
     pub fn new() -> Self {
         Self {
@@ -139,7 +139,9 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
             notify: Arc::new(Notify::new()),
         }
     }
+}
 
+impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
     /// Construct a new transactional [`Semaphore`] with a write reservation for its initial value.
     pub fn with_reservation(txn_id: I, range: R) -> Self {
         let mut version = Version::new();

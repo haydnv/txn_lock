@@ -81,7 +81,8 @@ struct State<I, T> {
     finalized: Option<I>,
 }
 
-impl<I: Ord + Hash + Copy + fmt::Debug, T: fmt::Debug> State<I, T> {
+impl<I, T> State<I, T> {
+    #[inline]
     fn new(canon: T) -> Self {
         State {
             canon: Arc::new(canon),
@@ -91,7 +92,9 @@ impl<I: Ord + Hash + Copy + fmt::Debug, T: fmt::Debug> State<I, T> {
             finalized: None,
         }
     }
+}
 
+impl<I: Ord + Hash + Copy + fmt::Debug, T: fmt::Debug> State<I, T> {
     #[inline]
     fn check_pending(&self, txn_id: &I) -> Result<()> {
         if self.finalized.as_ref() > Some(txn_id) {
@@ -259,12 +262,7 @@ impl<I, T> TxnLock<I, T> {
         self.state.write().expect("write lock state")
     }
 }
-
-impl<I, T> TxnLock<I, T>
-where
-    I: Copy + Hash + Ord + fmt::Debug,
-    T: fmt::Debug,
-{
+impl<I, T> TxnLock<I, T> {
     /// Construct a new [`TxnLock`].
     pub fn new(canon: T) -> Self {
         Self {
@@ -272,7 +270,13 @@ where
             semaphore: Semaphore::new(),
         }
     }
+}
 
+impl<I, T> TxnLock<I, T>
+where
+    I: Copy + Hash + Ord + fmt::Debug,
+    T: fmt::Debug,
+{
     /// Acquire a read lock for this value at `txn_id`.
     pub async fn read(&self, txn_id: I) -> Result<TxnLockReadGuard<T>> {
         if let Poll::Ready(result) = self.state().read_committed(&txn_id) {

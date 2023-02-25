@@ -141,12 +141,7 @@ struct State<I, K, V> {
     finalized: Option<I>,
 }
 
-impl<I, K, V> State<I, K, V>
-where
-    I: Copy + Hash + Ord + fmt::Debug,
-    K: Hash + Ord,
-    V: fmt::Debug,
-{
+impl<I: Ord + Hash + fmt::Debug, K, V> State<I, K, V> {
     #[inline]
     fn new(txn_id: I, version: Pending<K, V>) -> Self {
         Self {
@@ -157,7 +152,14 @@ where
             finalized: None,
         }
     }
+}
 
+impl<I, K, V> State<I, K, V>
+where
+    I: Copy + Hash + Ord + fmt::Debug,
+    K: Hash + Ord,
+    V: fmt::Debug,
+{
     #[inline]
     fn check_committed(&self, txn_id: &I) -> Result<bool> {
         match self.finalized.as_ref().cmp(&Some(txn_id)) {
@@ -661,12 +663,7 @@ impl<I, K, V> TxnMapLock<I, K, V> {
     }
 }
 
-impl<I, K, V> TxnMapLock<I, K, V>
-where
-    I: Copy + Hash + Ord + fmt::Debug,
-    K: Eq + Hash + Ord + fmt::Debug,
-    V: fmt::Debug,
-{
+impl<I: Ord + Hash + fmt::Debug, K, V> TxnMapLock<I, K, V> {
     /// Construct a new [`TxnMapLock`].
     pub fn new(txn_id: I) -> Self {
         Self {
@@ -674,7 +671,14 @@ where
             semaphore: Semaphore::new(),
         }
     }
+}
 
+impl<I, K, V> TxnMapLock<I, K, V>
+where
+    I: Copy + Hash + Ord + fmt::Debug,
+    K: Eq + Hash + Ord + fmt::Debug,
+    V: fmt::Debug,
+{
     /// Construct a new [`TxnMapLock`] with the given `contents`.
     pub fn with_contents<C: IntoIterator<Item = (K, V)>>(txn_id: I, contents: C) -> Self {
         let version = contents

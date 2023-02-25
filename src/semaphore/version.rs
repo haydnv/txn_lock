@@ -410,7 +410,7 @@ pub struct Version<R> {
     roots: List<RangeLock<R>>,
 }
 
-impl<R: fmt::Debug> Version<R> {
+impl<R> Version<R> {
     /// Create a new [`Version`] semaphore
     pub fn new() -> Self {
         Self {

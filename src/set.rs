@@ -85,7 +85,7 @@ struct State<I, T> {
     finalized: Option<I>,
 }
 
-impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
+impl<I: Ord + Hash + fmt::Debug, T: Eq + Hash> State<I, T> {
     fn new(txn_id: I, set: Canon<T>) -> Self {
         let delta = set.into_iter().map(|key| (key, true)).collect();
 
@@ -97,7 +97,9 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
             finalized: None,
         }
     }
+}
 
+impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
     #[inline]
     fn canon(&self, txn_id: &I) -> Canon<T> {
         let mut canon = self.canon.clone();
@@ -313,11 +315,7 @@ impl<I, T> TxnSetLock<I, T> {
     }
 }
 
-impl<I, T> TxnSetLock<I, T>
-where
-    I: Copy + Hash + Ord + fmt::Debug,
-    T: Hash + Ord + fmt::Debug,
-{
+impl<I: Ord + Hash + fmt::Debug, T: Eq + Hash> TxnSetLock<I, T> {
     /// Construct a new, empty [`TxnSetLock`].
     pub fn new(txn_id: I) -> Self {
         Self {
@@ -325,7 +323,13 @@ where
             semaphore: Semaphore::new(),
         }
     }
+}
 
+impl<I, T> TxnSetLock<I, T>
+where
+    I: Copy + Hash + Ord + fmt::Debug,
+    T: Hash + Ord + fmt::Debug,
+{
     /// Construct a new [`TxnSetLock`] with the given `contents`.
     pub fn with_contents<C: IntoIterator<Item = T>>(txn_id: I, contents: C) -> Self {
         let set = contents.into_iter().map(Key::new).collect();
