@@ -350,7 +350,7 @@ where
 
     /// Read and commit this [`TxnLock`] in a single operation.
     /// Panics: if this [`TxnLock`] has already been finalized at `txn_id`
-    pub async fn read_and_commit(&self, txn_id: I) -> Option<TxnLockVersionGuard<I, T>> {
+    pub async fn read_and_commit(&self, txn_id: I) -> TxnLockVersionGuard<I, T> {
         let permit = self.semaphore.read(txn_id, Range).await.expect("permit");
 
         let canon = {
@@ -363,17 +363,14 @@ where
             }
         };
 
-        Some(TxnLockVersionGuard::new(
-            txn_id,
-            self.semaphore.clone(),
-            permit,
-            canon,
-        ))
+        TxnLockVersionGuard::new(txn_id, self.semaphore.clone(), permit, canon)
     }
 
     /// Roll back the state of this [`TxnLock`] at `txn_id`.
     /// Panics: if this [`TxnLock`] has already been committed or finalized at `txn_id`
     pub fn rollback(&self, txn_id: &I) {
+        self.semaphore.finalize(txn_id, false);
+
         let mut state = self.state_mut();
 
         assert!(
@@ -387,12 +384,11 @@ where
         }
 
         state.pending.remove(txn_id);
-        self.semaphore.finalize(txn_id, false);
     }
 
     /// Read and roll back this [`TxnLock`] in a single operation, if there is a version pending.
     /// Panics: if this [`TxnLock`] has already been committed or finalized at `txn_id`
-    pub async fn read_and_rollback(&self, txn_id: I) -> Option<TxnLockVersionGuard<I, T>> {
+    pub async fn read_and_rollback(&self, txn_id: I) -> TxnLockVersionGuard<I, T> {
         let permit = self.semaphore.read(txn_id, Range).await.expect("permit");
 
         let version = {
@@ -413,12 +409,7 @@ where
                 .unwrap_or_else(|| state.read_canon(&txn_id).clone())
         };
 
-        Some(TxnLockVersionGuard::new(
-            txn_id,
-            self.semaphore.clone(),
-            permit,
-            version,
-        ))
+        TxnLockVersionGuard::new(txn_id, self.semaphore.clone(), permit, version)
     }
 
     /// Finalize the state of this [`TxnLock`] at `txn_id`.

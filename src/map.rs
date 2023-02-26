@@ -300,7 +300,7 @@ where
         while let Some(version_id) = self.deltas.keys().next().copied() {
             if version_id <= txn_id {
                 let version = self.deltas.pop_first().expect("version");
-                merge(&mut self.canon, version);
+                merge_owned(&mut self.canon, version);
             } else {
                 break;
             }
@@ -1006,22 +1006,27 @@ where
         }
 
         state.commit(txn_id);
+
         self.semaphore.finalize(&txn_id, false);
     }
 
-    /// Read and commit this [`TxnMapLock`] in a single operation, if there is a version pending.
+    /// Read and commit this [`TxnMapLock`] in a single operation.
+    /// Also returns the set of changes committed, if any.
     ///
     /// Panics:
     ///  - if this [`TxnMapLock`] has already been finalized at `txn_id`
     ///  - if any new value to commit is still locked (for reading or writing)
-    pub async fn read_and_commit(&self, txn_id: I) -> Option<TxnMapVersionGuard<I, K, V>> {
+    pub async fn read_and_commit(
+        &self,
+        txn_id: I,
+    ) -> (TxnMapVersionGuard<I, K, V>, Option<Delta<K, V>>) {
         let permit = self
             .semaphore
             .read(txn_id, Range::All)
             .await
             .expect("permit");
 
-        let canon = {
+        let (version, deltas) = {
             let mut state = self.state_mut();
 
             if state.finalized > Some(txn_id) {
@@ -1029,21 +1034,20 @@ where
             }
 
             state.commit(txn_id);
-            state.canon(&txn_id)
+            (state.canon(&txn_id), state.deltas.get(&txn_id).cloned())
         };
 
-        Some(TxnMapVersionGuard::new(
-            txn_id,
-            self.semaphore.clone(),
-            permit,
-            canon,
-        ))
+        let version = TxnMapVersionGuard::new(txn_id, self.semaphore.clone(), permit, version);
+
+        (version, deltas)
     }
 
     /// Roll back the state of this [`TxnMapLock`] at `txn_id`.
     ///
     /// Panics: if this [`TxnMapLock`] has already been committed or finalized at `txn_id`
     pub fn rollback(&self, txn_id: &I) {
+        self.semaphore.finalize(txn_id, false);
+
         let mut state = self.state_mut();
 
         assert!(
@@ -1057,22 +1061,25 @@ where
         }
 
         state.pending.remove(txn_id);
-        self.semaphore.finalize(txn_id, false);
     }
 
-    /// Read and roll back this [`TxnMapLock`] in a single operation, if there is a version pending.
+    /// Read and roll back this [`TxnMapLock`] in a single operation.
+    /// Also returns the set of changes rolled back, if any.
     ///
     /// Panics:
     ///  - if this [`TxnMapLock`] has already been committed or finalized at `txn_id`
     ///  - if any updated value is still locked for reading or writing
-    pub async fn read_and_rollback(&self, txn_id: I) -> Option<TxnMapVersionGuard<I, K, V>> {
+    pub async fn read_and_rollback(
+        &self,
+        txn_id: I,
+    ) -> (TxnMapVersionGuard<I, K, V>, Option<Delta<K, V>>) {
         let permit = self
             .semaphore
             .read(txn_id, Range::All)
             .await
             .expect("permit");
 
-        let version = {
+        let (version, deltas) = {
             let mut state = self.state_mut();
 
             assert!(
@@ -1086,18 +1093,18 @@ where
             }
 
             let mut version = state.canon(&txn_id);
-            if let Some(deltas) = state.commit_version(&txn_id) {
+            let deltas = state.commit_version(&txn_id);
+
+            if let Some(deltas) = &deltas {
                 merge(&mut version, deltas);
             }
-            version
+
+            (version, deltas)
         };
 
-        Some(TxnMapVersionGuard::new(
-            txn_id,
-            self.semaphore.clone(),
-            permit,
-            version,
-        ))
+        let version = TxnMapVersionGuard::new(txn_id, self.semaphore.clone(), permit, version);
+
+        (version, deltas)
     }
 
     /// Finalize the state of this [`TxnMapLock`] at `txn_id`.
@@ -1315,11 +1322,21 @@ where
 }
 
 #[inline]
-fn merge<K: Eq + Hash, V>(canon: &mut Canon<K, V>, deltas: Delta<K, V>) {
+fn merge<K: Eq + Hash, V>(version: &mut Canon<K, V>, deltas: &Delta<K, V>) {
     for (key, delta) in deltas {
         match delta {
-            Some(value) => canon.insert(key, value),
-            None => canon.remove(&key),
+            Some(value) => version.insert(key.clone(), value.clone()),
+            None => version.remove(key),
+        };
+    }
+}
+
+#[inline]
+fn merge_owned<K: Eq + Hash, V>(version: &mut Canon<K, V>, deltas: Delta<K, V>) {
+    for (key, delta) in deltas {
+        match delta {
+            Some(value) => version.insert(key, value),
+            None => version.remove(&key),
         };
     }
 }

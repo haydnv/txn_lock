@@ -63,7 +63,6 @@ use std::task::Poll;
 use std::{fmt, iter};
 
 use ds_ext::{OrdHashMap, OrdHashSet};
-use futures::future::FutureExt;
 
 use super::guard::TxnVersionGuard;
 use super::semaphore::{PermitRead, Semaphore};
@@ -551,20 +550,26 @@ where
             panic!("tried to commit already-finalized version {:?}", txn_id);
         }
 
-        self.semaphore.finalize(&txn_id, false);
         state.commit(txn_id);
+
+        self.semaphore.finalize(&txn_id, false);
     }
 
     /// Read and commit of this [`TxnSetLock`] in a single operation, if there is a version pending.
+    /// Also returns the set of changes committed, if any.
+    ///
     /// Panics: if this [`TxnSetLock`] has already been finalized at `txn_id`
-    pub async fn read_and_commit(&self, txn_id: I) -> Option<TxnSetLockVersionGuard<I, T>> {
+    pub async fn read_and_commit(
+        &self,
+        txn_id: I,
+    ) -> (TxnSetLockVersionGuard<I, T>, Option<Delta<T>>) {
         let permit = self
             .semaphore
             .read(txn_id, Range::All)
-            .map(|r| r.ok())
-            .await?;
+            .await
+            .expect("permit");
 
-        let version = {
+        let (version, delta) = {
             let mut state = self.state_mut();
 
             if state.finalized > Some(txn_id) {
@@ -572,20 +577,20 @@ where
             }
 
             state.commit(txn_id);
-            state.canon(&txn_id)
+
+            (state.canon(&txn_id), state.deltas.get(&txn_id).cloned())
         };
 
-        Some(TxnSetLockVersionGuard::new(
-            txn_id,
-            self.semaphore.clone(),
-            permit,
-            version,
-        ))
+        let version = TxnSetLockVersionGuard::new(txn_id, self.semaphore.clone(), permit, version);
+
+        (version, delta)
     }
 
     /// Roll back the state of this [`TxnSetLock`] at `txn_id`.
     /// Panics: if this [`TxnSetLock`] has already been committed or finalized at `txn_id`
     pub fn rollback(&self, txn_id: &I) {
+        self.semaphore.finalize(txn_id, false);
+
         let mut state = self.state_mut();
 
         assert!(
@@ -598,20 +603,24 @@ where
             panic!("tried to roll back finalized version at {:?}", txn_id);
         }
 
-        self.semaphore.finalize(txn_id, false);
         state.pending.remove(txn_id);
     }
 
     /// Read and roll back this [`TxnSetLock`] in a single operation, if there is a version pending.
+    /// Also returns the set of changes rolled back, if any.
+    ///
     /// Panics: if this [`TxnSetLock`] has already been committed or finalized at `txn_id`
-    pub async fn read_and_rollback(&self, txn_id: I) -> Option<TxnSetLockVersionGuard<I, T>> {
+    pub async fn read_and_rollback(
+        &self,
+        txn_id: I,
+    ) -> (TxnSetLockVersionGuard<I, T>, Option<Delta<T>>) {
         let permit = self
             .semaphore
             .read(txn_id, Range::All)
             .await
             .expect("permit");
 
-        let version = {
+        let (version, deltas) = {
             let mut state = self.state_mut();
 
             assert!(
@@ -625,18 +634,18 @@ where
             }
 
             let mut version = state.canon(&txn_id);
-            if let Some(deltas) = state.pending.remove(&txn_id) {
-                merge_owned(&mut version, deltas);
+            let deltas = state.pending.remove(&txn_id);
+
+            if let Some(deltas) = &deltas {
+                merge(&mut version, deltas);
             }
-            version
+
+            (version, deltas)
         };
 
-        Some(TxnSetLockVersionGuard::new(
-            txn_id,
-            self.semaphore.clone(),
-            permit,
-            version,
-        ))
+        let version = TxnSetLockVersionGuard::new(txn_id, self.semaphore.clone(), permit, version);
+
+        (version, deltas)
     }
 
     /// Finalize the state of this [`TxnSetLock`] at `txn_id`.
@@ -683,21 +692,21 @@ impl<T> Iterator for Iter<T> {
 }
 
 #[inline]
-fn merge_owned<T: Hash + Ord>(canon: &mut Canon<T>, delta: Delta<T>) {
+fn merge<T: Hash + Ord>(version: &mut Canon<T>, delta: &Delta<T>) {
     for (key, key_state) in delta {
         match key_state {
-            true => canon.insert(key),
-            false => canon.remove(&key),
+            true => version.insert(key.clone()),
+            false => version.remove(key),
         };
     }
 }
 
 #[inline]
-fn merge<T: Hash + Ord>(canon: &mut Canon<T>, delta: &Delta<T>) {
+fn merge_owned<T: Hash + Ord>(version: &mut Canon<T>, delta: Delta<T>) {
     for (key, key_state) in delta {
         match key_state {
-            true => canon.insert(key.clone()),
-            false => canon.remove(key),
+            true => version.insert(key),
+            false => version.remove(&key),
         };
     }
 }
