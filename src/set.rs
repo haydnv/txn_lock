@@ -4,12 +4,15 @@
 //! ```
 //! use std::collections::HashSet;
 //! use std::sync::Arc;
+//!
+//! use collate::Collator;
 //! use futures::executor::block_on;
 //!
 //! use txn_lock::set::*;
 //! use txn_lock::Error;
 //!
-//! let set = TxnSetLock::<u64, String>::new(0);
+//! let collator = Arc::new(Collator::default());
+//! let set = TxnSetLock::<u64, Collator<String>, String>::new(0, collator);
 //!
 //! let one = "one";
 //! let two = "two";
@@ -26,30 +29,30 @@
 //!     vec![Arc::new(one.to_string())]
 //! );
 //! assert!(block_on(set.remove(2, one)).expect("remove"));
-//! // assert!(!set.try_contains(2, one).expect("contains"));
-//! // assert!(!set.try_remove(2, one).expect("remove"));
-//! // assert!(!set.try_contains(2, one).expect("contains"));
-//! // assert!(!set.try_remove(2, two).expect("remove"));
-//! // set.try_insert(2, two.to_string()).expect("insert");
-//! // set.finalize(2);
+//! assert!(!set.try_contains(2, one).expect("contains"));
+//! assert!(!set.try_remove(2, one).expect("remove"));
+//! assert!(!set.try_contains(2, one).expect("contains"));
+//! assert!(!set.try_remove(2, two).expect("remove"));
+//! set.try_insert(2, two.to_string()).expect("insert");
+//! set.finalize(2);
 //!
-//! // assert_eq!(set.try_contains(1, one).unwrap_err(), Error::Outdated);
-//! // assert!(set.try_contains(3, one).expect("contains"));
-//! // assert!(set.try_remove(3, one).expect("remove"));
-//! // assert!(!set.try_remove(3, one).expect("remove"));
-//! // assert!(!set.try_remove(3, two).expect("remove"));
-//! // set.commit(3);
+//! assert_eq!(set.try_contains(1, one).unwrap_err(), Error::Outdated);
+//! assert!(set.try_contains(3, one).expect("contains"));
+//! assert!(set.try_remove(3, one).expect("remove"));
+//! assert!(!set.try_remove(3, one).expect("remove"));
+//! assert!(!set.try_remove(3, two).expect("remove"));
+//! set.commit(3);
 //!
-//! // let new_values: HashSet<String> = ["one", "two", "three", "four"]
-//! //     .into_iter()
-//! //     .map(String::from)
-//! //     .collect();
+//! let new_values: HashSet<String> = ["one", "two", "three", "four"]
+//!     .into_iter()
+//!     .map(String::from)
+//!     .collect();
 //!
-//! // set.try_extend(4, new_values.clone()).expect("extend");
-//! // assert_eq!(
-//! //     new_values.into_iter().map(Arc::from).collect::<HashSet<Arc<String>>>(),
-//! //     set.try_clear(4).expect("clear").into_iter().map(Arc::from).collect::<HashSet<_>>()
-//! // );
+//! set.try_extend(4, new_values.clone()).expect("extend");
+//! assert_eq!(
+//!     new_values.into_iter().map(Arc::from).collect::<HashSet<Arc<String>>>(),
+//!     set.try_clear(4).expect("clear").into_iter().map(Arc::from).collect::<HashSet<_>>()
+//! );
 //! ```
 
 use std::borrow::Borrow;
@@ -62,6 +65,7 @@ use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
 use std::{fmt, iter};
 
+use collate::Collate;
 use ds_ext::{OrdHashMap, OrdHashSet};
 
 use super::guard::TxnVersionGuard;
@@ -74,7 +78,7 @@ type Delta<T> = HashMap<Key<T>, bool>;
 type Canon<T> = HashSet<Key<T>>;
 
 /// A read guard on a version of a [`TxnSetLock`]
-pub type TxnSetLockVersionGuard<I, T> = TxnVersionGuard<I, Range<T>, Canon<T>>;
+pub type TxnSetLockVersionGuard<I, C, T> = TxnVersionGuard<I, C, Range<T>, Canon<T>>;
 
 struct State<I, T> {
     canon: Canon<T>,
@@ -290,12 +294,12 @@ where
 }
 
 /// A futures-aware read-write lock on a [`HashSet`] which supports transactional versioning
-pub struct TxnSetLock<I, T> {
+pub struct TxnSetLock<I, C, T> {
     state: Arc<RwLockInner<State<I, T>>>,
-    semaphore: Semaphore<I, Range<T>>,
+    semaphore: Semaphore<I, C, Range<T>>,
 }
 
-impl<I, T> Clone for TxnSetLock<I, T> {
+impl<I, C, T> Clone for TxnSetLock<I, C, T> {
     fn clone(&self) -> Self {
         Self {
             state: self.state.clone(),
@@ -304,7 +308,7 @@ impl<I, T> Clone for TxnSetLock<I, T> {
     }
 }
 
-impl<I, T> TxnSetLock<I, T> {
+impl<I, C, T> TxnSetLock<I, C, T> {
     #[inline]
     fn state(&self) -> impl Deref<Target = State<I, T>> + '_ {
         self.state.read().expect("lock state")
@@ -316,28 +320,37 @@ impl<I, T> TxnSetLock<I, T> {
     }
 }
 
-impl<I: Ord + Hash + fmt::Debug, T: Eq + Hash> TxnSetLock<I, T> {
+impl<I, C, T> TxnSetLock<I, C, T>
+where
+    I: Ord + Hash + fmt::Debug,
+    T: Eq + Hash,
+{
     /// Construct a new, empty [`TxnSetLock`].
-    pub fn new(txn_id: I) -> Self {
+    pub fn new(txn_id: I, collator: Arc<C>) -> Self {
         Self {
             state: Arc::new(RwLockInner::new(State::new(txn_id, Canon::new()))),
-            semaphore: Semaphore::new(),
+            semaphore: Semaphore::new(collator),
         }
     }
 }
 
-impl<I, T> TxnSetLock<I, T>
+impl<I, C, T> TxnSetLock<I, C, T>
 where
     I: Copy + Hash + Ord + fmt::Debug,
+    C: Collate<Value = T>,
     T: Hash + Ord + fmt::Debug,
 {
     /// Construct a new [`TxnSetLock`] with the given `contents`.
-    pub fn with_contents<C: IntoIterator<Item = T>>(txn_id: I, contents: C) -> Self {
+    pub fn with_contents<IT: IntoIterator<Item = T>>(
+        txn_id: I,
+        collator: Arc<C>,
+        contents: IT,
+    ) -> Self {
         let set = contents.into_iter().map(Key::new).collect();
 
         Self {
             state: Arc::new(RwLockInner::new(State::new(txn_id, set))),
-            semaphore: Semaphore::with_reservation(txn_id, Range::All),
+            semaphore: Semaphore::with_reservation(txn_id, collator, Range::All),
         }
     }
 
@@ -536,9 +549,10 @@ where
     }
 }
 
-impl<I, T> TxnSetLock<I, T>
+impl<I, C, T> TxnSetLock<I, C, T>
 where
     I: Copy + Hash + Ord + fmt::Debug,
+    C: Collate<Value = T>,
     T: Hash + Ord + fmt::Debug,
 {
     /// Commit the state of this [`TxnSetLock`] at `txn_id`.
@@ -562,7 +576,7 @@ where
     pub async fn read_and_commit(
         &self,
         txn_id: I,
-    ) -> (TxnSetLockVersionGuard<I, T>, Option<Delta<T>>) {
+    ) -> (TxnSetLockVersionGuard<I, C, T>, Option<Delta<T>>) {
         let permit = self
             .semaphore
             .read(txn_id, Range::All)
@@ -613,7 +627,7 @@ where
     pub async fn read_and_rollback(
         &self,
         txn_id: I,
-    ) -> (TxnSetLockVersionGuard<I, T>, Option<Delta<T>>) {
+    ) -> (TxnSetLockVersionGuard<I, C, T>, Option<Delta<T>>) {
         let permit = self
             .semaphore
             .read(txn_id, Range::All)
@@ -711,7 +725,7 @@ fn merge_owned<T: Hash + Ord>(version: &mut Canon<T>, delta: Delta<T>) {
     }
 }
 
-impl<I, T> fmt::Debug for TxnSetLock<I, T> {
+impl<I, C, T> fmt::Debug for TxnSetLock<I, C, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("a transactional lock on a set of values")
     }

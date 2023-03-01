@@ -200,18 +200,18 @@ impl<R, T: PartialOrd> PartialOrd<T> for TxnWriteGuard<R, T> {
 }
 
 /// A read guard on the state of a transactional lock to commit or roll back
-pub struct TxnVersionGuard<I: Copy + Ord, R, T> {
+pub struct TxnVersionGuard<I: Copy + Ord, C, R, T> {
     #[allow(unused)]
     permit: PermitRead<R>,
-    semaphore: Semaphore<I, R>,
+    semaphore: Semaphore<I, C, R>,
     canon: T,
     txn_id: I,
 }
 
-impl<I: Copy + Ord, R, T> TxnVersionGuard<I, R, T> {
+impl<I: Copy + Ord, C, R, T> TxnVersionGuard<I, C, R, T> {
     pub(crate) fn new(
         txn_id: I,
-        semaphore: Semaphore<I, R>,
+        semaphore: Semaphore<I, C, R>,
         permit: PermitRead<R>,
         canon: T,
     ) -> Self {
@@ -224,7 +224,7 @@ impl<I: Copy + Ord, R, T> TxnVersionGuard<I, R, T> {
     }
 }
 
-impl<I: Copy + Ord, R, T> Deref for TxnVersionGuard<I, R, T> {
+impl<I: Copy + Ord, C, R, T> Deref for TxnVersionGuard<I, C, R, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -232,7 +232,7 @@ impl<I: Copy + Ord, R, T> Deref for TxnVersionGuard<I, R, T> {
     }
 }
 
-impl<I: Copy + Ord, R, T> Drop for TxnVersionGuard<I, R, T> {
+impl<I: Copy + Ord, C, R, T> Drop for TxnVersionGuard<I, C, R, T> {
     fn drop(&mut self) {
         self.semaphore.finalize(&self.txn_id, false)
     }

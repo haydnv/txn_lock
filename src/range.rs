@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::sync::Arc;
 
-use collate::{Overlap, Overlaps};
+use collate::{Collate, Overlap, Overlaps};
 
 /// A key in a transactional lock
 pub struct Key<K> {
@@ -133,8 +133,8 @@ impl<K> Clone for Range<K> {
     }
 }
 
-impl<K: Eq + Ord> Overlaps<Self> for Range<K> {
-    fn overlaps(&self, other: &Self) -> Overlap {
+impl<K, C: Collate<Value = K>> Overlaps<Self, C> for Range<K> {
+    fn overlaps(&self, other: &Self, collator: &C) -> Overlap {
         match self {
             Self::All => match other {
                 Self::All => Overlap::Equal,
@@ -142,17 +142,17 @@ impl<K: Eq + Ord> Overlaps<Self> for Range<K> {
             },
             this => match other {
                 Self::All => Overlap::Narrow,
-                Self::One(that) => this.overlaps(&**that),
+                Self::One(that) => this.overlaps(&**that, collator),
             },
         }
     }
 }
 
-impl<K: Eq + Ord> Overlaps<K> for Range<K> {
-    fn overlaps(&self, other: &K) -> Overlap {
+impl<K, C: Collate<Value = K>> Overlaps<K, C> for Range<K> {
+    fn overlaps(&self, other: &K, collator: &C) -> Overlap {
         match self {
             Self::All => Overlap::Wide,
-            Self::One(this) => match (&**this).cmp(other) {
+            Self::One(this) => match collator.cmp(&**this, other) {
                 Ordering::Less => Overlap::Less,
                 Ordering::Equal => Overlap::Equal,
                 Ordering::Greater => Overlap::Greater,

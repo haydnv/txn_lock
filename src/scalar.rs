@@ -46,7 +46,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
 
-use collate::{Overlap, Overlaps};
+use collate::{Collator, Overlap, Overlaps};
 use ds_ext::{OrdHashMap, OrdHashSet};
 use tokio::sync::RwLock;
 
@@ -61,14 +61,14 @@ pub type TxnLockReadGuard<T> = TxnReadGuard<Range, T>;
 pub type TxnLockWriteGuard<T> = TxnWriteGuard<Range, T>;
 
 /// A read guard on the state of a [`TxnLock`] that was committed or rolled back
-pub type TxnLockVersionGuard<I, T> = TxnVersionGuard<I, Range, Arc<T>>;
+pub type TxnLockVersionGuard<I, T> = TxnVersionGuard<I, Collator<()>, Range, Arc<T>>;
 
 /// A range used to reserve a permit to guard access to a [`TxnLock`]
 #[derive(Debug)]
 pub struct Range;
 
-impl Overlaps<Range> for Range {
-    fn overlaps(&self, _other: &Range) -> Overlap {
+impl Overlaps<Range, Collator<()>> for Range {
+    fn overlaps(&self, _other: &Range, _collator: &Collator<()>) -> Overlap {
         Overlap::Equal
     }
 }
@@ -241,7 +241,7 @@ impl<I: Copy + Ord + Hash + fmt::Debug, T: Clone + fmt::Debug> State<I, T> {
 /// [`Clone::clone`] is called once when [`TxnLock::write`] is called with a valid new `txn_id`.
 pub struct TxnLock<I, T> {
     state: Arc<RwLockInner<State<I, T>>>,
-    semaphore: Semaphore<I, Range>,
+    semaphore: Semaphore<I, Collator<()>, Range>,
 }
 
 impl<I, T> Clone for TxnLock<I, T> {
@@ -264,12 +264,13 @@ impl<I, T> TxnLock<I, T> {
         self.state.write().expect("write lock state")
     }
 }
+
 impl<I, T> TxnLock<I, T> {
     /// Construct a new [`TxnLock`].
     pub fn new(canon: T) -> Self {
         Self {
             state: Arc::new(RwLockInner::new(State::new(canon))),
-            semaphore: Semaphore::new(),
+            semaphore: Semaphore::new(Arc::new(Collator::default())),
         }
     }
 }
@@ -309,7 +310,11 @@ where
     }
 }
 
-impl<I: Copy + Hash + Ord + fmt::Debug, T: Clone + fmt::Debug> TxnLock<I, T> {
+impl<I, T> TxnLock<I, T>
+where
+    I: Copy + Hash + Ord + fmt::Debug,
+    T: Clone + fmt::Debug,
+{
     /// Acquire a write lock for this value at `txn_id`.
     pub async fn write(&self, txn_id: I) -> Result<TxnLockWriteGuard<T>> {
         let permit = self.semaphore.write(txn_id, Range).await?;

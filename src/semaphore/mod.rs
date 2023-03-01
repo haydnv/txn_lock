@@ -10,10 +10,15 @@
 //! Example:
 //! ```
 //! use std::ops::Range;
+//! use std::sync::Arc;
+//!
+//! use collate::Collator;
+//!
 //! use txn_lock::semaphore::*;
 //! use txn_lock::Error;
 //!
-//! let semaphore = Semaphore::<u64, Range<usize>>::new();
+//! let collator = Arc::new(Collator::default());
+//! let semaphore = Semaphore::<u64, Collator<usize>, Range<usize>>::new(collator);
 //!
 //! // Multiple overlapping read permits within a transaction are fine
 //! let permit0_1 = semaphore.try_read(0, 0..1).expect("read 0..1");
@@ -62,7 +67,7 @@ use std::fmt;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
-use collate::Overlaps;
+use collate::{Collate, Overlaps};
 use tokio::sync::Notify;
 
 use super::{Error, Result};
@@ -111,52 +116,56 @@ impl<R> Drop for PermitWrite<R> {
     }
 }
 
-enum VersionRead<I, R> {
-    Version(Arc<R>, RangeLock<R>),
+enum VersionRead<I, C, R> {
+    Version(Arc<R>, RangeLock<C, R>),
     Pending(Arc<R>, I),
 }
 
 /// A semaphore used to maintain the ACID compliance of transactional resource
-pub struct Semaphore<I, R> {
-    versions: Arc<Mutex<BTreeMap<I, Version<R>>>>,
+pub struct Semaphore<I, C, R> {
+    collator: Arc<C>,
+    versions: Arc<Mutex<BTreeMap<I, Version<C, R>>>>,
     notify: Arc<Notify>,
 }
 
-impl<I, R> Clone for Semaphore<I, R> {
+impl<I, C, R> Clone for Semaphore<I, C, R> {
     fn clone(&self) -> Self {
         Self {
+            collator: self.collator.clone(),
             versions: self.versions.clone(),
             notify: self.notify.clone(),
         }
     }
 }
 
-impl<I, R> Semaphore<I, R> {
+impl<I, C, R> Semaphore<I, C, R> {
     /// Construct a new transactional [`Semaphore`].
-    pub fn new() -> Self {
+    pub fn new(collator: Arc<C>) -> Self {
         Self {
+            collator,
             versions: Arc::new(Mutex::new(BTreeMap::new())),
             notify: Arc::new(Notify::new()),
         }
     }
 }
 
-impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
+impl<I: Ord, C: Collate, R: Overlaps<R, C> + fmt::Debug> Semaphore<I, C, R> {
     /// Construct a new transactional [`Semaphore`] with a write reservation for its initial value.
-    pub fn with_reservation(txn_id: I, range: R) -> Self {
-        let mut version = Version::new();
+    pub fn with_reservation(txn_id: I, collator: Arc<C>, range: R) -> Self {
+        let mut version = Version::new(collator.clone());
         version.insert(Arc::new(range), true);
 
-        let mut versions: BTreeMap<I, Version<R>> = BTreeMap::new();
+        let mut versions: BTreeMap<I, Version<C, R>> = BTreeMap::new();
         versions.insert(txn_id, version);
 
         Self {
+            collator,
             versions: Arc::new(Mutex::new(BTreeMap::new())),
             notify: Arc::new(Notify::new()),
         }
     }
 
-    fn read_inner(&self, txn_id: I, range: Arc<R>) -> VersionRead<I, R> {
+    fn read_inner(&self, txn_id: I, range: Arc<R>) -> VersionRead<I, C, R> {
         let mut versions = self.versions.lock().expect("versions");
 
         // check if there's an overlapping write lock in the past
@@ -176,7 +185,7 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
             }
         }
 
-        let mut version = Version::new();
+        let mut version = Version::new(self.collator.clone());
         let root = version.insert(range.clone(), false);
         versions.insert(txn_id, version);
 
@@ -195,7 +204,7 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
                 }
                 VersionRead::Version(range, root) => {
                     return Ok(PermitRead {
-                        permit: root.read(&range).await?,
+                        permit: root.read(&range, &self.collator).await?,
                         notify: self.notify.clone(),
                     })
                 }
@@ -212,7 +221,7 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
         match self.read_inner(txn_id, range) {
             VersionRead::Pending(_, _) => Err(Error::WouldBlock),
             VersionRead::Version(range, root) => root
-                .try_read(&range)
+                .try_read(&range, &self.collator)
                 .map(|permit| PermitRead {
                     permit,
                     notify: self.notify.clone(),
@@ -221,7 +230,7 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
         }
     }
 
-    fn write_inner(&self, txn_id: I, range: Arc<R>) -> Result<VersionRead<I, R>> {
+    fn write_inner(&self, txn_id: I, range: Arc<R>) -> Result<VersionRead<I, C, R>> {
         let mut versions = self.versions.lock().expect("versions");
 
         // handle creating a new version
@@ -252,7 +261,7 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
                 Ok(VersionRead::Version(range, root))
             }
             btree_map::Entry::Vacant(entry) => {
-                let mut version = Version::new();
+                let mut version = Version::new(self.collator.clone());
                 let root = version.insert(range.clone(), true);
                 entry.insert(version);
 
@@ -272,7 +281,7 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
                     range = r;
                 }
                 VersionRead::Version(range, root) => {
-                    let permit = root.write(&range).await?;
+                    let permit = root.write(&range, &self.collator).await?;
 
                     return Ok(PermitWrite {
                         permit,
@@ -292,7 +301,7 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
         match self.write_inner(txn_id, range)? {
             VersionRead::Pending(_, _) => Err(Error::WouldBlock),
             VersionRead::Version(range, root) => root
-                .try_write(&range)
+                .try_write(&range, &self.collator)
                 .map(|permit| PermitWrite {
                     permit,
                     notify: self.notify.clone(),
@@ -302,7 +311,7 @@ impl<I: Ord, R: Overlaps<R> + fmt::Debug> Semaphore<I, R> {
     }
 }
 
-impl<I: Copy + Ord, R> Semaphore<I, R> {
+impl<I: Copy + Ord, C, R> Semaphore<I, C, R> {
     /// Mark a transaction completed, un-blocking waiting requests for future permits.
     ///
     /// Call this when the transactional resource is no longer writable at `txn_id`

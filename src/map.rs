@@ -4,6 +4,8 @@
 //! ```
 //! use std::collections::HashMap;
 //! use std::sync::Arc;
+//!
+//! use collate::Collator;
 //! use futures::executor::block_on;
 //!
 //! use txn_lock::map::*;
@@ -12,7 +14,8 @@
 //! let one = "one";
 //! let two = "two";
 //!
-//! let map = TxnMapLock::<u64, String, f32>::new(1);
+//! let collator = Arc::new(Collator::default());
+//! let map = TxnMapLock::<u64, Collator<String>, String, f32>::new(1, collator);
 //!
 //! assert_eq!(block_on(map.insert(1, one.to_string(), 1.0)).expect("insert"), None);
 //!
@@ -101,6 +104,7 @@ use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
 use std::{fmt, iter};
 
+use collate::Collate;
 use ds_ext::{OrdHashMap, OrdHashSet};
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
@@ -116,7 +120,7 @@ type Deltas<I, K, V> = OrdHashMap<I, Delta<K, V>>;
 type Pending<K, V> = HashMap<Key<K>, Option<Arc<RwLock<V>>>>;
 
 /// A read guard on a version of a [`TxnMapLock`]
-pub type TxnMapVersionGuard<I, K, V> = TxnVersionGuard<I, Range<K>, Canon<K, V>>;
+pub type TxnMapVersionGuard<I, C, K, V> = TxnVersionGuard<I, C, Range<K>, Canon<K, V>>;
 
 /// A read guard on a value in a [`TxnMapLock`]
 pub type TxnMapValueReadGuard<K, V> = TxnReadGuard<Range<K>, V>;
@@ -639,12 +643,12 @@ impl<I, K, V> Entry<I, K, V> {
 ///
 /// The `get_mut` and `try_get_mut` methods require the value type `V` to implement [`Clone`]
 /// in order to support multiple transactions with different versions.
-pub struct TxnMapLock<I, K, V> {
+pub struct TxnMapLock<I, C, K, V> {
     state: Arc<RwLockInner<State<I, K, V>>>,
-    semaphore: Semaphore<I, Range<K>>,
+    semaphore: Semaphore<I, C, Range<K>>,
 }
 
-impl<I, K, V> Clone for TxnMapLock<I, K, V> {
+impl<I, C, K, V> Clone for TxnMapLock<I, C, K, V> {
     fn clone(&self) -> Self {
         Self {
             state: self.state.clone(),
@@ -653,7 +657,7 @@ impl<I, K, V> Clone for TxnMapLock<I, K, V> {
     }
 }
 
-impl<I, K, V> TxnMapLock<I, K, V> {
+impl<I, C, K, V> TxnMapLock<I, C, K, V> {
     #[inline]
     fn state(&self) -> impl Deref<Target = State<I, K, V>> + '_ {
         self.state.read().expect("lock state")
@@ -665,24 +669,29 @@ impl<I, K, V> TxnMapLock<I, K, V> {
     }
 }
 
-impl<I: Ord + Hash + fmt::Debug, K, V> TxnMapLock<I, K, V> {
+impl<I: Ord + Hash + fmt::Debug, C, K, V> TxnMapLock<I, C, K, V> {
     /// Construct a new [`TxnMapLock`].
-    pub fn new(txn_id: I) -> Self {
+    pub fn new(txn_id: I, collator: Arc<C>) -> Self {
         Self {
             state: Arc::new(RwLockInner::new(State::new(txn_id, Pending::new()))),
-            semaphore: Semaphore::new(),
+            semaphore: Semaphore::new(collator),
         }
     }
 }
 
-impl<I, K, V> TxnMapLock<I, K, V>
+impl<I, C, K, V> TxnMapLock<I, C, K, V>
 where
     I: Copy + Hash + Ord + fmt::Debug,
+    C: Collate<Value = K>,
     K: Eq + Hash + Ord + fmt::Debug,
     V: fmt::Debug,
 {
     /// Construct a new [`TxnMapLock`] with the given `contents`.
-    pub fn with_contents<C: IntoIterator<Item = (K, V)>>(txn_id: I, contents: C) -> Self {
+    pub fn with_contents<KV: IntoIterator<Item = (K, V)>>(
+        txn_id: I,
+        collator: Arc<C>,
+        contents: KV,
+    ) -> Self {
         let version = contents
             .into_iter()
             .map(|(key, value)| (Key::new(key), Some(Arc::new(RwLock::new(value)))))
@@ -690,7 +699,7 @@ where
 
         Self {
             state: Arc::new(RwLockInner::new(State::new(txn_id, version))),
-            semaphore: Semaphore::with_reservation(txn_id, Range::All),
+            semaphore: Semaphore::with_reservation(txn_id, collator, Range::All),
         }
     }
 
@@ -893,9 +902,10 @@ where
     }
 }
 
-impl<I, K, V> TxnMapLock<I, K, V>
+impl<I, C, K, V> TxnMapLock<I, C, K, V>
 where
     I: Copy + Hash + Ord + fmt::Debug,
+    C: Collate<Value = K>,
     K: Hash + Ord + fmt::Debug,
     V: Clone + fmt::Debug,
 {
@@ -988,9 +998,10 @@ where
     }
 }
 
-impl<I, K, V> TxnMapLock<I, K, V>
+impl<I, C, K, V> TxnMapLock<I, C, K, V>
 where
     I: Copy + Hash + Ord + fmt::Debug,
+    C: Collate<Value = K>,
     K: Eq + Hash + Ord + fmt::Debug,
     V: fmt::Debug,
 {
@@ -1019,7 +1030,7 @@ where
     pub async fn read_and_commit(
         &self,
         txn_id: I,
-    ) -> (TxnMapVersionGuard<I, K, V>, Option<Delta<K, V>>) {
+    ) -> (TxnMapVersionGuard<I, C, K, V>, Option<Delta<K, V>>) {
         let permit = self
             .semaphore
             .read(txn_id, Range::All)
@@ -1072,7 +1083,7 @@ where
     pub async fn read_and_rollback(
         &self,
         txn_id: I,
-    ) -> (TxnMapVersionGuard<I, K, V>, Option<Delta<K, V>>) {
+    ) -> (TxnMapVersionGuard<I, C, K, V>, Option<Delta<K, V>>) {
         let permit = self
             .semaphore
             .read(txn_id, Range::All)
@@ -1122,7 +1133,7 @@ where
     }
 }
 
-impl<I, K, V> fmt::Debug for TxnMapLock<I, K, V> {
+impl<I, C, K, V> fmt::Debug for TxnMapLock<I, C, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str("a transactional lock on a map of keys to values")
     }
