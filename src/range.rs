@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::sync::Arc;
 
-use collate::{Collate, Overlap, Overlaps};
+use collate::{Collate, Overlap, OverlapsRange};
 
 /// A key in a transactional lock
 pub struct Key<K> {
@@ -133,7 +133,7 @@ impl<K> Clone for Range<K> {
     }
 }
 
-impl<K, C: Collate<Value = K>> Overlaps<Self, C> for Range<K> {
+impl<K, C: Collate<Value = K>> OverlapsRange<Self, C> for Range<K> {
     fn overlaps(&self, other: &Self, collator: &C) -> Overlap {
         match self {
             Self::All => match other {
@@ -148,7 +148,7 @@ impl<K, C: Collate<Value = K>> Overlaps<Self, C> for Range<K> {
     }
 }
 
-impl<K, C: Collate<Value = K>> Overlaps<K, C> for Range<K> {
+impl<K, C: Collate<Value = K>> OverlapsRange<K, C> for Range<K> {
     fn overlaps(&self, other: &K, collator: &C) -> Overlap {
         match self {
             Self::All => Overlap::Wide,

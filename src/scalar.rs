@@ -46,7 +46,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
 
-use collate::{Collator, Overlap, Overlaps};
+use collate::{Collator, Overlap, OverlapsRange};
 use ds_ext::{OrdHashMap, OrdHashSet};
 use tokio::sync::RwLock;
 
@@ -67,7 +67,7 @@ pub type TxnLockVersionGuard<I, T> = TxnVersionGuard<I, Collator<()>, Range, Arc
 #[derive(Debug)]
 pub struct Range;
 
-impl Overlaps<Range, Collator<()>> for Range {
+impl OverlapsRange<Range, Collator<()>> for Range {
     fn overlaps(&self, _other: &Range, _collator: &Collator<()>) -> Overlap {
         Overlap::Equal
     }

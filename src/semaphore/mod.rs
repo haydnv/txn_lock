@@ -67,7 +67,7 @@ use std::fmt;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
-use collate::{Collate, Overlaps};
+use collate::{Collate, OverlapsRange};
 use tokio::sync::Notify;
 
 use super::{Error, Result};
@@ -149,7 +149,7 @@ impl<I, C, R> Semaphore<I, C, R> {
     }
 }
 
-impl<I: Ord, C: Collate, R: Overlaps<R, C> + fmt::Debug> Semaphore<I, C, R> {
+impl<I: Ord, C: Collate, R: OverlapsRange<R, C> + fmt::Debug> Semaphore<I, C, R> {
     /// Construct a new transactional [`Semaphore`] with a write reservation for its initial value.
     pub fn with_reservation(txn_id: I, collator: Arc<C>, range: R) -> Self {
         let mut version = Version::new(collator.clone());

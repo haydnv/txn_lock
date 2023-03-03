@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::{fmt, mem};
 
-use collate::{Collate, Overlap, Overlaps};
+use collate::{Collate, Overlap, OverlapsRange};
 use ds_ext::List;
 use futures::future::{self, Future, TryFutureExt};
 use futures::try_join;
@@ -218,13 +218,13 @@ impl<C, R> RangeLock<C, R> {
     }
 }
 
-impl<C: Collate, R: Overlaps<R, C> + fmt::Debug> RangeLock<C, R> {
+impl<C: Collate, R: OverlapsRange<R, C> + fmt::Debug> RangeLock<C, R> {
     fn insert<'a>(&'a mut self, collator: &'a C, node: Self) -> &'a Self {
         #[cfg(feature = "logging")]
         log::trace!("range {:?} is part of {:?}", node.range, self.range);
 
         #[inline]
-        fn insert_node<'a, C: Collate, R: Overlaps<R, C> + fmt::Debug>(
+        fn insert_node<'a, C: Collate, R: OverlapsRange<R, C> + fmt::Debug>(
             extant: &'a mut Option<Box<RangeLock<C, R>>>,
             collator: &'a C,
             new_node: RangeLock<C, R>,
@@ -512,7 +512,7 @@ impl<C, R> Version<C, R> {
     }
 }
 
-impl<C: Collate, R: Overlaps<R, C> + fmt::Debug> Version<C, R> {
+impl<C: Collate, R: OverlapsRange<R, C> + fmt::Debug> Version<C, R> {
     /// Create a new `range` semaphore and return its root [`RangeLock`]
     pub fn insert(&mut self, range: Arc<R>, write: bool) -> RangeLock<C, R> {
         let insert_at = bisect_left(&self.roots, &range, &self.collator);
@@ -582,7 +582,7 @@ impl<C: Collate, R: Overlaps<R, C> + fmt::Debug> Version<C, R> {
 fn bisect_left<'a, C, R>(roots: &'a List<RangeLock<C, R>>, range: &'a R, collator: &'a C) -> usize
 where
     C: Collate,
-    R: Overlaps<R, C> + fmt::Debug + 'a,
+    R: OverlapsRange<R, C> + fmt::Debug + 'a,
 {
     let mut start = 0;
     let mut end = roots.len();
@@ -605,7 +605,7 @@ where
 fn bisect_right<'a, C, R>(roots: &'a List<RangeLock<C, R>>, range: &'a R, collator: &'a C) -> usize
 where
     C: Collate,
-    R: Overlaps<R, C> + fmt::Debug + 'a,
+    R: OverlapsRange<R, C> + fmt::Debug + 'a,
 {
     let mut start = 0;
     let mut end = roots.len();
