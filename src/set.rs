@@ -67,6 +67,7 @@ use std::{fmt, iter};
 
 use collate::Collate;
 use ds_ext::{OrdHashMap, OrdHashSet};
+use futures::TryFutureExt;
 
 use super::guard::TxnVersionGuard;
 use super::semaphore::{PermitRead, Semaphore};
@@ -515,6 +516,25 @@ where
         state.check_pending(&txn_id)?;
 
         Ok(state.insert(txn_id, key))
+    }
+
+    /// Return `true` if this [`TxnSetLock`] is empty at the given `txn_id`.
+    pub async fn is_empty(&self, txn_id: I) -> Result<bool> {
+        self.len(txn_id).map_ok(|len| len == 0).await
+    }
+
+    /// Get the size of this [`TxnSetLock`] at the given `txn_id`.
+    pub async fn len(&self, txn_id: I) -> Result<usize> {
+        let _permit = self.semaphore.read(txn_id, Range::All).await?;
+
+        let state = self.state();
+
+        let mut set = state.canon(&txn_id);
+        if let Some(delta) = state.pending.get(&txn_id) {
+            merge(&mut set, delta);
+        }
+
+        Ok(set.len())
     }
 
     /// Remove a `key` into this [`TxnSetLock`] at `txn_id` and return `true` if it was present.

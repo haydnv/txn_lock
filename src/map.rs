@@ -106,6 +106,7 @@ use std::{fmt, iter};
 
 use collate::Collate;
 use ds_ext::{OrdHashMap, OrdHashSet};
+use futures::TryFutureExt;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use super::guard::{TxnReadGuard, TxnReadGuardMap, TxnVersionGuard, TxnWriteGuard};
@@ -864,6 +865,26 @@ where
         let _permit = self.semaphore.try_write(txn_id, key.clone().into())?;
 
         Ok(state.insert(txn_id, key, value))
+    }
+
+    /// Return `true` if this [`TxnMapLock`] is empty at the given `txn_id`.
+    pub async fn is_empty(&self, txn_id: I) -> Result<bool> {
+        self.len(txn_id).map_ok(|len| len == 0).await
+    }
+
+    /// Get the size of this [`TxnMapLock`] at the given `txn_id`.
+    pub async fn len(&self, txn_id: I) -> Result<usize> {
+        let _permit = self.semaphore.read(txn_id, Range::All).await?;
+
+        let state = self.state();
+
+        if state.check_committed(&txn_id)? {
+            let keys = state.keys_committed(&txn_id);
+            Ok(keys.len())
+        } else {
+            let keys = state.keys_pending(txn_id);
+            Ok(keys.len())
+        }
     }
 
     /// Remove and return the value at `key` from this [`TxnMapLock`] at `txn_id`, if present.
