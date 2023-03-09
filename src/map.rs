@@ -264,6 +264,49 @@ where
     }
 
     #[inline]
+    fn contains_canon<Q>(&self, txn_id: &I, key: &Q) -> bool
+    where
+        Q: Eq + Hash + ?Sized,
+        Key<K>: Borrow<Q>,
+    {
+        contains_canon(&self.canon, &self.deltas, txn_id, key)
+    }
+
+    #[inline]
+    fn contains_committed<Q>(&self, txn_id: &I, key: &Q) -> Poll<Result<bool>>
+    where
+        Q: Eq + Hash + ?Sized,
+        Key<K>: Borrow<Q>,
+    {
+        match self.finalized.as_ref().cmp(&Some(txn_id)) {
+            Ordering::Greater => Poll::Ready(Err(Error::Outdated)),
+            Ordering::Equal => Poll::Ready(Ok(self.contains_canon(txn_id, key))),
+            Ordering::Less => {
+                if self.commits.contains(txn_id) {
+                    Poll::Ready(Ok(self.contains_canon(txn_id, key)))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn contains_pending<Q>(&self, txn_id: &I, key: &Q) -> bool
+    where
+        Q: Eq + Hash + ?Sized,
+        Key<K>: Borrow<Q>,
+    {
+        if let Some(delta) = self.pending.get(txn_id) {
+            if let Some(key_state) = delta.get(key) {
+                return key_state.is_some();
+            }
+        }
+
+        self.contains_canon(txn_id, key)
+    }
+
+    #[inline]
     fn extend<Q, E>(&mut self, txn_id: I, other: E)
     where
         Q: Into<Key<K>>,
@@ -474,6 +517,34 @@ where
             None
         }
     }
+}
+
+#[inline]
+fn contains_canon<I, K, V, Q>(
+    canon: &Canon<K, V>,
+    deltas: &OrdHashMap<I, Delta<K, V>>,
+    txn_id: &I,
+    key: &Q,
+) -> bool
+where
+    I: Hash + Ord + fmt::Debug,
+    K: Hash + Ord,
+    Q: Eq + Hash + ?Sized,
+    Key<K>: Borrow<Q>,
+{
+    let deltas = deltas
+        .iter()
+        .rev()
+        .skip_while(|(id, _)| *id > txn_id)
+        .map(|(_, version)| version);
+
+    for delta in deltas {
+        if let Some(key_state) = delta.get(key) {
+            return key_state.is_some();
+        }
+    }
+
+    canon.contains_key(key)
 }
 
 impl<I, K, V> State<I, K, V>
@@ -722,6 +793,41 @@ where
         let _permit = self.semaphore.try_write(txn_id, Range::All)?;
 
         Ok(state.clear(txn_id))
+    }
+
+    /// Return `true` if this [`TxnMapLock`] has an entry at `key` at `txn_id`.
+    pub async fn contains_key<Q>(&self, txn_id: I, key: &Q) -> Result<bool>
+    where
+        Q: Eq + Hash + ToOwned<Owned = K> + ?Sized,
+        Key<K>: Borrow<Q>,
+    {
+        let range: Range<K> = {
+            let state = self.state();
+            if let Poll::Ready(result) = state.contains_committed(&txn_id, key) {
+                return result;
+            } else {
+                Key::<K>::from((key, state.key(&txn_id, key))).into()
+            }
+        };
+
+        let _permit = self.semaphore.read(txn_id, range).await?;
+        Ok(self.state().contains_pending(&txn_id, key))
+    }
+
+    /// Synchronously check whether the given `key` is present in this [`TxnMapLock`]s, if possible.
+    pub fn try_contains_key<Q>(&self, txn_id: I, key: &Q) -> Result<bool>
+    where
+        Q: Eq + Hash + ToOwned<Owned = K> + ?Sized,
+        Key<K>: Borrow<Q>,
+    {
+        let state = self.state();
+        if let Poll::Ready(result) = state.contains_committed(&txn_id, key) {
+            return result;
+        }
+
+        let range = Key::<K>::from((key, state.key(&txn_id, key))).into();
+        let _permit = self.semaphore.try_read(txn_id, range)?;
+        Ok(state.contains_pending(&txn_id, key))
     }
 
     /// Insert the entries from `other` [`TxnMapLock`] at `txn_id`.

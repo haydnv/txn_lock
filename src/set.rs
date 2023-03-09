@@ -362,10 +362,9 @@ where
         Q: Eq + Hash + ToOwned<Owned = T> + ?Sized,
         Key<T>: Borrow<Q>,
     {
-        // before acquiring a permit, check if this version has already been committed
         let range: Range<T> = {
             let state = self.state();
-            if let Poll::Ready(result) = self.state().contains_committed(&txn_id, key) {
+            if let Poll::Ready(result) = state.contains_committed(&txn_id, key) {
                 return result;
             } else {
                 Key::<T>::from((key, state.key(&txn_id, key))).into()
@@ -382,7 +381,6 @@ where
         Q: Eq + Hash + ToOwned<Owned = T> + ?Sized,
         Key<T>: Borrow<Q>,
     {
-        // before acquiring a permit, check if this version has already been committed
         let state = self.state();
         if let Poll::Ready(result) = state.contains_committed(&txn_id, key) {
             return result;
