@@ -14,6 +14,8 @@ use crate::Result;
 
 const PERMITS: u32 = u32::MAX >> 3;
 
+type BoxTryFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
 struct NodePermit {
     #[allow(unused)]
     permit: OwnedSemaphorePermit,
@@ -80,7 +82,7 @@ impl<C, R> Clone for RangeLock<C, R> {
     }
 }
 
-impl<C, R> RangeLock<C, R> {
+impl<C: Send + Sync, R: Send + Sync> RangeLock<C, R> {
     fn new(range: Arc<R>, write: bool) -> Self {
         let semaphore = Arc::new(Semaphore::new(PERMITS as usize));
 
@@ -103,14 +105,18 @@ impl<C, R> RangeLock<C, R> {
         *flag = *flag || write;
     }
 
-    fn acquire(&self) -> Pin<Box<dyn Future<Output = Result<NodePermit>> + '_>> {
+    fn acquire(&self) -> BoxTryFuture<NodePermit> {
         Box::pin(async move {
             let permit = self.semaphore.clone().acquire_owned().await?;
 
             #[inline]
             fn child_lock<C, R>(
                 node: Option<&Box<RangeLock<C, R>>>,
-            ) -> Pin<Box<dyn Future<Output = Result<Option<Box<NodePermit>>>> + '_>> {
+            ) -> BoxTryFuture<Option<Box<NodePermit>>>
+            where
+                C: Send + Sync,
+                R: Send + Sync,
+            {
                 if let Some(node) = node {
                     Box::pin(node.acquire().map_ok(Box::new).map_ok(Some))
                 } else {
@@ -137,9 +143,11 @@ impl<C, R> RangeLock<C, R> {
         let permit = self.semaphore.clone().try_acquire_owned()?;
 
         #[inline]
-        fn child_lock<C, R>(
-            node: Option<&Box<RangeLock<C, R>>>,
-        ) -> Result<Option<Box<NodePermit>>> {
+        fn child_lock<C, R>(node: Option<&Box<RangeLock<C, R>>>) -> Result<Option<Box<NodePermit>>>
+        where
+            C: Send + Sync,
+            R: Send + Sync,
+        {
             if let Some(node) = node {
                 node.try_acquire().map(Box::new).map(Some)
             } else {
@@ -159,7 +167,7 @@ impl<C, R> RangeLock<C, R> {
         })
     }
 
-    fn acquire_many(&self, permits: u32) -> Pin<Box<dyn Future<Output = Result<NodePermit>> + '_>> {
+    fn acquire_many(&self, permits: u32) -> BoxTryFuture<NodePermit> {
         Box::pin(async move {
             let permit = self.semaphore.clone().acquire_many_owned(permits).await?;
 
@@ -167,7 +175,11 @@ impl<C, R> RangeLock<C, R> {
             fn child_lock<C, R>(
                 node: Option<&Box<RangeLock<C, R>>>,
                 permits: u32,
-            ) -> Pin<Box<dyn Future<Output = Result<Option<Box<NodePermit>>>> + '_>> {
+            ) -> BoxTryFuture<Option<Box<NodePermit>>>
+            where
+                C: Send + Sync,
+                R: Send + Sync,
+            {
                 if let Some(node) = node {
                     Box::pin(node.acquire_many(permits).map_ok(Box::new).map_ok(Some))
                 } else {
@@ -197,7 +209,11 @@ impl<C, R> RangeLock<C, R> {
         fn child_lock<C, R>(
             node: Option<&Box<RangeLock<C, R>>>,
             permits: u32,
-        ) -> Result<Option<Box<NodePermit>>> {
+        ) -> Result<Option<Box<NodePermit>>>
+        where
+            C: Send + Sync,
+            R: Send + Sync,
+        {
             if let Some(node) = node {
                 node.try_acquire_many(permits).map(Box::new).map(Some)
             } else {
@@ -218,17 +234,21 @@ impl<C, R> RangeLock<C, R> {
     }
 }
 
-impl<C: Collate, R: OverlapsRange<R, C> + fmt::Debug> RangeLock<C, R> {
+impl<C: Collate + Send + Sync, R: OverlapsRange<R, C> + fmt::Debug + Send + Sync> RangeLock<C, R> {
     fn insert<'a>(&'a mut self, collator: &'a C, node: Self) -> &'a Self {
         #[cfg(feature = "logging")]
         log::trace!("range {:?} is part of {:?}", node.range, self.range);
 
         #[inline]
-        fn insert_node<'a, C: Collate, R: OverlapsRange<R, C> + fmt::Debug>(
+        fn insert_node<'a, C, R>(
             extant: &'a mut Option<Box<RangeLock<C, R>>>,
             collator: &'a C,
             new_node: RangeLock<C, R>,
-        ) -> &'a RangeLock<C, R> {
+        ) -> &'a RangeLock<C, R>
+        where
+            C: Collate + Send + Sync,
+            R: OverlapsRange<R, C> + fmt::Debug + Send + Sync,
+        {
             if let Some(extant) = extant {
                 extant.insert(collator, new_node)
             } else {
@@ -271,11 +291,7 @@ impl<C: Collate, R: OverlapsRange<R, C> + fmt::Debug> RangeLock<C, R> {
     }
 
     /// Acquire a read lock on this [`RangeLock`] and its children.
-    pub fn read<'a>(
-        &'a self,
-        target: &'a R,
-        collator: &'a C,
-    ) -> Pin<Box<dyn Future<Output = Result<Permit<R>>> + 'a>> {
+    pub fn read<'a>(&'a self, target: &'a R, collator: &'a C) -> BoxTryFuture<Permit<R>> {
         Box::pin(async move {
             let overlap = self.range.overlaps(target, collator);
 
@@ -378,11 +394,7 @@ impl<C: Collate, R: OverlapsRange<R, C> + fmt::Debug> RangeLock<C, R> {
     }
 
     /// Acquire a write lock on this [`RangeLock`] and its children.
-    pub fn write<'a>(
-        &'a self,
-        target: &'a R,
-        collator: &'a C,
-    ) -> Pin<Box<dyn Future<Output = Result<Permit<R>>> + 'a>> {
+    pub fn write<'a>(&'a self, target: &'a R, collator: &'a C) -> BoxTryFuture<Permit<R>> {
         Box::pin(async move {
             let overlap = self.range.overlaps(target, collator);
 
@@ -512,7 +524,7 @@ impl<C, R> Version<C, R> {
     }
 }
 
-impl<C: Collate, R: OverlapsRange<R, C> + fmt::Debug> Version<C, R> {
+impl<C: Collate + Send + Sync, R: OverlapsRange<R, C> + fmt::Debug + Send + Sync> Version<C, R> {
     /// Create a new `range` semaphore and return its root [`RangeLock`]
     pub fn insert(&mut self, range: Arc<R>, write: bool) -> RangeLock<C, R> {
         let insert_at = bisect_left(&self.roots, &range, &self.collator);

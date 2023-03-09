@@ -149,7 +149,12 @@ impl<I, C, R> Semaphore<I, C, R> {
     }
 }
 
-impl<I: Ord, C: Collate, R: OverlapsRange<R, C> + fmt::Debug> Semaphore<I, C, R> {
+impl<I, C, R> Semaphore<I, C, R>
+where
+    I: Ord,
+    C: Collate + Send + Sync,
+    R: OverlapsRange<R, C> + fmt::Debug + Send + Sync,
+{
     /// Construct a new transactional [`Semaphore`] with a write reservation for its initial value.
     pub fn with_reservation(txn_id: I, collator: Arc<C>, range: R) -> Self {
         let mut version = Version::new(collator.clone());

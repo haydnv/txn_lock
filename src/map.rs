@@ -683,8 +683,8 @@ impl<I: Ord + Hash + fmt::Debug, C, K, V> TxnMapLock<I, C, K, V> {
 impl<I, C, K, V> TxnMapLock<I, C, K, V>
 where
     I: Copy + Hash + Ord + fmt::Debug,
-    C: Collate<Value = K>,
-    K: Eq + Hash + Ord + fmt::Debug,
+    C: Collate<Value = K> + Send + Sync,
+    K: Eq + Hash + Ord + fmt::Debug + Send + Sync,
     V: fmt::Debug,
 {
     /// Construct a new [`TxnMapLock`] with the given `contents`.
@@ -926,8 +926,8 @@ where
 impl<I, C, K, V> TxnMapLock<I, C, K, V>
 where
     I: Copy + Hash + Ord + fmt::Debug,
-    C: Collate<Value = K>,
-    K: Hash + Ord + fmt::Debug,
+    C: Collate<Value = K> + Send + Sync,
+    K: Hash + Ord + fmt::Debug + Send + Sync,
     V: Clone + fmt::Debug,
 {
     /// Borrow an [`Entry`] mutably for writing at `txn_id`.
@@ -1022,8 +1022,8 @@ where
 impl<I, C, K, V> TxnMapLock<I, C, K, V>
 where
     I: Copy + Hash + Ord + fmt::Debug,
-    C: Collate<Value = K>,
-    K: Eq + Hash + Ord + fmt::Debug,
+    C: Collate<Value = K> + Send + Sync,
+    K: Eq + Hash + Ord + fmt::Debug + Send + Sync,
     V: fmt::Debug,
 {
     /// Commit the state of this [`TxnMapLock`] at `txn_id`.

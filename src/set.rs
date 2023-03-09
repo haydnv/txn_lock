@@ -338,8 +338,9 @@ where
 impl<I, C, T> TxnSetLock<I, C, T>
 where
     I: Copy + Hash + Ord + fmt::Debug,
-    C: Collate<Value = T>,
+    C: Collate<Value = T> + Send + Sync,
     T: Hash + Ord + fmt::Debug,
+    Range<T>: Send + Sync,
 {
     /// Construct a new [`TxnSetLock`] with the given `contents`.
     pub fn with_contents<IT: IntoIterator<Item = T>>(
@@ -572,8 +573,8 @@ where
 impl<I, C, T> TxnSetLock<I, C, T>
 where
     I: Copy + Hash + Ord + fmt::Debug,
-    C: Collate<Value = T>,
-    T: Hash + Ord + fmt::Debug,
+    C: Collate<Value = T> + Send + Sync,
+    T: Hash + Ord + fmt::Debug + Send + Sync,
 {
     /// Commit the state of this [`TxnSetLock`] at `txn_id`.
     /// Panics: if this [`TxnSetLock`] has already been finalized at `txn_id`
