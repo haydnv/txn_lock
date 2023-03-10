@@ -119,7 +119,7 @@ type Deltas<I, K, V> = OrdHashMap<I, Delta<K, V>>;
 type Pending<K, V> = HashMap<Key<K>, Option<Arc<RwLock<V>>>>;
 
 /// A read guard on a version of a [`TxnMapLock`]
-pub type TxnMapVersionGuard<I, K, V> = TxnVersionGuard<I, Collator<K>, Range<K>, Canon<K, V>>;
+pub type TxnMapLockVersionGuard<I, K, V> = TxnVersionGuard<I, Collator<K>, Range<K>, Canon<K, V>>;
 
 /// A read guard on a value in a [`TxnMapLock`]
 pub type TxnMapValueReadGuard<K, V> = TxnReadGuard<Range<K>, V>;
@@ -1152,7 +1152,7 @@ where
     pub async fn read_and_commit(
         &self,
         txn_id: I,
-    ) -> (TxnMapVersionGuard<I, K, V>, Option<Delta<K, V>>) {
+    ) -> (TxnMapLockVersionGuard<I, K, V>, Option<Delta<K, V>>) {
         let permit = self
             .semaphore
             .read(txn_id, Range::All)
@@ -1170,7 +1170,7 @@ where
             (state.canon(&txn_id), state.deltas.get(&txn_id).cloned())
         };
 
-        let version = TxnMapVersionGuard::new(txn_id, self.semaphore.clone(), permit, version);
+        let version = TxnMapLockVersionGuard::new(txn_id, self.semaphore.clone(), permit, version);
 
         (version, deltas)
     }
@@ -1205,7 +1205,7 @@ where
     pub async fn read_and_rollback(
         &self,
         txn_id: I,
-    ) -> (TxnMapVersionGuard<I, K, V>, Option<Delta<K, V>>) {
+    ) -> (TxnMapLockVersionGuard<I, K, V>, Option<Delta<K, V>>) {
         let permit = self
             .semaphore
             .read(txn_id, Range::All)
@@ -1235,7 +1235,7 @@ where
             (version, deltas)
         };
 
-        let version = TxnMapVersionGuard::new(txn_id, self.semaphore.clone(), permit, version);
+        let version = TxnMapLockVersionGuard::new(txn_id, self.semaphore.clone(), permit, version);
 
         (version, deltas)
     }
