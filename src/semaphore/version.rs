@@ -622,7 +622,7 @@ where
     let mut end = roots.len();
 
     while start < end {
-        let mid = (start + end) / 2;
+        let mid = (start + end) >> 1;
 
         let node = roots.get(mid).expect("range");
         if node.range.overlaps(range, collator) == Overlap::Less {
@@ -653,7 +653,7 @@ where
     let mut end = roots.len();
 
     while start < end {
-        let mid = (end - start) / 2;
+        let mid = (start + end) >> 1;
 
         let node = roots.get(mid).expect("range");
         if node.range.overlaps(range, collator) == Overlap::Greater {
