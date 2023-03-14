@@ -234,7 +234,11 @@ impl<C: Send + Sync, R: Send + Sync> RangeLock<C, R> {
     }
 }
 
-impl<C: Collate + Send + Sync, R: OverlapsRange<R, C> + fmt::Debug + Send + Sync> RangeLock<C, R> {
+impl<C, R> RangeLock<C, R>
+where
+    C: Collate + Send + Sync,
+    R: OverlapsRange<R, C> + fmt::Debug + Send + Sync,
+{
     fn insert<'a>(&'a mut self, collator: &'a C, node: Self) -> &'a Self {
         #[cfg(feature = "logging")]
         log::trace!("range {:?} is part of {:?}", node.range, self.range);
@@ -527,9 +531,19 @@ impl<C, R> Version<C, R> {
 impl<C: Collate + Send + Sync, R: OverlapsRange<R, C> + fmt::Debug + Send + Sync> Version<C, R> {
     /// Create a new `range` semaphore and return its root [`RangeLock`]
     pub fn insert(&mut self, range: Arc<R>, write: bool) -> RangeLock<C, R> {
+        #[cfg(feature = "logging")]
+        log::debug!("Version::insert {:?} (write: {})", range, write);
+
         let insert_at = bisect_left(&self.roots, &range, &self.collator);
         let take_until = bisect_right(&self.roots, &range, &self.collator);
         assert!(take_until >= insert_at);
+
+        #[cfg(feature = "logging")]
+        log::debug!(
+            "{:?} covers {} existing ranges in this version",
+            range,
+            take_until - insert_at
+        );
 
         if insert_at == take_until {
             let root = RangeLock::new(range, write);
@@ -596,6 +610,14 @@ where
     C: Collate,
     R: OverlapsRange<R, C> + fmt::Debug + 'a,
 {
+    if roots.is_empty() {
+        return 0;
+    } else if roots.front().expect("root").range.overlaps(range, collator) == Overlap::Greater {
+        return 0;
+    } else if roots.back().expect("root").range.overlaps(range, collator) == Overlap::Less {
+        return roots.len();
+    }
+
     let mut start = 0;
     let mut end = roots.len();
 
@@ -619,6 +641,14 @@ where
     C: Collate,
     R: OverlapsRange<R, C> + fmt::Debug + 'a,
 {
+    if roots.is_empty() {
+        return 0;
+    } else if roots.front().expect("root").range.overlaps(range, collator) == Overlap::Greater {
+        return 0;
+    } else if roots.back().expect("root").range.overlaps(range, collator) == Overlap::Less {
+        return roots.len();
+    }
+
     let mut start = 0;
     let mut end = roots.len();
 

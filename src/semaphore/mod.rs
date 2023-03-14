@@ -236,7 +236,19 @@ where
     }
 
     fn write_inner(&self, txn_id: I, range: Arc<R>) -> Result<VersionRead<I, C, R>> {
+        #[cfg(feature = "logging")]
+        log::trace!(
+            "lock semaphore state to check if {:?} is available for writing...",
+            range
+        );
+
         let mut versions = self.versions.lock().expect("versions");
+
+        #[cfg(feature = "logging")]
+        log::trace!(
+            "locked semaphore state, checking if {:?} is available for writing...",
+            range
+        );
 
         // handle creating a new version
         for (version_id, version) in versions.iter() {
@@ -244,6 +256,9 @@ where
                 Ordering::Greater => {
                     if version.is_pending_write_at(&range) {
                         // if there's a write lock in the past, wait it out
+                        #[cfg(feature = "logging")]
+                        log::trace!("there is a pending write overlapping {:?}", range);
+
                         return Ok(VersionRead::Pending(range, txn_id));
                     }
                 }
@@ -259,16 +274,35 @@ where
             }
         }
 
+        #[cfg(feature = "logging")]
+        log::trace!(
+            "checking if this semaphore already has a record for {:?}...",
+            range
+        );
+
         match versions.entry(txn_id) {
             btree_map::Entry::Occupied(mut entry) => {
+                #[cfg(feature = "logging")]
+                log::trace!("this semaphore already has a record for {:?}", range);
+
                 let version = entry.get_mut();
                 let root = version.insert(range.clone(), true);
+
+                #[cfg(feature = "logging")]
+                log::trace!("got the RangeLock for {:?}", range);
+
                 Ok(VersionRead::Version(range, root))
             }
             btree_map::Entry::Vacant(entry) => {
+                #[cfg(feature = "logging")]
+                log::trace!("creating a new record for {:?}...", range);
+
                 let mut version = Version::new(self.collator.clone());
                 let root = version.insert(range.clone(), true);
                 entry.insert(version);
+
+                #[cfg(feature = "logging")]
+                log::trace!("created a new RangeLock for {:?}", range);
 
                 Ok(VersionRead::Version(range, root))
             }
@@ -277,6 +311,9 @@ where
 
     /// Acquire a permit to write to a section of transactional resource, if possible.
     pub async fn write(&self, mut txn_id: I, range: R) -> Result<PermitWrite<R>> {
+        #[cfg(feature = "logging")]
+        log::debug!("Semaphore::write {:?}", range);
+
         let mut range = Arc::new(range);
 
         loop {
