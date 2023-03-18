@@ -1263,17 +1263,17 @@ impl<I, K, V> fmt::Debug for TxnMapLock<I, K, V> {
 
 /// A guard on a value in an [`Iter`]
 #[derive(Debug)]
-pub struct TxnMapIterGuard<V> {
+pub struct TxnMapLockIterGuard<V> {
     value: PendingValue<V>,
 }
 
-impl<V> From<PendingValue<V>> for TxnMapIterGuard<V> {
+impl<V> From<PendingValue<V>> for TxnMapLockIterGuard<V> {
     fn from(value: PendingValue<V>) -> Self {
         Self { value }
     }
 }
 
-impl<V> Deref for TxnMapIterGuard<V> {
+impl<V> Deref for TxnMapLockIterGuard<V> {
     type Target = V;
 
     fn deref(&self) -> &Self::Target {
@@ -1284,13 +1284,13 @@ impl<V> Deref for TxnMapIterGuard<V> {
     }
 }
 
-impl<V: PartialEq> PartialEq<V> for TxnMapIterGuard<V> {
+impl<V: PartialEq> PartialEq<V> for TxnMapLockIterGuard<V> {
     fn eq(&self, other: &V) -> bool {
         self.deref().eq(other)
     }
 }
 
-impl<V: PartialOrd> PartialOrd<V> for TxnMapIterGuard<V> {
+impl<V: PartialOrd> PartialOrd<V> for TxnMapLockIterGuard<V> {
     fn partial_cmp(&self, other: &V) -> Option<Ordering> {
         self.deref().partial_cmp(other)
     }
@@ -1326,7 +1326,7 @@ where
     K: Hash + Ord,
     V: fmt::Debug,
 {
-    type Item = (Key<K>, TxnMapIterGuard<V>);
+    type Item = (Key<K>, TxnMapLockIterGuard<V>);
 
     fn next(&mut self) -> Option<Self::Item> {
         let state = self.lock_state.read().expect("lock state");
