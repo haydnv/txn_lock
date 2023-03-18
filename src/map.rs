@@ -1368,11 +1368,11 @@ where
 
 /// A guard on a mutable value in an [`IterMut`]
 #[derive(Debug)]
-pub struct TxnMapIterMutGuard<V> {
+pub struct TxnMapLockIterMutGuard<V> {
     guard: OwnedRwLockWriteGuard<V>,
 }
 
-impl<V> Deref for TxnMapIterMutGuard<V> {
+impl<V> Deref for TxnMapLockIterMutGuard<V> {
     type Target = V;
 
     fn deref(&self) -> &Self::Target {
@@ -1380,25 +1380,25 @@ impl<V> Deref for TxnMapIterMutGuard<V> {
     }
 }
 
-impl<V> DerefMut for TxnMapIterMutGuard<V> {
+impl<V> DerefMut for TxnMapLockIterMutGuard<V> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.guard.deref_mut()
     }
 }
 
-impl<V: PartialEq> PartialEq<V> for TxnMapIterMutGuard<V> {
+impl<V: PartialEq> PartialEq<V> for TxnMapLockIterMutGuard<V> {
     fn eq(&self, other: &V) -> bool {
         self.deref().eq(other)
     }
 }
 
-impl<V: PartialOrd> PartialOrd<V> for TxnMapIterMutGuard<V> {
+impl<V: PartialOrd> PartialOrd<V> for TxnMapLockIterMutGuard<V> {
     fn partial_cmp(&self, other: &V) -> Option<Ordering> {
         self.deref().partial_cmp(other)
     }
 }
 
-impl<V> From<OwnedRwLockWriteGuard<V>> for TxnMapIterMutGuard<V> {
+impl<V> From<OwnedRwLockWriteGuard<V>> for TxnMapLockIterMutGuard<V> {
     fn from(guard: OwnedRwLockWriteGuard<V>) -> Self {
         Self { guard }
     }
@@ -1436,7 +1436,7 @@ where
     K: Hash + Ord,
     V: Clone + fmt::Debug,
 {
-    type Item = (Arc<K>, TxnMapIterMutGuard<V>);
+    type Item = (Arc<K>, TxnMapLockIterMutGuard<V>);
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut state = self.lock_state.write().expect("lock state");
@@ -1444,7 +1444,7 @@ where
         loop {
             let key = self.keys.next()?;
             if let Some(guard) = state.get_mut(self.txn_id, key.clone()) {
-                return Some((key.into(), TxnMapIterMutGuard::from(guard)));
+                return Some((key.into(), TxnMapLockIterMutGuard::from(guard)));
             }
         }
     }
