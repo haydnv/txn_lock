@@ -99,6 +99,12 @@ impl Borrow<str> for Key<String> {
     }
 }
 
+impl<K> Borrow<K> for Key<K> {
+    fn borrow(&self) -> &K {
+        (&*self.key).borrow()
+    }
+}
+
 impl<K: fmt::Debug> fmt::Debug for Key<K> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.key.fmt(f)
