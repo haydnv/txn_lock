@@ -6,7 +6,6 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use collate::{Collate, Overlap, OverlapsRange};
-use ds_ext::Id;
 
 /// A key in a transactional lock
 pub struct Key<K> {
@@ -94,13 +93,15 @@ impl<K> Borrow<Arc<K>> for Key<K> {
     }
 }
 
-impl Borrow<str> for Key<Id> {
+#[cfg(feature = "id")]
+impl Borrow<str> for Key<hr_id::Id> {
     fn borrow(&self) -> &str {
         (&*self.key).borrow()
     }
 }
 
-impl Borrow<String> for Key<Id> {
+#[cfg(feature = "id")]
+impl Borrow<String> for Key<hr_id::Id> {
     fn borrow(&self) -> &String {
         (&*self.key).borrow()
     }

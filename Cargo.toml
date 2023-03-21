@@ -12,11 +12,14 @@ keywords = ["transaction", "transactional", "lock", "version", "versioning"]
 categories = ["concurrency", "data-structures"]
 
 [features]
+all = ["hr-id", "logging"]
+id = ["hr-id"]
 logging = ["log"]
 
 [dependencies]
 collate = { path = "../collate" }
 ds-ext = { path = "../ds-ext" }
+hr-id = { path = "../hr-id", optional = true }
 futures = "0.3"
 log = { version = "0.4", features = ["release_max_level_info"], optional = true }
 tokio = { version = "1.24", features = ["sync"] }
