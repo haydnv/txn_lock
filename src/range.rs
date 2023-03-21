@@ -119,12 +119,6 @@ impl<K> Borrow<K> for Key<K> {
     }
 }
 
-impl<K: fmt::Debug> fmt::Debug for Key<K> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.key.fmt(f)
-    }
-}
-
 impl<K> From<Key<K>> for Arc<K> {
     fn from(key: Key<K>) -> Self {
         key.key
@@ -134,6 +128,18 @@ impl<K> From<Key<K>> for Arc<K> {
 impl<K> From<Key<K>> for Range<K> {
     fn from(key: Key<K>) -> Self {
         Range::One(key.key)
+    }
+}
+
+impl<K: fmt::Debug> fmt::Debug for Key<K> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.key.fmt(f)
+    }
+}
+
+impl<K: fmt::Display> fmt::Display for Key<K> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.key.fmt(f)
     }
 }
 
