@@ -17,12 +17,12 @@ id = ["hr-id"]
 logging = ["log"]
 
 [dependencies]
-collate = { path = "../collate" }
-ds-ext = { path = "../ds-ext" }
-hr-id = { path = "../hr-id", optional = true }
+collate = "0.3"
+ds-ext = "0.1"
+hr-id = { version = "0.3", optional = true }
 futures = "0.3"
 log = { version = "0.4", features = ["release_max_level_info"], optional = true }
-tokio = { version = "1.24", features = ["sync"] }
+tokio = { version = "1.29", features = ["sync"] }
 
 [dev-dependencies]
 futures = "0.3"
