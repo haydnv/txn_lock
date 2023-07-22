@@ -239,7 +239,7 @@ where
     C: Collate + Send + Sync,
     R: OverlapsRange<R, C> + fmt::Debug + Send + Sync,
 {
-    fn insert<'a>(&'a mut self, collator: &'a C, node: Self) -> &'a Self {
+    fn insert<'a>(&'a mut self, collator: &'a C, mut node: Self) -> &'a Self {
         #[cfg(feature = "logging")]
         log::trace!("range {:?} is part of {:?}", node.range, self.range);
 
@@ -272,7 +272,15 @@ where
             Overlap::Wide => insert_node(&mut self.center, collator, node),
             Overlap::WideLess => insert_node(&mut self.right_partial, collator, node),
             Overlap::Less => insert_node(&mut self.right, collator, node),
-            other => unreachable!("insert a range with overlap {:?}", other),
+            Overlap::Narrow => {
+                mem::swap(self, &mut node);
+                match self.range.overlaps(&node.range, collator) {
+                    Overlap::WideGreater => insert_node(&mut self.left_partial, collator, node),
+                    Overlap::Wide => insert_node(&mut self.center, collator, node),
+                    Overlap::WideLess => insert_node(&mut self.right_partial, collator, node),
+                    _ => unreachable!("range {:?} does not contain {:?}", self.range, node.range),
+                }
+            }
         }
     }
 
@@ -553,10 +561,16 @@ impl<C: Collate + Send + Sync, R: OverlapsRange<R, C> + fmt::Debug + Send + Sync
             match root.range.overlaps(&range, &self.collator) {
                 Overlap::Equal => root.reserve(write),
                 Overlap::WideLess | Overlap::Wide | Overlap::WideGreater => {
+                    #[cfg(feature = "logging")]
+                    log::trace!("{:?} is wide w/r/t {:?}", root.range, range);
+
                     let node = RangeLock::new(range, write);
                     root.insert(&self.collator, node);
                 }
                 Overlap::Narrow => {
+                    #[cfg(feature = "logging")]
+                    log::trace!("{:?} is narrow w/r/t {:?}", root.range, range);
+
                     mem::drop(root);
                     let node = self.roots.remove(insert_at).expect("root");
                     let mut root = RangeLock::new(range, write);
