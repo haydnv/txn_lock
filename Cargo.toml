@@ -18,7 +18,7 @@ logging = ["log"]
 
 [dependencies]
 collate = "0.3"
-ds-ext = "0.1"
+ds-ext = { path = "../ds-ext" }
 hr-id = { version = "0.3", optional = true }
 futures = "0.3"
 log = { version = "0.4", features = ["release_max_level_info"], optional = true }

@@ -559,7 +559,12 @@ impl<C: Collate + Send + Sync, R: OverlapsRange<R, C> + fmt::Debug + Send + Sync
         } else if take_until - insert_at == 1 {
             let root = self.roots.get_mut(insert_at).expect("root range");
             match root.range.overlaps(&range, &self.collator) {
-                Overlap::Equal => root.reserve(write),
+                Overlap::Equal => {
+                    root.reserve(write);
+
+                    #[cfg(feature = "logging")]
+                    log::trace!("reserved root range lock with write: {write}");
+                },
                 Overlap::WideLess | Overlap::Wide | Overlap::WideGreater => {
                     #[cfg(feature = "logging")]
                     log::trace!("{:?} is wide w/r/t {:?}", root.range, range);
@@ -572,6 +577,7 @@ impl<C: Collate + Send + Sync, R: OverlapsRange<R, C> + fmt::Debug + Send + Sync
                     log::trace!("{:?} is narrow w/r/t {:?}", root.range, range);
 
                     mem::drop(root);
+
                     let node = self.roots.remove(insert_at).expect("root");
                     let mut root = RangeLock::new(range, write);
                     root.insert(&self.collator, node);

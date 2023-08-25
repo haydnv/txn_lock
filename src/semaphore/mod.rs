@@ -68,6 +68,7 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 use collate::{Collate, OverlapsRange};
+use log::trace;
 use tokio::sync::Notify;
 
 use super::{Error, Result};
@@ -171,6 +172,8 @@ where
     }
 
     fn read_inner(&self, txn_id: I, range: Arc<R>) -> VersionRead<I, C, R> {
+        trace!("Semaphore::read_inner {range:?}");
+
         let mut versions = self.versions.lock().expect("versions");
 
         // check if there's an overlapping write lock in the past
@@ -183,12 +186,16 @@ where
                     }
                 }
                 Ordering::Equal => {
+                    trace!("this semaphore already has a record for {range:?}");
+
                     let root = version.insert(range.clone(), false);
                     return VersionRead::Version(range, root);
                 }
                 Ordering::Less => break,
             }
         }
+
+        trace!("creating a new record for {range:?}...");
 
         let mut version = Version::new(self.collator.clone());
         let root = version.insert(range.clone(), false);
@@ -208,6 +215,8 @@ where
                     range = r;
                 }
                 VersionRead::Version(range, root) => {
+                    trace!("acquiring read lock on {range:?}...");
+
                     return Ok(PermitRead {
                         permit: root.read(&range, &self.collator).await?,
                         notify: self.notify.clone(),
@@ -245,10 +254,7 @@ where
         let mut versions = self.versions.lock().expect("versions");
 
         #[cfg(feature = "logging")]
-        log::trace!(
-            "locked semaphore state, checking if {:?} is available for writing...",
-            range
-        );
+        log::trace!("locked semaphore state, checking if {range:?} is available for writing...");
 
         // handle creating a new version
         for (version_id, version) in versions.iter() {
@@ -323,6 +329,8 @@ where
                     range = r;
                 }
                 VersionRead::Version(range, root) => {
+                    trace!("acquiring write lock on {range:?}...");
+
                     let permit = root.write(&range, &self.collator).await?;
 
                     return Ok(PermitWrite {
