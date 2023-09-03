@@ -68,7 +68,6 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 use collate::{Collate, OverlapsRange};
-use log::trace;
 use tokio::sync::Notify;
 
 use super::{Error, Result};
@@ -172,7 +171,8 @@ where
     }
 
     fn read_inner(&self, txn_id: I, range: Arc<R>) -> VersionRead<I, C, R> {
-        trace!("Semaphore::read_inner {range:?}");
+        #[cfg(feature = "logging")]
+        log::trace!("Semaphore::read_inner {range:?}");
 
         let mut versions = self.versions.lock().expect("versions");
 
@@ -186,7 +186,8 @@ where
                     }
                 }
                 Ordering::Equal => {
-                    trace!("this semaphore already has a record for {range:?}");
+                    #[cfg(feature = "logging")]
+                    log::trace!("this semaphore already has a record for {range:?}");
 
                     let root = version.insert(range.clone(), false);
                     return VersionRead::Version(range, root);
@@ -195,7 +196,8 @@ where
             }
         }
 
-        trace!("creating a new record for {range:?}...");
+        #[cfg(feature = "logging")]
+        log::trace!("creating a new record for {range:?}...");
 
         let mut version = Version::new(self.collator.clone());
         let root = version.insert(range.clone(), false);
@@ -215,7 +217,8 @@ where
                     range = r;
                 }
                 VersionRead::Version(range, root) => {
-                    trace!("acquiring read lock on {range:?}...");
+                    #[cfg(feature = "logging")]
+                    log::trace!("acquiring read lock on {range:?}...");
 
                     return Ok(PermitRead {
                         permit: root.read(&range, &self.collator).await?,
@@ -329,7 +332,8 @@ where
                     range = r;
                 }
                 VersionRead::Version(range, root) => {
-                    trace!("acquiring write lock on {range:?}...");
+                    #[cfg(feature = "logging")]
+                    log::trace!("acquiring write lock on {range:?}...");
 
                     let permit = root.write(&range, &self.collator).await?;
 
