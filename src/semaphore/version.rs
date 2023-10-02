@@ -576,8 +576,6 @@ impl<C: Collate + Send + Sync, R: OverlapsRange<R, C> + fmt::Debug + Send + Sync
                     #[cfg(feature = "logging")]
                     log::trace!("{:?} is narrow w/r/t {:?}", root.range, range);
 
-                    mem::drop(root);
-
                     let node = self.roots.remove(insert_at).expect("root");
                     let mut root = RangeLock::new(range, write);
                     root.insert(&self.collator, node);
