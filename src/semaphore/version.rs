@@ -286,7 +286,11 @@ where
 
     #[inline]
     fn is_pending_write(&self) -> bool {
-        if *self.write.lock().expect("write bit") {
+        let write_flag = self.write.lock().expect("write bit");
+
+        if *write_flag {
+            #[cfg(feature = "logging")]
+            log::trace!("{self:?} is reserved for writing");
             return true;
         }
 
