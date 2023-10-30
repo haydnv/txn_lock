@@ -10,14 +10,13 @@
 //! Example:
 //! ```
 //! use std::ops::Range;
-//! use std::sync::Arc;
 //!
 //! use collate::Collator;
 //!
 //! use txn_lock::semaphore::*;
 //! use txn_lock::Error;
 //!
-//! let collator = Arc::new(Collator::default());
+//! let collator = Collator::default();
 //! let semaphore = Semaphore::<u64, Collator<usize>, Range<usize>>::new(collator);
 //!
 //! // Multiple overlapping read permits within a transaction are fine
@@ -123,12 +122,15 @@ enum VersionRead<I, C, R> {
 
 /// A semaphore used to maintain the ACID compliance of transactional resource
 pub struct Semaphore<I, C, R> {
-    collator: Arc<C>,
+    collator: C,
     versions: Arc<Mutex<BTreeMap<I, Version<C, R>>>>,
     notify: Arc<Notify>,
 }
 
-impl<I, C, R> Clone for Semaphore<I, C, R> {
+impl<I, C, R> Clone for Semaphore<I, C, R>
+where
+    C: Clone,
+{
     fn clone(&self) -> Self {
         Self {
             collator: self.collator.clone(),
@@ -140,7 +142,7 @@ impl<I, C, R> Clone for Semaphore<I, C, R> {
 
 impl<I, C, R> Semaphore<I, C, R> {
     /// Construct a new transactional [`Semaphore`].
-    pub fn new(collator: Arc<C>) -> Self {
+    pub fn new(collator: C) -> Self {
         Self {
             collator,
             versions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -152,11 +154,11 @@ impl<I, C, R> Semaphore<I, C, R> {
 impl<I, C, R> Semaphore<I, C, R>
 where
     I: Ord,
-    C: Collate + Send + Sync,
+    C: Collate + Clone + Send + Sync,
     R: OverlapsRange<R, C> + fmt::Debug + Send + Sync,
 {
     /// Construct a new transactional [`Semaphore`] with a write reservation for its initial value.
-    pub fn with_reservation(txn_id: I, collator: Arc<C>, range: R) -> Self {
+    pub fn with_reservation(txn_id: I, collator: C, range: R) -> Self {
         let mut version = Version::new(collator.clone());
         version.insert(Arc::new(range), true);
 
@@ -223,7 +225,7 @@ where
                     return Ok(PermitRead {
                         permit: root.read(&range, &self.collator).await?,
                         notify: self.notify.clone(),
-                    })
+                    });
                 }
             }
 

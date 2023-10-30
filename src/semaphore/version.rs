@@ -526,13 +526,13 @@ impl<C, R: fmt::Debug> fmt::Debug for RangeLock<C, R> {
 
 /// Semaphores for ranges within a single transactional version
 pub struct Version<C, R> {
-    collator: Arc<C>,
+    collator: C,
     roots: List<RangeLock<C, R>>,
 }
 
 impl<C, R> Version<C, R> {
     /// Create a new [`Version`] semaphore
-    pub fn new(collator: Arc<C>) -> Self {
+    pub fn new(collator: C) -> Self {
         Self {
             collator,
             roots: List::with_capacity(1),
@@ -568,7 +568,7 @@ impl<C: Collate + Send + Sync, R: OverlapsRange<R, C> + fmt::Debug + Send + Sync
 
                     #[cfg(feature = "logging")]
                     log::trace!("reserved root range lock with write: {write}");
-                },
+                }
                 Overlap::WideLess | Overlap::Wide | Overlap::WideGreater => {
                     #[cfg(feature = "logging")]
                     log::trace!("{:?} is wide w/r/t {:?}", root.range, range);

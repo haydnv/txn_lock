@@ -270,7 +270,7 @@ impl<I, T> TxnLock<I, T> {
     pub fn new(canon: T) -> Self {
         Self {
             state: Arc::new(RwLockInner::new(State::new(canon))),
-            semaphore: Semaphore::new(Arc::new(Collator::default())),
+            semaphore: Semaphore::new(Collator::default()),
         }
     }
 }
