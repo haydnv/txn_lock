@@ -115,7 +115,7 @@ impl Borrow<str> for Key<String> {
 
 impl<K> Borrow<K> for Key<K> {
     fn borrow(&self) -> &K {
-        (&*self.key).borrow()
+        self.key.borrow()
     }
 }
 
