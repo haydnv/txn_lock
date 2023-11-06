@@ -328,7 +328,7 @@ where
     pub fn new(txn_id: I) -> Self {
         Self {
             state: Arc::new(RwLockInner::new(State::new(txn_id, Canon::new()))),
-            semaphore: Semaphore::new(Arc::new(Collator::<T>::default())),
+            semaphore: Semaphore::new(Collator::<T>::default()),
         }
     }
 }
@@ -346,7 +346,7 @@ where
 
         Self {
             state: Arc::new(RwLockInner::new(State::new(txn_id, set))),
-            semaphore: Semaphore::with_reservation(txn_id, Arc::new(collator), Range::All),
+            semaphore: Semaphore::with_reservation(txn_id, collator, Range::All),
         }
     }
 

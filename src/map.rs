@@ -746,7 +746,7 @@ impl<I: Ord + Hash + fmt::Debug, K, V> TxnMapLock<I, K, V> {
 
         Self {
             state: Arc::new(RwLockInner::new(State::new(txn_id, Pending::new()))),
-            semaphore: Semaphore::new(Arc::new(collator)),
+            semaphore: Semaphore::new(collator),
         }
     }
 }
@@ -768,7 +768,7 @@ where
 
         Self {
             state: Arc::new(RwLockInner::new(State::new(txn_id, version))),
-            semaphore: Semaphore::with_reservation(txn_id, Arc::new(collator), Range::All),
+            semaphore: Semaphore::with_reservation(txn_id, collator, Range::All),
         }
     }
 
