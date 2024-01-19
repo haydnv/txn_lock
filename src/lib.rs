@@ -1,12 +1,12 @@
 //! Utilities to support transactional versioning.
 //!
 //! General-purpose locks and usage examples are provided
-//! in the [`map`], [`scalar`], and [`set`] modules.
+//! in the [`map`], [`queue`], [`scalar`], and [`set`] modules.
 //!
 //! More complex transaction locks (e.g. for a relational database) can be constructed using
 //! the [`semaphore`] module.
-
 pub mod map;
+pub mod queue;
 pub mod scalar;
 pub mod semaphore;
 pub mod set;
