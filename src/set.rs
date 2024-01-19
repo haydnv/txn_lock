@@ -67,7 +67,6 @@ use collate::Collator;
 use ds_ext::{OrdHashMap, OrdHashSet};
 use futures::TryFutureExt;
 
-use super::guard::TxnVersionGuard;
 use super::semaphore::{PermitRead, Semaphore};
 use super::{Error, Result};
 
@@ -75,9 +74,6 @@ pub use super::range::{Key, Range};
 
 type Delta<T> = HashMap<Key<T>, bool>;
 type Canon<T> = HashSet<Key<T>>;
-
-/// A read guard on a version of a [`TxnSetLock`]
-pub type TxnSetLockVersionGuard<I, T> = TxnVersionGuard<I, Collator<T>, Range<T>, Canon<T>>;
 
 struct State<I, T> {
     canon: Canon<T>,
@@ -358,6 +354,7 @@ where
     {
         let range: Range<T> = {
             let state = self.state();
+
             if let Poll::Ready(result) = state.contains_committed(&txn_id, key) {
                 return result;
             } else {
@@ -585,11 +582,8 @@ where
     /// Also returns the set of changes committed, if any.
     ///
     /// Panics: if this [`TxnSetLock`] has already been finalized at `txn_id`
-    pub async fn read_and_commit(
-        &self,
-        txn_id: I,
-    ) -> (TxnSetLockVersionGuard<I, T>, Option<Delta<T>>) {
-        let permit = self
+    pub async fn read_and_commit(&self, txn_id: I) -> (Canon<T>, Option<Delta<T>>) {
+        let _permit = self
             .semaphore
             .read(txn_id, Range::All)
             .await
@@ -607,7 +601,7 @@ where
             (state.canon(&txn_id), state.deltas.get(&txn_id).cloned())
         };
 
-        let version = TxnSetLockVersionGuard::new(txn_id, self.semaphore.clone(), permit, version);
+        self.semaphore.finalize(&txn_id, false);
 
         (version, delta)
     }
@@ -615,8 +609,6 @@ where
     /// Roll back the state of this [`TxnSetLock`] at `txn_id`.
     /// Panics: if this [`TxnSetLock`] has already been committed or finalized at `txn_id`
     pub fn rollback(&self, txn_id: &I) {
-        self.semaphore.finalize(txn_id, false);
-
         let mut state = self.state_mut();
 
         assert!(
@@ -630,17 +622,16 @@ where
         }
 
         state.pending.remove(txn_id);
+
+        self.semaphore.finalize(txn_id, false);
     }
 
     /// Read and roll back this [`TxnSetLock`] in a single operation, if there is a version pending.
     /// Also returns the set of changes rolled back, if any.
     ///
     /// Panics: if this [`TxnSetLock`] has already been committed or finalized at `txn_id`
-    pub async fn read_and_rollback(
-        &self,
-        txn_id: I,
-    ) -> (TxnSetLockVersionGuard<I, T>, Option<Delta<T>>) {
-        let permit = self
+    pub async fn read_and_rollback(&self, txn_id: I) -> (Canon<T>, Option<Delta<T>>) {
+        let _permit = self
             .semaphore
             .read(txn_id, Range::All)
             .await
@@ -669,7 +660,7 @@ where
             (version, deltas)
         };
 
-        let version = TxnSetLockVersionGuard::new(txn_id, self.semaphore.clone(), permit, version);
+        self.semaphore.finalize(&txn_id, false);
 
         (version, deltas)
     }

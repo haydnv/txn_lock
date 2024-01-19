@@ -50,7 +50,7 @@ use collate::{Collator, Overlap, OverlapsRange};
 use ds_ext::{OrdHashMap, OrdHashSet};
 use tokio::sync::RwLock;
 
-use super::guard::{TxnReadGuard, TxnVersionGuard, TxnWriteGuard};
+use super::guard::{TxnReadGuard, TxnWriteGuard};
 use super::semaphore::{PermitRead, PermitWrite, Semaphore};
 use super::{Error, Result};
 
@@ -59,9 +59,6 @@ pub type TxnLockReadGuard<T> = TxnReadGuard<Range, T>;
 
 /// A write guard on a [`TxnLock`]
 pub type TxnLockWriteGuard<T> = TxnWriteGuard<Range, T>;
-
-/// A read guard on the state of a [`TxnLock`] that was committed or rolled back
-pub type TxnLockVersionGuard<I, T> = TxnVersionGuard<I, Collator<()>, Range, Arc<T>>;
 
 /// A range used to reserve a permit to guard access to a [`TxnLock`]
 #[derive(Debug)]
@@ -355,8 +352,8 @@ where
 
     /// Read and commit this [`TxnLock`] in a single operation.
     /// Panics: if this [`TxnLock`] has already been finalized at `txn_id`
-    pub async fn read_and_commit(&self, txn_id: I) -> TxnLockVersionGuard<I, T> {
-        let permit = self.semaphore.read(txn_id, Range).await.expect("permit");
+    pub async fn read_and_commit(&self, txn_id: I) -> Arc<T> {
+        let _permit = self.semaphore.read(txn_id, Range).await.expect("permit");
 
         let canon = {
             let mut state = self.state_mut();
@@ -368,7 +365,9 @@ where
             }
         };
 
-        TxnLockVersionGuard::new(txn_id, self.semaphore.clone(), permit, canon)
+        self.semaphore.finalize(&txn_id, false);
+
+        canon
     }
 
     /// Roll back the state of this [`TxnLock`] at `txn_id`.
@@ -389,12 +388,14 @@ where
         }
 
         state.pending.remove(txn_id);
+
+        self.semaphore.finalize(txn_id, false);
     }
 
     /// Read and roll back this [`TxnLock`] in a single operation, if there is a version pending.
     /// Panics: if this [`TxnLock`] has already been committed or finalized at `txn_id`
-    pub async fn read_and_rollback(&self, txn_id: I) -> TxnLockVersionGuard<I, T> {
-        let permit = self.semaphore.read(txn_id, Range).await.expect("permit");
+    pub async fn read_and_rollback(&self, txn_id: I) -> Arc<T> {
+        let _permit = self.semaphore.read(txn_id, Range).await.expect("permit");
 
         let version = {
             let mut state = self.state_mut();
@@ -414,7 +415,9 @@ where
                 .unwrap_or_else(|| state.read_canon(&txn_id).clone())
         };
 
-        TxnLockVersionGuard::new(txn_id, self.semaphore.clone(), permit, version)
+        self.semaphore.finalize(&txn_id, false);
+
+        version
     }
 
     /// Finalize the state of this [`TxnLock`] at `txn_id`.
