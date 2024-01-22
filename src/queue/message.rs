@@ -3,16 +3,16 @@
 //! Example:
 //! ```
 //! use futures::executor::block_on;
-//! use txn_lock::queue::*;
+//! use txn_lock::queue::message::*;
 //! use txn_lock::Error;
 //!
 //! let queue = MessageQueue::<u64, &'static str>::new();
 //!
 //! assert_eq!(queue.commit(0), Vec::<&'static str>::new());
 //!
-//! queue.send(1, "first message").expect("send");
-//! queue.send(2, "second message").expect("send");
-//! queue.send(3, "third message").expect("send");
+//! queue.push(1, "first message").expect("send");
+//! queue.push(2, "second message").expect("send");
+//! queue.push(3, "third message").expect("send");
 //!
 //! assert_eq!(queue.commit(2), vec!["second message"]);
 //! assert_eq!(queue.commit(1), vec!["first message"]);
@@ -21,8 +21,7 @@
 //!
 //! assert_eq!(queue.commit(3), vec!["third message"]);
 //!
-//! queue.send(4, "fourth message").expect("send");
-//!
+//! queue.push(4, "fourth message").expect("send");
 //! ```
 
 use std::fmt;
@@ -31,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::Error;
 
-use super::State;
+use super::{Entry, State};
 
 /// A transactional message queue
 pub struct MessageQueue<I, M> {
@@ -56,24 +55,23 @@ impl<I, M> MessageQueue<I, M> {
 }
 
 impl<I: Copy + Eq + Ord + Hash, M> MessageQueue<I, M> {
-    /// Send the given `message` at `txn_id`.
-    pub fn send(&self, txn_id: I, message: M) -> Result<(), Error> {
+    /// Push the given `message` onto the queue at `txn_id`.
+    pub fn push(&self, txn_id: I, message: M) -> Result<(), Error> {
         let mut state = self.state.lock().expect("state");
 
-        state.check_pending(&txn_id)?;
-
-        if let Some(queue) = state.pending.get_mut(&txn_id) {
-            queue.push(message);
-        } else {
-            state.pending.insert(txn_id, vec![message]);
-        }
+        match state.check_pending(txn_id)? {
+            Entry::Occupied(mut entry) => entry.get_mut().push(message),
+            Entry::Vacant(entry) => {
+                entry.insert(vec![message]);
+            }
+        };
 
         Ok(())
     }
 }
 
 impl<I: Eq + Hash + Ord + fmt::Debug, M> MessageQueue<I, M> {
-    /// Close the channel and return the queue for the given `txn_id`, if any.
+    /// Close and return the queue for the given `txn_id`, if any.
     ///
     /// If `commit` is called multiple times, only the first will return a filled `Vec`.
     ///
@@ -84,9 +82,10 @@ impl<I: Eq + Hash + Ord + fmt::Debug, M> MessageQueue<I, M> {
         state.commit(txn_id).unwrap_or_default()
     }
 
-    /// Close the channel for the given `txn_id`, if any.
+    /// Close the queue at `txn_id`, if any.
     ///
     /// Panics:
+    ///  - if this [`MessageQueue`] has already been committed at the given `txn_id`
     ///  - if this [`MessageQueue`] has already been finalized at the given `txn_id`
     pub fn rollback(&self, txn_id: &I) {
         let mut state = self.state.lock().expect("state");

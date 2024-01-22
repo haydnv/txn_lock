@@ -1,13 +1,14 @@
-use core::fmt;
-/// Composable transactional queues.
-use ds_ext::{OrdHashMap, OrdHashSet};
+/// Transactional queue structures.
+use std::fmt;
 use std::hash::Hash;
+
+use ds_ext::map::{Entry, OrdHashMap};
+use ds_ext::set::OrdHashSet;
 
 use super::Error;
 
-mod message;
-
-pub use message::MessageQueue;
+pub mod message;
+pub mod task;
 
 struct State<I, S> {
     pending: OrdHashMap<I, S>,
@@ -27,15 +28,16 @@ impl<I, S> State<I, S> {
 
 impl<I, S> State<I, S>
 where
-    I: Eq + Hash + PartialOrd,
+    I: Eq + Hash + Ord,
+    S: Default,
 {
-    fn check_pending(&self, txn_id: &I) -> Result<(), Error> {
-        if Some(txn_id) < self.finalized.as_ref() {
+    fn check_pending(&mut self, txn_id: I) -> Result<Entry<I, S>, Error> {
+        if Some(&txn_id) < self.finalized.as_ref() {
             Err(Error::Outdated)
-        } else if self.commits.contains(txn_id) {
+        } else if self.commits.contains(&txn_id) {
             Err(Error::Committed)
         } else {
-            Ok(())
+            Ok(self.pending.entry(txn_id))
         }
     }
 }
