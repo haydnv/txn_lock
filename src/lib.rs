@@ -5,6 +5,7 @@
 //!
 //! More complex transaction locks (e.g. for a relational database) can be constructed using
 //! the [`semaphore`] module.
+
 pub mod map;
 pub mod queue;
 pub mod scalar;
