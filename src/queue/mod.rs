@@ -29,10 +29,17 @@ impl<I, S> State<I, S> {
 impl<I, S> State<I, S>
 where
     I: Eq + Hash + Ord,
-    S: Default,
 {
+    fn check_finalized(&mut self, txn_id: &I) -> Result<Option<&mut S>, Error> {
+        if Some(txn_id) <= self.finalized.as_ref() {
+            Err(Error::Outdated)
+        } else {
+            Ok(self.pending.get_mut(txn_id))
+        }
+    }
+
     fn check_pending(&mut self, txn_id: I) -> Result<Entry<I, S>, Error> {
-        if Some(&txn_id) < self.finalized.as_ref() {
+        if Some(&txn_id) <= self.finalized.as_ref() {
             Err(Error::Outdated)
         } else if self.commits.contains(&txn_id) {
             Err(Error::Committed)
