@@ -29,7 +29,7 @@ use crate::Error;
 use super::{Entry, State};
 
 /// The return type of a [`Task`] function
-pub type BoxFuture<Out> = Pin<Box<dyn Future<Output = Out> + Send + Sync>>;
+pub type BoxFuture<Out> = Pin<Box<dyn Future<Output = Out> + Send>>;
 
 /// A task for a [`TaskQueue`] to run
 pub type Task<I, O> = Pin<Arc<dyn Fn(I) -> BoxFuture<O> + Send + Sync>>;
