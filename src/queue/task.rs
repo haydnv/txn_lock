@@ -20,8 +20,8 @@ use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use futures::future::{Future, FutureExt};
-use tokio::sync::{OwnedRwLockReadGuard, RwLock};
+use futures::future::Future;
+use tokio::sync::{mpsc, OwnedRwLockReadGuard, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::Error;
@@ -35,14 +35,18 @@ pub type BoxFuture<Out> = Pin<Box<dyn Future<Output = Out> + Send + Sync>>;
 pub type Task<I, O> = Pin<Arc<dyn Fn(I) -> BoxFuture<O> + Send + Sync>>;
 
 struct Queue<O> {
-    tasks: VecDeque<JoinHandle<O>>,
+    tx: mpsc::UnboundedSender<JoinHandle<O>>,
+    rx: mpsc::UnboundedReceiver<JoinHandle<O>>,
     results: Arc<RwLock<Vec<O>>>,
 }
 
 impl<O> Queue<O> {
     fn new() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+
         Self {
-            tasks: VecDeque::with_capacity(1),
+            tx,
+            rx,
             results: Arc::new(RwLock::new(Vec::with_capacity(1))),
         }
     }
@@ -50,9 +54,11 @@ impl<O> Queue<O> {
 
 impl<O: Send + Sync + fmt::Debug + 'static> Queue<O> {
     async fn commit(mut self) -> Vec<O> {
+        std::mem::drop(self.tx);
+
         let mut results = Arc::try_unwrap(self.results).expect("results").into_inner();
 
-        while let Some(handle) = self.tasks.pop_front() {
+        while let Some(handle) = self.rx.recv().await {
             let result = handle.await.expect("join");
             results.push(result);
         }
@@ -60,19 +66,18 @@ impl<O: Send + Sync + fmt::Debug + 'static> Queue<O> {
         results
     }
 
-    async fn peek(&mut self) -> OwnedRwLockReadGuard<Vec<O>> {
-        let mut results = self.results.clone().write_owned().await;
+    fn peek(&mut self) -> (VecDeque<JoinHandle<O>>, Arc<RwLock<Vec<O>>>) {
+        let mut pending = VecDeque::with_capacity(0);
 
-        while let Some(handle) = self.tasks.pop_front() {
-            let result = handle.await.expect("join");
-            results.push(result);
+        while let Ok(handle) = self.rx.try_recv() {
+            pending.push_back(handle);
         }
 
-        results.downgrade()
+        (pending, self.results.clone())
     }
 
-    fn push(&mut self, task: BoxFuture<O>) {
-        self.tasks.push_back(tokio::spawn(task))
+    fn push(&mut self, task: BoxFuture<O>) -> Result<(), mpsc::error::SendError<JoinHandle<O>>> {
+        self.tx.send(tokio::spawn(task))
     }
 }
 
@@ -108,13 +113,24 @@ where
 {
     /// Wait for all queued tasks to complete, then borrow them for inspection.
     pub async fn peek(&self, txn_id: &I) -> Result<Option<OwnedRwLockReadGuard<Vec<Out>>>, Error> {
-        let mut state = self.state.lock().expect("state");
+        let (mut pending, results) = {
+            let mut state = self.state.lock().expect("state");
 
-        if let Some(queue) = state.check_finalized(txn_id)? {
-            queue.peek().map(Some).map(Ok).await
-        } else {
-            Ok(None)
+            if let Some(queue) = state.check_finalized(txn_id)? {
+                queue.peek()
+            } else {
+                return Ok(None);
+            }
+        };
+
+        let mut results = results.write_owned().await;
+
+        while let Some(handle) = pending.pop_front() {
+            let result = handle.await?;
+            results.push(result);
         }
+
+        Ok(Some(results.downgrade()))
     }
 
     /// Push a new input onto the queue at `txn_id`.
@@ -125,10 +141,9 @@ where
 
         match state.check_pending(txn_id)? {
             Entry::Occupied(mut entry) => entry.get_mut().push(task),
-            Entry::Vacant(entry) => {
-                entry.insert(Queue::new()).push(task);
-            }
-        };
+            Entry::Vacant(entry) => entry.insert(Queue::new()).push(task),
+        }
+        .expect("send"); // at this point the channel can't possibly be closed
 
         Ok(())
     }
@@ -145,8 +160,12 @@ where
     ///  - if there is an active lock on the message queue at `txn_id`
     ///  - if the queue has already been finalized at `txn_id`
     pub async fn commit(&self, txn_id: I) -> Vec<Out> {
-        let mut state = self.state.lock().expect("state");
-        if let Some(queue) = state.commit(txn_id) {
+        let queue = {
+            let mut state = self.state.lock().expect("state");
+            state.commit(txn_id)
+        };
+
+        if let Some(queue) = queue {
             queue.commit().await
         } else {
             vec![]
