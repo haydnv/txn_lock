@@ -24,7 +24,9 @@
 //!
 //! std::mem::drop(value);
 //!
-//! map.commit(1);
+//! let (state_at_txn_1, deltas) = block_on(map.read_and_commit(1));
+//! assert_eq!(deltas.expect("deltas").len(), 1);
+//! assert_eq!(state_at_txn_1.len(), 1);
 //!
 //! let mut value = map.try_get_mut(2, one).expect("read").expect("value");
 //! assert_eq!(value, 1.0);
@@ -107,7 +109,7 @@ use ds_ext::{OrdHashMap, OrdHashSet};
 use futures::TryFutureExt;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
-use super::guard::{TxnReadGuard, TxnReadGuardMap, TxnVersionGuard, TxnWriteGuard};
+use super::guard::{TxnReadGuard, TxnReadGuardMap, TxnWriteGuard};
 use super::semaphore::*;
 use super::{Error, Result};
 
@@ -117,9 +119,6 @@ type Canon<K, V> = HashMap<Key<K>, Arc<V>>;
 type Delta<K, V> = HashMap<Key<K>, Option<Arc<V>>>;
 type Deltas<I, K, V> = OrdHashMap<I, Delta<K, V>>;
 type Pending<K, V> = HashMap<Key<K>, Option<Arc<RwLock<V>>>>;
-
-/// A read guard on a version of a [`TxnMapLock`]
-pub type TxnMapLockVersionGuard<I, K, V> = TxnVersionGuard<I, Collator<K>, Range<K>, Canon<K, V>>;
 
 /// A read guard on a value in a [`TxnMapLock`]
 pub type TxnMapValueReadGuard<K, V> = TxnReadGuard<Range<K>, V>;
@@ -774,6 +773,9 @@ where
 
     /// Remove and return all entries from this [`TxnMapLock`] at `txn_id`.
     pub async fn clear(&self, txn_id: I) -> Result<Canon<K, V>> {
+        #[cfg(feature = "logging")]
+        log::trace!("clear {self:?} at {txn_id:?}");
+
         let _permit = self.semaphore.write(txn_id, Range::All).await?;
 
         let mut state = self.state_mut();
@@ -784,6 +786,9 @@ where
 
     /// Remove and return all entries from this [`TxnMapLock`] at `txn_id`.
     pub fn try_clear(&self, txn_id: I) -> Result<Canon<K, V>> {
+        #[cfg(feature = "logging")]
+        log::trace!("try_clear {self:?} at {txn_id:?}");
+
         let mut state = self.state_mut();
         state.check_pending(&txn_id)?;
 
@@ -798,6 +803,9 @@ where
         Q: Eq + Hash + ToOwned<Owned = K> + ?Sized,
         Key<K>: Borrow<Q>,
     {
+        #[cfg(feature = "logging")]
+        log::trace!("contains_key? {self:?} at {txn_id:?}");
+
         let range: Range<K> = {
             let state = self.state();
             if let Poll::Ready(result) = state.contains_committed(&txn_id, key) {
@@ -817,6 +825,9 @@ where
         Q: Eq + Hash + ToOwned<Owned = K> + ?Sized,
         Key<K>: Borrow<Q>,
     {
+        #[cfg(feature = "logging")]
+        log::trace!("try_contains_key {self:?} at {txn_id:?}");
+
         let state = self.state();
         if let Poll::Ready(result) = state.contains_committed(&txn_id, key) {
             return result;
@@ -833,6 +844,9 @@ where
         Q: Into<Key<K>>,
         E: IntoIterator<Item = (Q, V)>,
     {
+        #[cfg(feature = "logging")]
+        log::trace!("extend {self:?} at {txn_id:?}");
+
         let _permit = self.semaphore.write(txn_id, Range::All).await?;
 
         let mut state = self.state_mut();
@@ -847,6 +861,9 @@ where
         Q: Into<Key<K>>,
         E: IntoIterator<Item = (Q, V)>,
     {
+        #[cfg(feature = "logging")]
+        log::trace!("try_extend {self:?} at {txn_id:?}");
+
         let mut state = self.state_mut();
         state.check_pending(&txn_id)?;
 
@@ -861,6 +878,9 @@ where
         Q: Eq + Hash + ToOwned<Owned = K> + ?Sized,
         Key<K>: Borrow<Q>,
     {
+        #[cfg(feature = "logging")]
+        log::trace!("get from {self:?} at {txn_id:?}");
+
         let range: Range<K> = {
             let state = self.state();
 
@@ -893,10 +913,20 @@ where
         Q: Eq + Hash + ToOwned<Owned = K> + ?Sized,
         Key<K>: Borrow<Q>,
     {
+        #[cfg(feature = "logging")]
+        log::trace!("try_get from {self:?} at {txn_id:?}");
+
         let state = self.state();
 
         if let Poll::Ready(result) = state.get_committed(&txn_id, key) {
+            #[cfg(feature = "log")]
+            log::trace!(
+                "{self:?} is already committed at {txn_id:?}, no need for a read permit..."
+            );
             return result;
+        } else {
+            #[cfg(feature = "log")]
+            log::trace!("{self:?} is not yet committed at {txn_id:?}, getting a read permit...");
         }
 
         let range = Key::<K>::from((key, state.key(&txn_id, key))).into();
@@ -911,6 +941,9 @@ where
 
     /// Construct an iterator over the entries in this [`TxnMapLock`] at `txn_id`.
     pub async fn iter(&self, txn_id: I) -> Result<Iter<I, K, V>> {
+        #[cfg(feature = "logging")]
+        log::trace!("iter over {self:?} at {txn_id:?}");
+
         let permit = self.semaphore.read(txn_id, Range::All).await?;
 
         let state = self.state();
@@ -926,6 +959,9 @@ where
 
     /// Construct an iterator over the entries in this [`TxnMapLock`] at `txn_id` synchronously.
     pub fn try_iter(&self, txn_id: I) -> Result<Iter<I, K, V>> {
+        #[cfg(feature = "logging")]
+        log::trace!("try_iter over {self:?} at {txn_id:?}");
+
         let state = self.state();
 
         if state.check_committed(&txn_id)? {
@@ -945,6 +981,9 @@ where
         key: Q,
         value: V,
     ) -> Result<Option<Arc<V>>> {
+        #[cfg(feature = "logging")]
+        log::trace!("insert into {self:?} at {txn_id:?}");
+
         let key: Key<K> = key.into();
         let _permit = self.semaphore.write(txn_id, key.clone().into()).await?;
 
@@ -961,6 +1000,9 @@ where
         key: Q,
         value: V,
     ) -> Result<Option<Arc<V>>> {
+        #[cfg(feature = "logging")]
+        log::trace!("try_insert into {self:?} at {txn_id:?}");
+
         let mut state = self.state_mut();
         state.check_pending(&txn_id)?;
 
@@ -972,11 +1014,17 @@ where
 
     /// Return `true` if this [`TxnMapLock`] is empty at the given `txn_id`.
     pub async fn is_empty(&self, txn_id: I) -> Result<bool> {
+        #[cfg(feature = "logging")]
+        log::trace!("is_empty? {self:?} at {txn_id:?}");
+
         self.len(txn_id).map_ok(|len| len == 0).await
     }
 
     /// Get the size of this [`TxnMapLock`] at the given `txn_id`.
     pub async fn len(&self, txn_id: I) -> Result<usize> {
+        #[cfg(feature = "logging")]
+        log::trace!("len of {self:?} at {txn_id:?}");
+
         let _permit = self.semaphore.read(txn_id, Range::All).await?;
 
         let state = self.state();
@@ -996,6 +1044,9 @@ where
         Q: Eq + Hash + ToOwned<Owned = K> + ?Sized,
         Key<K>: Borrow<Q>,
     {
+        #[cfg(feature = "logging")]
+        log::trace!("remove from {self:?} at {txn_id:?}");
+
         let key: Key<K> = {
             let state = self.state();
             state.check_pending(&txn_id)?;
@@ -1016,6 +1067,9 @@ where
         Q: Eq + Hash + ToOwned<Owned = K> + ?Sized,
         Key<K>: Borrow<Q>,
     {
+        #[cfg(feature = "logging")]
+        log::trace!("try_remove from {self:?} at {txn_id:?}");
+
         let mut state = self.state_mut();
         state.check_pending(&txn_id)?;
 
@@ -1034,6 +1088,9 @@ where
 {
     /// Borrow an [`Entry`] mutably for writing at `txn_id`.
     pub async fn entry<Q: Into<Key<K>>>(&self, txn_id: I, key: Q) -> Result<Entry<I, K, V>> {
+        #[cfg(feature = "logging")]
+        log::trace!("get entry in {self:?} at {txn_id:?}");
+
         // before acquiring a permit, check if this version has already been committed
         self.state().check_pending(&txn_id)?;
 
@@ -1062,6 +1119,9 @@ where
         txn_id: I,
         key: Q,
     ) -> Result<Option<TxnMapValueWriteGuard<K, V>>> {
+        #[cfg(feature = "logging")]
+        log::trace!("get_mut {self:?} at {txn_id:?}");
+
         // before acquiring a permit, check if this version has already been committed
         self.state().check_pending(&txn_id)?;
 
@@ -1081,6 +1141,9 @@ where
         Q: Eq + Hash + ToOwned<Owned = K> + ?Sized,
         Key<K>: Borrow<Q>,
     {
+        #[cfg(feature = "logging")]
+        log::trace!("try_get_mut {self:?} at {txn_id:?}");
+
         let mut state = self.state_mut();
 
         // before acquiring a permit, check if this version has already been committed
@@ -1099,6 +1162,9 @@ where
 
     /// Construct a mutable iterator over the entries in this [`TxnMapLock`] at `txn_id`.
     pub async fn iter_mut(&self, txn_id: I) -> Result<IterMut<I, K, V>> {
+        #[cfg(feature = "logging")]
+        log::trace!("iter_mut {self:?} at {txn_id:?}");
+
         // before acquiring a permit, check if this version has already been committed
         self.state().check_pending(&txn_id)?;
 
@@ -1110,6 +1176,9 @@ where
     /// Construct a mutable iterator over the entries in this [`TxnMapLock`] at `txn_id`,
     /// synchronously if possible.
     pub fn try_iter_mut(&self, txn_id: I) -> Result<IterMut<I, K, V>> {
+        #[cfg(feature = "logging")]
+        log::trace!("try_iter_mut {self:?} at {txn_id:?}");
+
         let state = self.state();
 
         // before acquiring a permit, check if this version has already been committed
@@ -1132,6 +1201,9 @@ where
     ///  - if this [`TxnMapLock`] has already been finalized at `txn_id`
     ///  - if any new value to commit is still locked (for reading or writing)
     pub fn commit(&self, txn_id: I) {
+        #[cfg(feature = "logging")]
+        log::trace!("commit {self:?} at {txn_id:?}");
+
         let mut state = self.state_mut();
 
         if state.finalized.as_ref() >= Some(&txn_id) {
@@ -1149,11 +1221,11 @@ where
     /// Panics:
     ///  - if this [`TxnMapLock`] has already been finalized at `txn_id`
     ///  - if any new value to commit is still locked (for reading or writing)
-    pub async fn read_and_commit(
-        &self,
-        txn_id: I,
-    ) -> (TxnMapLockVersionGuard<I, K, V>, Option<Delta<K, V>>) {
-        let permit = self
+    pub async fn read_and_commit(&self, txn_id: I) -> (Canon<K, V>, Option<Delta<K, V>>) {
+        #[cfg(feature = "logging")]
+        log::trace!("read and commit {self:?} at {txn_id:?}");
+
+        let _permit = self
             .semaphore
             .read(txn_id, Range::All)
             .await
@@ -1167,10 +1239,11 @@ where
             }
 
             state.commit(txn_id);
+
             (state.canon(&txn_id), state.deltas.get(&txn_id).cloned())
         };
 
-        let version = TxnMapLockVersionGuard::new(txn_id, self.semaphore.clone(), permit, version);
+        self.semaphore.finalize(&txn_id, false);
 
         (version, deltas)
     }
@@ -1194,19 +1267,17 @@ where
         }
 
         state.pending.remove(txn_id);
+
+        self.semaphore.finalize(txn_id, false);
     }
 
     /// Read and roll back this [`TxnMapLock`] in a single operation.
-    /// Also returns the set of changes rolled back, if any.
     ///
     /// Panics:
     ///  - if this [`TxnMapLock`] has already been committed or finalized at `txn_id`
     ///  - if any updated value is still locked for reading or writing
-    pub async fn read_and_rollback(
-        &self,
-        txn_id: I,
-    ) -> (TxnMapLockVersionGuard<I, K, V>, Option<Delta<K, V>>) {
-        let permit = self
+    pub async fn read_and_rollback(&self, txn_id: I) -> (Canon<K, V>, Option<Delta<K, V>>) {
+        let _permit = self
             .semaphore
             .read(txn_id, Range::All)
             .await
@@ -1225,8 +1296,10 @@ where
                 panic!("tried to roll back finalized version at {:?}", txn_id);
             }
 
-            let mut version = state.canon(&txn_id);
+            // note: this removes the pending version, i.e. it returns the version that WOULD be committed
             let deltas = state.commit_version(&txn_id);
+
+            let mut version = state.canon(&txn_id);
 
             if let Some(deltas) = &deltas {
                 merge(&mut version, deltas);
@@ -1235,7 +1308,7 @@ where
             (version, deltas)
         };
 
-        let version = TxnMapLockVersionGuard::new(txn_id, self.semaphore.clone(), permit, version);
+        self.semaphore.finalize(&txn_id, false);
 
         (version, deltas)
     }

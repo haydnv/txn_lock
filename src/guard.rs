@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard};
 
-use super::semaphore::{PermitRead, PermitWrite, Semaphore};
+use super::semaphore::{PermitRead, PermitWrite};
 
 /// A permit to read a value in a pending read transaction
 #[derive(Debug)]
@@ -196,44 +196,5 @@ impl<R, T: PartialEq> PartialEq<T> for TxnWriteGuard<R, T> {
 impl<R, T: PartialOrd> PartialOrd<T> for TxnWriteGuard<R, T> {
     fn partial_cmp(&self, other: &T) -> Option<Ordering> {
         self.deref().partial_cmp(other)
-    }
-}
-
-/// A read guard on the state of a transactional lock to commit or roll back
-pub struct TxnVersionGuard<I: Copy + Ord, C, R, T> {
-    #[allow(unused)]
-    permit: PermitRead<R>,
-    semaphore: Semaphore<I, C, R>,
-    canon: T,
-    txn_id: I,
-}
-
-impl<I: Copy + Ord, C, R, T> TxnVersionGuard<I, C, R, T> {
-    pub(crate) fn new(
-        txn_id: I,
-        semaphore: Semaphore<I, C, R>,
-        permit: PermitRead<R>,
-        canon: T,
-    ) -> Self {
-        Self {
-            permit,
-            semaphore,
-            canon,
-            txn_id,
-        }
-    }
-}
-
-impl<I: Copy + Ord, C, R, T> Deref for TxnVersionGuard<I, C, R, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.canon
-    }
-}
-
-impl<I: Copy + Ord, C, R, T> Drop for TxnVersionGuard<I, C, R, T> {
-    fn drop(&mut self) {
-        self.semaphore.finalize(&self.txn_id, false)
     }
 }

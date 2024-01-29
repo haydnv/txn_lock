@@ -1,12 +1,13 @@
 //! Utilities to support transactional versioning.
 //!
 //! General-purpose locks and usage examples are provided
-//! in the [`map`], [`scalar`], and [`set`] modules.
+//! in the [`map`], [`queue`], [`scalar`], and [`set`] modules.
 //!
 //! More complex transaction locks (e.g. for a relational database) can be constructed using
 //! the [`semaphore`] module.
 
 pub mod map;
+pub mod queue;
 pub mod scalar;
 pub mod semaphore;
 pub mod set;
@@ -17,7 +18,7 @@ mod range;
 use std::fmt;
 
 /// An error which may occur when attempting to acquire a transactional lock
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum Error {
     /// Cannot acquire a write lock because the transaction is already committed
     Committed,
@@ -30,16 +31,22 @@ pub enum Error {
 
     /// Unable to acquire a transactional lock synchronously
     WouldBlock,
+
+    /// An error occurred in a background task
+    Background(String),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(match self {
-            Self::Committed => "cannot acquire an exclusive lock after committing",
-            Self::Conflict => "there is a conflicting transactional lock on this resource",
-            Self::Outdated => "the value has already been finalized",
-            Self::WouldBlock => "synchronous lock acquisition failed",
-        })
+        match self {
+            Self::Committed => f.write_str("cannot acquire an exclusive lock after committing"),
+            Self::Conflict => {
+                f.write_str("there is a conflicting transactional lock on this resource")
+            }
+            Self::Outdated => f.write_str("the value has already been finalized"),
+            Self::WouldBlock => f.write_str("synchronous lock acquisition failed"),
+            Self::Background(cause) => write!(f, "an error occured in a background task: {cause}"),
+        }
     }
 }
 
@@ -50,6 +57,12 @@ impl fmt::Debug for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<tokio::task::JoinError> for Error {
+    fn from(cause: tokio::task::JoinError) -> Self {
+        Self::Background(cause.to_string())
+    }
+}
 
 impl From<tokio::sync::AcquireError> for Error {
     fn from(_: tokio::sync::AcquireError) -> Self {

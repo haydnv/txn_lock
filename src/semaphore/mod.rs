@@ -153,7 +153,7 @@ impl<I, C, R> Semaphore<I, C, R> {
 
 impl<I, C, R> Semaphore<I, C, R>
 where
-    I: Ord,
+    I: Ord + fmt::Debug,
     C: Collate + Clone + Send + Sync,
     R: OverlapsRange<R, C> + fmt::Debug + Send + Sync,
 {
@@ -183,6 +183,9 @@ where
             match txn_id.cmp(version_id) {
                 Ordering::Greater => {
                     if version.is_pending_write_at(&range) {
+                        #[cfg(feature = "logging")]
+                        log::trace!("{range:?} is reserved for writing at {version_id:?}");
+
                         // if there's a write lock in the past, wait it out
                         return VersionRead::Pending(range, txn_id);
                     }
@@ -367,7 +370,7 @@ where
     }
 }
 
-impl<I: Copy + Ord, C, R> Semaphore<I, C, R> {
+impl<I: Copy + Ord + fmt::Debug, C, R> Semaphore<I, C, R> {
     /// Mark a transaction completed, un-blocking waiting requests for future permits.
     ///
     /// Call this when the transactional resource is no longer writable at `txn_id`
@@ -395,6 +398,9 @@ impl<I: Copy + Ord, C, R> Semaphore<I, C, R> {
         };
 
         if notify {
+            #[cfg(feature = "logging")]
+            log::trace!("dropped transactional semaphore version {txn_id:?}");
+
             self.notify.notify_waiters();
         }
     }

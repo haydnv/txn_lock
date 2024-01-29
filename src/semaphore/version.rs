@@ -82,7 +82,7 @@ impl<C, R> Clone for RangeLock<C, R> {
     }
 }
 
-impl<C: Send + Sync, R: Send + Sync> RangeLock<C, R> {
+impl<C, R> RangeLock<C, R> {
     fn new(range: Arc<R>, write: bool) -> Self {
         let semaphore = Arc::new(Semaphore::new(PERMITS as usize));
 
@@ -99,12 +99,33 @@ impl<C: Send + Sync, R: Send + Sync> RangeLock<C, R> {
         }
     }
 
+    fn is_pending_write(&self) -> bool {
+        let write_flag = self.write.lock().expect("write bit");
+
+        if *write_flag {
+            return true;
+        }
+
+        [
+            &self.left,
+            &self.left_partial,
+            &self.center,
+            &self.right_partial,
+            &self.right,
+        ]
+        .into_iter()
+        .filter_map(|node| node.as_ref())
+        .any(|node| node.is_pending_write())
+    }
+
     #[inline]
     fn reserve(&self, write: bool) {
         let mut flag = self.write.lock().expect("write flag");
         *flag = *flag || write;
     }
+}
 
+impl<C: Send + Sync, R: Send + Sync> RangeLock<C, R> {
     fn acquire(&self) -> BoxTryFuture<NodePermit> {
         Box::pin(async move {
             let permit = self.semaphore.clone().acquire_owned().await?;
@@ -282,28 +303,6 @@ where
                 }
             }
         }
-    }
-
-    #[inline]
-    fn is_pending_write(&self) -> bool {
-        let write_flag = self.write.lock().expect("write bit");
-
-        if *write_flag {
-            #[cfg(feature = "logging")]
-            log::trace!("{self:?} is reserved for writing");
-            return true;
-        }
-
-        [
-            &self.left,
-            &self.left_partial,
-            &self.center,
-            &self.right_partial,
-            &self.right,
-        ]
-        .into_iter()
-        .filter_map(|node| node.as_ref())
-        .any(|node| node.is_pending_write())
     }
 
     /// Acquire a read lock on this [`RangeLock`] and its children.
