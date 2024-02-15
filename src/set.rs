@@ -10,7 +10,7 @@
 //! use txn_lock::set::*;
 //! use txn_lock::Error;
 //!
-//! let set = TxnSetLock::<u64, String>::new(0);
+//! let set = TxnSetLock::<u64, String>::new(0, []);
 //!
 //! let one = "one";
 //! let two = "two";
@@ -321,9 +321,14 @@ where
     T: Eq + Hash,
 {
     /// Construct a new, empty [`TxnSetLock`].
-    pub fn new(txn_id: I) -> Self {
+    pub fn new<Contents>(txn_id: I, contents: Contents) -> Self
+    where
+        Contents: IntoIterator<Item = T>,
+    {
+        let contents = contents.into_iter().map(Key::from).collect();
+
         Self {
-            state: Arc::new(RwLockInner::new(State::new(txn_id, Canon::new()))),
+            state: Arc::new(RwLockInner::new(State::new(txn_id, contents))),
             semaphore: Semaphore::new(Collator::<T>::default()),
         }
     }
