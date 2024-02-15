@@ -140,7 +140,7 @@ impl<I: Ord + Hash + Copy + fmt::Debug, T: fmt::Debug> State<I, T> {
             }
         }
 
-        while let Some(version_id) = self.commits.first().map(|id| **id) {
+        while let Some(version_id) = self.commits.first().copied() {
             if version_id <= txn_id {
                 self.commits.pop_first();
             } else {

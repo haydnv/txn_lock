@@ -82,7 +82,7 @@ where
         while self
             .commits
             .first()
-            .map(|version_id| &**version_id <= &txn_id)
+            .map(|version_id| version_id <= &txn_id)
             .unwrap_or_default()
         {
             self.commits.pop_first();
