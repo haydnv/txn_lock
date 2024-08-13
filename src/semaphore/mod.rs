@@ -223,10 +223,15 @@ where
                 }
                 VersionRead::Version(range, root) => {
                     #[cfg(feature = "logging")]
-                    log::trace!("acquiring read lock on {range:?}...");
+                    log::trace!("acquiring a read permit on {range:?}...");
+
+                    let permit = root.read(&range, &self.collator).await?;
+
+                    #[cfg(feature = "logging")]
+                    log::trace!("acquired read permit on {range:?}");
 
                     return Ok(PermitRead {
-                        permit: root.read(&range, &self.collator).await?,
+                        permit,
                         notify: self.notify.clone(),
                     });
                 }
@@ -338,9 +343,12 @@ where
                 }
                 VersionRead::Version(range, root) => {
                     #[cfg(feature = "logging")]
-                    log::trace!("acquiring write lock on {range:?}...");
+                    log::trace!("acquiring a write permit on {range:?}...");
 
                     let permit = root.write(&range, &self.collator).await?;
+
+                    #[cfg(feature = "logging")]
+                    log::trace!("acquired write permit on {range:?}");
 
                     return Ok(PermitWrite {
                         permit,
