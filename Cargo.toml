@@ -18,12 +18,12 @@ logging = ["log"]
 
 [dependencies]
 collate = "0.4"
-ds-ext = { path = "../ds-ext" }
-hr-id = { version = "0.5", optional = true }
+ds-ext = "0.2"
+hr-id = { version = "0.6", optional = true }
 futures = "0.3"
 log = { version = "0.4", features = ["release_max_level_info"], optional = true }
-tokio = { version = "1.35", features = ["sync", "rt"] }
+tokio = { version = "1.39", features = ["sync", "rt"] }
 
 [dev-dependencies]
 futures = "0.3"
-tokio = { version = "1.36", features = ["time"] }
+tokio = { version = "1.39", features = ["time"] }
