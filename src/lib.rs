@@ -79,4 +79,16 @@ impl From<tokio::sync::TryAcquireError> for Error {
     }
 }
 
+impl From<Error> for tc_error::TCError {
+    fn from(err: Error) -> Self {
+        match err {
+            Error::Committed => tc_error::TCError::conflict("transaction already committed"),
+            Error::Conflict => tc_error::TCError::conflict(err),
+            Error::Outdated => tc_error::TCError::not_found("transaction has been finalized"),
+            Error::WouldBlock => tc_error::TCError::conflict("transactional lock would block"),
+            Error::Background(cause) => tc_error::TCError::internal(cause),
+        }
+    }
+}
+
 type Result<T> = std::result::Result<T, Error>;
