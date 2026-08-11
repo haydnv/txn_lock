@@ -16,8 +16,7 @@ const PERMITS: u32 = u32::MAX >> 3;
 type BoxTryFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 struct NodePermit {
-    #[allow(unused)]
-    permit: OwnedSemaphorePermit,
+    _permit: OwnedSemaphorePermit,
     children: [Option<Box<NodePermit>>; 5],
 }
 
@@ -129,16 +128,16 @@ impl<C: Send + Sync, R: Send + Sync> RangeLock<C, R> {
         Box::pin(async move {
             let permit = self.semaphore.clone().acquire_owned().await?;
 
-        #[inline]
-        fn child_lock<C, R>(
-            node: Option<&RangeLock<C, R>>,
-        ) -> BoxTryFuture<'_, Option<Box<NodePermit>>>
-        where
-            C: Send + Sync,
-            R: Send + Sync,
-        {
-            if let Some(node) = node {
-                Box::pin(node.acquire().map_ok(Box::new).map_ok(Some))
+            #[inline]
+            fn child_lock<C, R>(
+                node: Option<&RangeLock<C, R>>,
+            ) -> BoxTryFuture<'_, Option<Box<NodePermit>>>
+            where
+                C: Send + Sync,
+                R: Send + Sync,
+            {
+                if let Some(node) = node {
+                    Box::pin(node.acquire().map_ok(Box::new).map_ok(Some))
                 } else {
                     Box::pin(future::ready(Ok(None)))
                 }
@@ -153,7 +152,7 @@ impl<C: Send + Sync, R: Send + Sync> RangeLock<C, R> {
             )?;
 
             Ok(NodePermit {
-                permit,
+                _permit: permit,
                 children: [left, left_partial, center, right_partial, right],
             })
         })
@@ -176,7 +175,7 @@ impl<C: Send + Sync, R: Send + Sync> RangeLock<C, R> {
         }
 
         Ok(NodePermit {
-            permit,
+            _permit: permit,
             children: [
                 child_lock(self.left.as_deref())?,
                 child_lock(self.left_partial.as_deref())?,
@@ -191,16 +190,16 @@ impl<C: Send + Sync, R: Send + Sync> RangeLock<C, R> {
         Box::pin(async move {
             let permit = self.semaphore.clone().acquire_many_owned(permits).await?;
 
-        #[inline]
-        fn child_lock<C, R>(
-            node: Option<&RangeLock<C, R>>,
-            permits: u32,
-        ) -> BoxTryFuture<'_, Option<Box<NodePermit>>>
-        where
-            C: Send + Sync,
-            R: Send + Sync,
-        {
-            if let Some(node) = node {
+            #[inline]
+            fn child_lock<C, R>(
+                node: Option<&RangeLock<C, R>>,
+                permits: u32,
+            ) -> BoxTryFuture<'_, Option<Box<NodePermit>>>
+            where
+                C: Send + Sync,
+                R: Send + Sync,
+            {
+                if let Some(node) = node {
                     Box::pin(node.acquire_many(permits).map_ok(Box::new).map_ok(Some))
                 } else {
                     Box::pin(future::ready(Ok(None)))
@@ -216,7 +215,7 @@ impl<C: Send + Sync, R: Send + Sync> RangeLock<C, R> {
             )?;
 
             Ok(NodePermit {
-                permit,
+                _permit: permit,
                 children: [left, left_partial, center, right_partial, right],
             })
         })
@@ -242,7 +241,7 @@ impl<C: Send + Sync, R: Send + Sync> RangeLock<C, R> {
         }
 
         Ok(NodePermit {
-            permit,
+            _permit: permit,
             children: [
                 child_lock(self.left.as_deref(), permits)?,
                 child_lock(self.left_partial.as_deref(), permits)?,

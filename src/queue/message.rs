@@ -2,11 +2,10 @@
 //!
 //! Example:
 //! ```
-//! use futures::executor::block_on;
 //! use txn_lock::queue::message::*;
 //! use txn_lock::Error;
 //!
-//! let queue = MessageQueue::<u64, &'static str>::new();
+//! let queue = MessageQueue::<u64, &'static str>::new(16);
 //!
 //! assert_eq!(queue.commit(0), Vec::<&'static str>::new());
 //!
@@ -34,12 +33,14 @@ use super::{Entry, State};
 
 /// A transactional message queue
 pub struct MessageQueue<I, M> {
+    capacity: usize,
     state: Arc<Mutex<State<I, Vec<M>>>>,
 }
 
 impl<I, M> Clone for MessageQueue<I, M> {
     fn clone(&self) -> Self {
         Self {
+            capacity: self.capacity,
             state: self.state.clone(),
         }
     }
@@ -47,16 +48,13 @@ impl<I, M> Clone for MessageQueue<I, M> {
 
 impl<I, M> MessageQueue<I, M> {
     /// Construct a new [`MessageQueue`].
-    pub fn new() -> Self {
+    pub fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "message queue capacity must be positive");
+
         Self {
+            capacity,
             state: Arc::new(Mutex::new(State::new())),
         }
-    }
-}
-
-impl<I, M> Default for MessageQueue<I, M> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -66,7 +64,10 @@ impl<I: Copy + Eq + Ord + Hash, M> MessageQueue<I, M> {
         let mut state = self.state.lock().expect("state");
 
         match state.check_pending(txn_id)? {
-            Entry::Occupied(mut entry) => entry.get_mut().push(message),
+            Entry::Occupied(mut entry) if entry.get().len() < self.capacity => {
+                entry.get_mut().push(message)
+            }
+            Entry::Occupied(_) => return Err(Error::Saturated),
             Entry::Vacant(entry) => {
                 entry.insert(vec![message]);
             }
@@ -105,5 +106,20 @@ impl<I: Eq + Hash + Ord + fmt::Debug, M> MessageQueue<I, M> {
     {
         let mut state = self.state.lock().expect("state");
         state.finalize(txn_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MessageQueue;
+    use crate::Error;
+
+    #[test]
+    fn applies_backpressure_at_capacity() {
+        let queue = MessageQueue::new(1);
+
+        queue.push(1, "first").expect("first message");
+        assert_eq!(queue.push(1, "second"), Err(Error::Saturated));
+        assert_eq!(queue.commit(1), vec!["first"]);
     }
 }

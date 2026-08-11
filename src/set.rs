@@ -689,15 +689,14 @@ where
 
 /// An iterator over the values of a [`TxnSetLock`] as of a specific transactional version
 pub struct Iter<T> {
-    #[allow(unused)]
-    permit: PermitRead<Range<T>>,
+    _permit: PermitRead<Range<T>>,
     iter: <Canon<T> as IntoIterator>::IntoIter,
 }
 
 impl<T> Iter<T> {
     fn new(permit: PermitRead<Range<T>>, set: Canon<T>) -> Self {
         Self {
-            permit,
+            _permit: permit,
             iter: set.into_iter(),
         }
     }

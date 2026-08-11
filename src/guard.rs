@@ -20,7 +20,7 @@ impl<R, F> PendingRead<R, F> {
         MapFn: FnOnce(&F) -> Result<T, E>,
     {
         map(&*self.value).map(|value| PendingMap {
-            permit: self.permit,
+            _permit: self.permit,
             value,
         })
     }
@@ -48,7 +48,7 @@ impl<R, F> PendingWrite<R, F> {
         MapFn: FnOnce(&F) -> Result<T, E>,
     {
         map(&*self.value).map(|value| PendingMap {
-            permit: self.permit,
+            _permit: self.permit,
             value,
         })
     }
@@ -65,8 +65,7 @@ impl<R, T> Deref for PendingWrite<R, T> {
 /// A permit to read a mapped value in a pending transaction
 #[derive(Debug)]
 pub struct PendingMap<R, T> {
-    #[allow(unused)]
-    permit: PermitRead<R>,
+    _permit: PermitRead<R>,
     value: T,
 }
 
@@ -161,15 +160,17 @@ impl<R, T> Deref for TxnReadGuardMap<R, T> {
 /// A write guard on a transactional value
 #[derive(Debug)]
 pub struct TxnWriteGuard<R, T> {
-    #[allow(unused)]
-    permit: PermitWrite<R>,
+    _permit: PermitWrite<R>,
     value: OwnedRwLockWriteGuard<T>,
 }
 
 impl<R, T> TxnWriteGuard<R, T> {
     /// Construct a guard for a mutable value as part of a pending transaction.
     pub fn new(permit: PermitWrite<R>, value: OwnedRwLockWriteGuard<T>) -> Self {
-        Self { permit, value }
+        Self {
+            _permit: permit,
+            value,
+        }
     }
 }
 

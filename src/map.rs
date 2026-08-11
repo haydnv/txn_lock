@@ -1484,8 +1484,7 @@ pub struct IterMut<I, K, V> {
     lock_state: Arc<RwLockInner<State<I, K, V>>>,
     txn_id: I,
 
-    #[allow(unused)]
-    permit: PermitWrite<Range<K>>,
+    _permit: PermitWrite<Range<K>>,
     keys: <HashSet<Key<K>> as IntoIterator>::IntoIter,
 }
 
@@ -1499,7 +1498,7 @@ impl<I, K, V> IterMut<I, K, V> {
         Self {
             lock_state,
             txn_id,
-            permit,
+            _permit: permit,
             keys: keys.into_iter(),
         }
     }

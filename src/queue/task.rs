@@ -8,7 +8,7 @@
 //! use txn_lock::Error;
 //!
 //! let task: Task<Duration, ()> = Arc::pin(|d| Box::pin(tokio::time::sleep(d)));
-//! let queue = TaskQueue::<u64, _, _>::new(task);
+//! let queue = TaskQueue::<u64, _, _>::new(task, 16);
 //!
 //! // this can only execute when a tokio reactor is running
 //! // queue.push(1, 1).expect("push");
@@ -35,16 +35,20 @@ pub type BoxFuture<Out> = Pin<Box<dyn Future<Output = Out> + Send>>;
 pub type Task<I, O> = Pin<Arc<dyn Fn(I) -> BoxFuture<O> + Send + Sync>>;
 
 struct Queue<O> {
-    tx: mpsc::UnboundedSender<JoinHandle<O>>,
-    rx: mpsc::UnboundedReceiver<JoinHandle<O>>,
+    accepted: usize,
+    capacity: usize,
+    tx: mpsc::Sender<JoinHandle<O>>,
+    rx: mpsc::Receiver<JoinHandle<O>>,
     results: Arc<RwLock<Vec<O>>>,
 }
 
 impl<O> Queue<O> {
-    fn new() -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+    fn new(capacity: usize) -> Self {
+        let (tx, rx) = mpsc::channel(capacity);
 
         Self {
+            accepted: 0,
+            capacity,
             tx,
             rx,
             results: Arc::new(RwLock::new(Vec::with_capacity(1))),
@@ -76,13 +80,25 @@ impl<O: Send + Sync + fmt::Debug + 'static> Queue<O> {
         (pending, self.results.clone())
     }
 
-    fn push(&mut self, task: BoxFuture<O>) -> Result<(), mpsc::error::SendError<JoinHandle<O>>> {
-        self.tx.send(tokio::spawn(task))
+    fn push<In>(&mut self, task: &Task<In, O>, input: In) -> Result<(), Error> {
+        if self.accepted >= self.capacity {
+            return Err(Error::Saturated);
+        }
+
+        let permit = self.tx.try_reserve().map_err(|cause| match cause {
+            mpsc::error::TrySendError::Full(_) => Error::Saturated,
+            mpsc::error::TrySendError::Closed(_) => Error::Outdated,
+        })?;
+
+        permit.send(tokio::spawn(task(input)));
+        self.accepted += 1;
+        Ok(())
     }
 }
 
 /// A transactional task queue
 pub struct TaskQueue<I, In, Out> {
+    capacity: usize,
     task: Task<In, Out>,
     state: Arc<Mutex<State<I, Queue<Out>>>>,
 }
@@ -90,6 +106,7 @@ pub struct TaskQueue<I, In, Out> {
 impl<I, In, Out> Clone for TaskQueue<I, In, Out> {
     fn clone(&self) -> Self {
         Self {
+            capacity: self.capacity,
             task: self.task.clone(),
             state: self.state.clone(),
         }
@@ -98,8 +115,11 @@ impl<I, In, Out> Clone for TaskQueue<I, In, Out> {
 
 impl<I, In, Out> TaskQueue<I, In, Out> {
     /// Construct a new transactional task queue.
-    pub fn new(task: Task<In, Out>) -> Self {
+    pub fn new(task: Task<In, Out>, capacity: usize) -> Self {
+        assert!(capacity > 0, "task queue capacity must be positive");
+
         Self {
+            capacity,
             task,
             state: Arc::new(Mutex::new(State::new())),
         }
@@ -137,13 +157,12 @@ where
     pub fn push(&self, txn_id: I, input: In) -> Result<(), Error> {
         let mut state = self.state.lock().expect("state");
 
-        let task = (self.task)(input);
-
         match state.check_pending(txn_id)? {
-            Entry::Occupied(mut entry) => entry.get_mut().push(task),
-            Entry::Vacant(entry) => entry.insert(Queue::new()).push(task),
-        }
-        .expect("send"); // at this point the channel can't possibly be closed
+            Entry::Occupied(mut entry) => entry.get_mut().push(&self.task, input),
+            Entry::Vacant(entry) => entry
+                .insert(Queue::new(self.capacity))
+                .push(&self.task, input),
+        }?;
 
         Ok(())
     }
@@ -186,5 +205,27 @@ where
     pub fn finalize(&self, txn_id: I) {
         let mut state = self.state.lock().expect("state");
         state.finalize(txn_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{Task, TaskQueue};
+    use crate::Error;
+
+    #[tokio::test]
+    async fn applies_backpressure_at_capacity() {
+        let task: Task<(), ()> = Arc::pin(|()| Box::pin(async {}));
+        let queue = TaskQueue::new(task, 1);
+
+        queue.push(1, ()).expect("first task");
+        let results = queue.peek(&1).await.expect("peek").expect("task queue");
+        assert_eq!(results.as_slice(), &[()]);
+        drop(results);
+
+        assert_eq!(queue.push(1, ()), Err(Error::Saturated));
+        assert_eq!(queue.commit(1).await, vec![()]);
     }
 }

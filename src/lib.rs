@@ -32,6 +32,9 @@ pub enum Error {
     /// Unable to acquire a transactional lock synchronously
     WouldBlock,
 
+    /// A bounded transactional queue has reached its configured capacity
+    Saturated,
+
     /// An error occurred in a background task
     Background(String),
 }
@@ -45,6 +48,7 @@ impl fmt::Display for Error {
             }
             Self::Outdated => f.write_str("the value has already been finalized"),
             Self::WouldBlock => f.write_str("synchronous lock acquisition failed"),
+            Self::Saturated => f.write_str("transactional queue capacity exhausted"),
             Self::Background(cause) => write!(f, "an error occured in a background task: {cause}"),
         }
     }

@@ -247,12 +247,13 @@ where
 
         match self.read_inner(txn_id, range) {
             VersionRead::Pending(_, _) => Err(Error::WouldBlock),
-            VersionRead::Version(range, root) => root
-                .try_read(&range, &self.collator)
-                .map(|permit| PermitRead {
-                    permit,
-                    notify: self.notify.clone(),
-                }),
+            VersionRead::Version(range, root) => {
+                root.try_read(&range, &self.collator)
+                    .map(|permit| PermitRead {
+                        permit,
+                        notify: self.notify.clone(),
+                    })
+            }
         }
     }
 
@@ -366,12 +367,13 @@ where
 
         match self.write_inner(txn_id, range)? {
             VersionRead::Pending(_, _) => Err(Error::WouldBlock),
-            VersionRead::Version(range, root) => root
-                .try_write(&range, &self.collator)
-                .map(|permit| PermitWrite {
-                    permit,
-                    notify: self.notify.clone(),
-                }),
+            VersionRead::Version(range, root) => {
+                root.try_write(&range, &self.collator)
+                    .map(|permit| PermitWrite {
+                        permit,
+                        notify: self.notify.clone(),
+                    })
+            }
         }
     }
 }
