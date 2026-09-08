@@ -154,6 +154,16 @@ impl<I: Ord + Hash + fmt::Debug, K, V> State<I, K, V> {
             finalized: None,
         }
     }
+
+    fn from_committed(canon: Canon<K, V>) -> Self {
+        Self {
+            canon,
+            commits: OrdHashSet::new(),
+            deltas: OrdHashMap::new(),
+            pending: OrdHashMap::new(),
+            finalized: None,
+        }
+    }
 }
 
 impl<I, K, V> State<I, K, V>
@@ -768,6 +778,19 @@ where
         Self {
             state: Arc::new(RwLockInner::new(State::new(txn_id, version))),
             semaphore: Semaphore::with_reservation(txn_id, collator, Range::All),
+        }
+    }
+
+    /// Construct a transactional map whose initial contents are already committed.
+    /// This does not reserve, commit, or finalize a synthetic transaction version.
+    pub fn from_committed<KV: IntoIterator<Item = (K, V)>>(contents: KV) -> Self {
+        let canon = contents
+            .into_iter()
+            .map(|(key, value)| (Key::new(key), Arc::new(value)))
+            .collect();
+        Self {
+            state: Arc::new(RwLockInner::new(State::from_committed(canon))),
+            semaphore: Semaphore::new(Collator::<K>::default()),
         }
     }
 
